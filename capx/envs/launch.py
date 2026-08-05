@@ -61,7 +61,7 @@ class LaunchArgs:
     reasoning_effort: str = "medium"
     """Effort level for reasoning models (if applicable). Options: minimal, low, medium, high."""
 
-    api_key: str | None = None
+    api_key: str | None = os.getenv("CAPX_API_KEY")
     """Optional API key for authentication with the model server."""
 
     # Execution configuration (can override YAML values)

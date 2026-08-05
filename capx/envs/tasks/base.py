@@ -257,6 +257,9 @@ class CodeExecutionEnvBase(Env):
         # Reinitialize globals for a fresh episode and prime INPUTS with the reset observation
         self._init_exec_globals()
         self._exec_globals["INPUTS"] = obs
+        for api in self._apis.values():
+            if hasattr(api, "reset_episode"):
+                api.reset_episode()
         info.update({"task_prompt": self._task_prompt})
         return obs, info
 

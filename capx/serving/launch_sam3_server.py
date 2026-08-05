@@ -3,6 +3,7 @@ import base64
 import functools
 import io
 import logging
+import os
 from typing import Any, List, Tuple
 
 import numpy as np
@@ -237,6 +238,7 @@ def main(
     device: str = "cuda",
     port: int = 8114,
     host: str = "127.0.0.1",
+    checkpoint_path: str | None = None,
 ):
     global _MODEL, _PROCESSOR, _DEVICE
 
@@ -256,8 +258,21 @@ def main(
 
     logger.info("Loading SAM3 model...")
     try:
-        # Assuming build_sam3_image_model loads default checkpoint
-        _MODEL = build_sam3_image_model(enable_inst_interactivity=True)
+        checkpoint_path = checkpoint_path or os.getenv("CAPX_SAM3_CHECKPOINT")
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            logger.info("Loading SAM3 checkpoint from %s", checkpoint_path)
+            _MODEL = build_sam3_image_model(
+                checkpoint_path=checkpoint_path,
+                load_from_HF=False,
+                enable_inst_interactivity=True,
+            )
+        else:
+            if checkpoint_path:
+                logger.warning(
+                    "SAM3 checkpoint not found at %s; falling back to Hugging Face.",
+                    checkpoint_path,
+                )
+            _MODEL = build_sam3_image_model(enable_inst_interactivity=True)
     except Exception as e:
         logger.error(f"Error building SAM3 model: {e}")
         raise

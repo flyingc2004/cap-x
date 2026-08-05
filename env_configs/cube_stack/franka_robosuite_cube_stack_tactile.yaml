@@ -1,0 +1,56 @@
+# Usage:
+# uv run capx/envs/launch.py --config-path env_configs/cube_stack/franka_robosuite_cube_stack_tactile.yaml
+
+env:
+  _target_: capx.envs.tasks.franka.franka_pick_place.FrankaPickPlaceCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: franka_robosuite_cubes_low_level
+    privileged: false
+    apis:
+      - FrankaControlApi
+      - TactileMemoryApi
+    prompt: |
+      You are controlling a Franka Emika robot with the APIs described below.
+      Goal: Pick up the red cube and gently stack it on top of the green cube, then release it.
+
+      Key rules:
+      - The extent from get_object_pose(..., return_bbox_extent=True) is the FULL side length. Use extent[2]/2 for half-height.
+      - For placement orientation, reuse the grasp quaternion from sample_grasp_pose. Do NOT use the quaternion from get_object_pose.
+      - Always use z_approach=0.1 when approaching an object for grasping or placing.
+      - After grasping, use tactile APIs to verify contact and detect slip before lifting.
+      - Do not assume the object is grasped only because the gripper is closed.
+      - If tactile contact is missing, retry once with a small downward or lateral pose adjustment before lifting.
+      - If slip is detected, open the gripper and retry with a small pose adjustment and slower, controlled approach.
+      - Prefer learned tactile strategy memory when it suggests retry or placement adjustments.
+      - Historical reward/success/task completion in tactile strategy memory is not a runtime observation.
+      - After grasping, lift the cube to a safe height (at least +0.2m in Z) before moving laterally to the placement location.
+      - The stacking height formula is: place_z = green_center_z + green_extent[2]/2 + red_extent[2]/2
+      - Nothing should be dropped from a height. Always approach with z_approach for controlled descent.
+
+      Write ONLY executable Python code (no code fences). Import numpy if needed.
+
+api_servers:
+  - _target_: capx.serving.launch_sam3_server.main
+    device: cuda
+    port: 8114
+    host: 127.0.0.1
+
+  - _target_: capx.serving.launch_contact_graspnet_server.main
+    port: 8115
+    host: 127.0.0.1
+
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+record_video: true
+output_dir: ./outputs/franka_robosuite_cube_stack_tactile
+tactile_strategy_memory: true
+tactile_strategy_memory_path: .capx_tactile_strategies.jsonl
+tactile_strategy_top_k: 3
+
+trials: 100
+num_workers: 12

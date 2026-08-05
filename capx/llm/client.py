@@ -260,7 +260,16 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     end_time = time.time()
     print(f"Time taken to query model: {end_time - start_time:.2f} seconds")
     response.raise_for_status()
-    body = response.json()
+    try:
+        body = response.json()
+    except requests.JSONDecodeError as exc:
+        content_type = response.headers.get("content-type", "<missing>")
+        response_preview = response.text[:500].replace("\n", "\\n")
+        raise RuntimeError(
+            "LLM endpoint returned a non-JSON response "
+            f"(status={response.status_code}, content-type={content_type}, "
+            f"url={server_url}, preview={response_preview!r})"
+        ) from exc
     out = {}
     if args.debug:
         print(json.dumps(body, indent=2))

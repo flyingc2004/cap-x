@@ -114,6 +114,25 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         if current_value == cli_default and field in configs_dict:
             setattr(args, field, configs_dict[field])
 
+    tactile_strategy_memory_path = configs_dict.get(
+        "tactile_strategy_memory_path",
+        ".capx_tactile_strategies.jsonl",
+    )
+    tactile_strategy_memory_read_path = configs_dict.get(
+        "tactile_strategy_memory_read_path",
+        tactile_strategy_memory_path,
+    )
+    tactile_strategy_top_k = int(configs_dict.get("tactile_strategy_top_k", 3))
+    tactile_strategy_memory_enabled = bool(configs_dict.get("tactile_strategy_memory", False))
+    os.environ["CAPX_TACTILE_STRATEGY_MEMORY_ENABLED"] = (
+        "1" if tactile_strategy_memory_enabled else "0"
+    )
+    os.environ["CAPX_TACTILE_STRATEGY_MEMORY_PATH"] = str(tactile_strategy_memory_path)
+    os.environ["CAPX_TACTILE_STRATEGY_MEMORY_READ_PATH"] = str(
+        tactile_strategy_memory_read_path
+    )
+    os.environ["CAPX_TACTILE_STRATEGY_TOP_K"] = str(tactile_strategy_top_k)
+
     # Build merged config dict (CLI args override YAML)
     merged_config = {
         "total_trials": args.total_trials
@@ -157,9 +176,41 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         if getattr(args, "web_ui_port", None) is not None
         else configs_dict.get("web_ui_port", 8200),
         "save_multiturn_prompts": configs_dict.get("save_multiturn_prompts", False),
+        "tactile_strategy_memory": tactile_strategy_memory_enabled,
+        "tactile_strategy_memory_path": tactile_strategy_memory_path,
+        "tactile_strategy_memory_read_path": tactile_strategy_memory_read_path,
+        "tactile_strategy_top_k": tactile_strategy_top_k,
     }
 
+    if merged_config["tactile_strategy_memory"]:
+        _inject_tactile_strategy_memory_prompt(env_factory, merged_config)
+
     return env_factory, merged_config, api_servers
+
+
+def _inject_tactile_strategy_memory_prompt(
+    env_factory: dict[str, Any],
+    config: dict[str, Any],
+) -> None:
+    """Append retrieved tactile strategy memory to the task prompt."""
+    try:
+        from capx.integrations.tactile.strategy_memory import (
+            TactileStrategyMemory,
+            format_strategies_for_prompt,
+        )
+
+        records = TactileStrategyMemory(
+            config.get("tactile_strategy_memory_read_path")
+        ).retrieve(
+            target="red cube",
+            top_k=int(config.get("tactile_strategy_top_k", 3)),
+        )
+        prompt_addition = format_strategies_for_prompt(records)
+        cfg = env_factory.get("cfg", {})
+        cfg["prompt"] = f"{cfg.get('prompt', '')}\n\n{prompt_addition}"
+        print(f"[tactile-memory] Injected {len(records)} strategy record(s) into prompt")
+    except Exception as exc:
+        print(f"WARNING: Failed to inject tactile strategy memory into prompt: {exc}")
 
 
 def _extract_code(content: str) -> list[str]:

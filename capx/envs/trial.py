@@ -207,6 +207,65 @@ def _save_turn_and_combined_videos(
             _write_video(wrist_frames, base_dir, suffix="combined_wrist")
 
 
+def _save_tactile_artifacts(
+    env: CodeExecutionEnvBase,
+    config: dict[str, Any],
+    trial: int,
+    info_step: dict[str, Any],
+    reward: float,
+) -> None:
+    """Save tactile timeline and overlay artifacts when TactileMemoryApi is active."""
+    if not config.get("output_dir"):
+        return
+
+    tactile_api = getattr(env, "_apis", {}).get("TactileMemoryApi")
+    if tactile_api is None or not hasattr(tactile_api, "export_tactile_frames"):
+        return
+
+    try:
+        records = tactile_api.export_tactile_frames()
+        if not records:
+            return
+
+        from capx.integrations.tactile.visualization import save_tactile_artifacts
+
+        trial_dir = _trial_video_dir(config, trial, info_step, reward)
+        video_candidates = [
+            os.path.join(trial_dir, "video_combined.mp4"),
+            os.path.join(trial_dir, f"video_{reward:.3f}.mp4"),
+        ]
+        video_path = next((path for path in video_candidates if os.path.exists(path)), None)
+        save_tactile_artifacts(records, trial_dir, target="cubeA", video_path=video_path)
+        _save_tactile_strategy_memory(config, trial_dir)
+    except Exception as exc:
+        print(f"WARNING: Failed to save tactile visualization artifacts: {exc}")
+
+
+def _save_tactile_strategy_memory(config: dict[str, Any], trial_dir: str) -> None:
+    """Append a tactile strategy memory record for a completed trial."""
+    if not config.get("tactile_strategy_memory", False):
+        return
+    try:
+        from capx.integrations.tactile.strategy_memory import append_trial_strategy_record
+
+        record = append_trial_strategy_record(
+            trial_dir,
+            memory_path=config.get("tactile_strategy_memory_path"),
+            task=config.get("task_name", "cube_stack"),
+            target="red cube",
+        )
+        if record is None:
+            print("[tactile-memory] No new strategy record saved")
+        else:
+            print(
+                "[tactile-memory] "
+                f"Saved {record.outcome} strategy {record.failure_type} "
+                f"reward={record.reward:.3f}"
+            )
+    except Exception as exc:
+        print(f"WARNING: Failed to save tactile strategy memory: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Visual feedback and image differencing
 # ---------------------------------------------------------------------------
@@ -921,6 +980,7 @@ def _run_single_trial(
         )
     else:
         _save_trial_video(env, config, trial, info_step, reward, num_code_blocks)
+    _save_tactile_artifacts(env, config, trial, info_step, reward)
 
     success = info_step["sandbox_rc"] == 0
 

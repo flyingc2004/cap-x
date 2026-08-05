@@ -73,6 +73,7 @@ class RobosuiteBaseEnv(BaseEnv):
         # Control state
         self._current_joints = np.zeros(7, dtype=np.float64)
         self._gripper_fraction = 1.0  # 1.0 = open, 0.0 = closed
+        self._step_observers = []
 
     def _init_robot_links(self) -> None:
         """Initialize robot link indices and base transforms. Call after robosuite_env is created."""
@@ -137,11 +138,12 @@ class RobosuiteBaseEnv(BaseEnv):
         else:
             self.robosuite_env.step(sliced, skip_render_images=True)
 
-    def _step_once(self) -> None:
-        """Execute one simulation step with current control state."""
-        action = self._build_action()
-        self._do_robosuite_step(action)
+    def add_step_observer(self, callback) -> None:
+        """Register a callback invoked after each low-level simulation step."""
+        if callback not in self._step_observers:
+            self._step_observers.append(callback)
 
+    def _after_robosuite_step(self) -> None:
         self.gripper_link_wxyz_xyz = np.concatenate(
             [
                 self.robosuite_env.sim.data.xquat[self.gripper_link_idx],
@@ -155,6 +157,15 @@ class RobosuiteBaseEnv(BaseEnv):
             self._record_frame()
         self._sim_step_count += 1
 
+        for callback in list(self._step_observers):
+            callback()
+
+    def _step_once(self) -> None:
+        """Execute one simulation step with current control state."""
+        action = self._build_action()
+        self._do_robosuite_step(action)
+        self._after_robosuite_step()
+
     def move_to_joints_non_blocking(self, joints: np.ndarray) -> None:
         """Move to target joint positions using Robosuite's controller (non-blocking)."""
         target = np.asarray(joints, dtype=np.float64).reshape(7)
@@ -162,14 +173,7 @@ class RobosuiteBaseEnv(BaseEnv):
         action[-2:] = 1.0 - action[-2:] * 2.0
 
         self._do_robosuite_step(action)
-
-        if hasattr(self, "viser_server") and self._sim_step_count % self._subsample_rate == 0:
-            self._update_viser_server()
-
-        if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-            self._record_frame()
-
-        self._sim_step_count += 1
+        self._after_robosuite_step()
 
     def move_to_joints_blocking(
         self, joints: np.ndarray, *, tolerance: float = 0.02, max_steps: int = 100
@@ -197,15 +201,9 @@ class RobosuiteBaseEnv(BaseEnv):
             action[-2:] = 1.0 - action[-2:] * 2.0
 
             self._do_robosuite_step(action)
-
-            if hasattr(self, "viser_server") and self._sim_step_count % self._subsample_rate == 0:
-                self._update_viser_server()
-
-            if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-                self._record_frame()
+            self._after_robosuite_step()
 
             steps += 1
-            self._sim_step_count += 1
 
     def step(self, action: Any) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
         """Low-level step - not typically called directly in code execution mode."""

@@ -11,6 +11,8 @@ env/
 .openrouterkey
 .nvinferencekeys
 .capx_skills.json
+.capx_tactile_strategies.jsonl
+.capx_tactile_strategies.jsonl.lock
 .pytest_cache/
 .ruff_cache/
 
