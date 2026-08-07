@@ -14,10 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import fastapi
 import numpy as np
-import requests
-import uvicorn
 from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
@@ -180,6 +177,18 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "tactile_strategy_memory_path": tactile_strategy_memory_path,
         "tactile_strategy_memory_read_path": tactile_strategy_memory_read_path,
         "tactile_strategy_top_k": tactile_strategy_top_k,
+        "trial_timeout_seconds": float(
+            os.getenv(
+                "CAPX_TRIAL_TIMEOUT_SECONDS",
+                configs_dict.get("trial_timeout_seconds", 1000),
+            )
+        ),
+        "max_trial_retries": int(
+            os.getenv(
+                "CAPX_MAX_TRIAL_RETRIES",
+                configs_dict.get("max_trial_retries", 3),
+            )
+        ),
     }
 
     if merged_config["tactile_strategy_memory"]:
@@ -460,6 +469,14 @@ def _save_trial_artifacts(
 
     (trial_dir / "all_responses.json").write_text(json.dumps(all_responses, indent=2))
     (trial_dir / "summary.txt").write_text("\n".join(log_lines))
+    if all_responses:
+        try:
+            initial_prompt_content = all_responses[0].get("initial_prompt")
+            if initial_prompt_content:
+                prompt_text = initial_prompt_content[-1]["content"][0]["text"]
+                (trial_dir / "initial_prompt.txt").write_text(str(prompt_text))
+        except Exception:
+            pass
 
     # Save initial ensemble data if provided
     if ensemble_data:

@@ -18,6 +18,7 @@ import gc
 import io
 import json
 import os
+import signal
 import time
 from typing import Any
 
@@ -115,7 +116,7 @@ def _trial_video_dir(
     info_step: dict[str, Any],
     reward: float,
 ) -> str:
-    """Return the trial output directory path used for video saving."""
+    """Return the trial output directory path used for artifact saving."""
     return os.path.join(
         config["output_dir"],
         f"trial_{trial:02d}_sandboxrc_{info_step['sandbox_rc']}_reward_{reward:.3f}"
@@ -231,8 +232,8 @@ def _save_tactile_artifacts(
 
         trial_dir = _trial_video_dir(config, trial, info_step, reward)
         video_candidates = [
-            os.path.join(trial_dir, "video_combined.mp4"),
-            os.path.join(trial_dir, f"video_{reward:.3f}.mp4"),
+            os.path.join(trial_dir, "videos", "video_combined.mp4"),
+            os.path.join(trial_dir, "videos", f"video_{reward:.3f}.mp4"),
         ]
         video_path = next((path for path in video_candidates if os.path.exists(path)), None)
         save_tactile_artifacts(records, trial_dir, target="cubeA", video_path=video_path)
@@ -264,6 +265,27 @@ def _save_tactile_strategy_memory(config: dict[str, Any], trial_dir: str) -> Non
             )
     except Exception as exc:
         print(f"WARNING: Failed to save tactile strategy memory: {exc}")
+
+
+def _save_env_debug_artifacts(
+    env: CodeExecutionEnvBase,
+    config: dict[str, Any],
+    trial: int,
+    info_step: dict[str, Any],
+    reward: float,
+) -> None:
+    """Save private simulator diagnostics beside trial artifacts."""
+    if not config.get("output_dir"):
+        return
+    low_level = getattr(env, "low_level_env", None)
+    export_fn = getattr(low_level, "export_debug_artifacts", None)
+    if not callable(export_fn):
+        return
+    try:
+        trial_dir = _trial_video_dir(config, trial, info_step, reward)
+        export_fn(trial_dir)
+    except Exception as exc:
+        print(f"WARNING: Failed to save environment debug artifacts: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -535,26 +557,36 @@ def _query_initial_code(
     Returns:
         (raw_code, reasoning, ensemble_data)
     """
-    # Save the initial prompt
-    with open(os.path.join(config["output_dir"], "initial_prompt.txt"), "w") as f:
-        f.write(str(obs["full_prompt"]))
-
     ensemble_data = None
-    if config["use_parallel_ensemble"]:
-        if config.get("use_multimodel", False):
-            print("RUNNING MULTIMODEL ENSEMBLE QUERY")
-            out = _query_model_ensemble(args, obs["full_prompt"], is_multiturn=False)
+    with _suspend_sigalrm():
+        if config["use_parallel_ensemble"]:
+            if config.get("use_multimodel", False):
+                print("RUNNING MULTIMODEL ENSEMBLE QUERY")
+                out = _query_model_ensemble(args, obs["full_prompt"], is_multiturn=False)
+            else:
+                print("RUNNING SINGLE MODEL ENSEMBLE QUERY")
+                out = _query_single_model_ensemble(args, obs["full_prompt"], args.model, is_multiturn=False)
+            ensemble_data = {
+                "ensemble_candidates_txt": out["ensemble_candidates_txt"],
+                "ensemble_synthesis_txt": out["ensemble_synthesis_txt"],
+            }
         else:
-            print("RUNNING SINGLE MODEL ENSEMBLE QUERY")
-            out = _query_single_model_ensemble(args, obs["full_prompt"], args.model, is_multiturn=False)
-        ensemble_data = {
-            "ensemble_candidates_txt": out["ensemble_candidates_txt"],
-            "ensemble_synthesis_txt": out["ensemble_synthesis_txt"],
-        }
-    else:
-        out = _query_model(args, obs["full_prompt"])
+            out = _query_model(args, obs["full_prompt"])
 
     return out["content"], out["reasoning"], ensemble_data
+
+
+class _suspend_sigalrm:
+    """Temporarily pause trial SIGALRM while waiting on remote LLM calls."""
+
+    def __enter__(self):
+        self.remaining = signal.alarm(0)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.remaining > 0:
+            signal.alarm(self.remaining)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -703,24 +735,36 @@ def _run_single_trial(
         5. Save artifacts (code, logs, per-turn videos, combined video) and return a TrialSummary.
     """
     trial_start_time = time.time()
+    print(f"[capx-trial] trial={trial} begin", flush=True)
 
     use_video_diff = config.get("use_video_differencing", False)
     use_wrist = config.get("use_wrist_camera", False)
+    should_record = config["record_video"] or use_video_diff
+    record_during_reset = should_record and bool(
+        getattr(env, "record_video_during_reset", False)
+    )
 
     # --- 1. Reset environment ---
+    print(f"[capx-trial] trial={trial} reset begin", flush=True)
+    if record_during_reset and hasattr(env, "enable_video_capture"):
+        env.enable_video_capture(
+            True,
+            clear=True,
+            wrist_camera=use_wrist,
+            capture_initial_frame=False,
+        )
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
+    print(f"[capx-trial] trial={trial} reset end", flush=True)
     # Reset the SIGALRM timer AFTER env.reset() so the timeout only covers
     # actual task execution, not scene loading / cuRobo JIT compilation.
-    import signal
     remaining = signal.alarm(0)  # cancel current alarm
     if remaining > 0:
-        signal.alarm(1000)  # restart fresh 1000s from now
+        timeout_seconds = int(config.get("trial_timeout_seconds", remaining))
+        signal.alarm(max(1, timeout_seconds))
     obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
     _patch_libero_goal(env, obs)
 
-    if config["record_video"] and hasattr(env, "enable_video_capture"):
-        env.enable_video_capture(True, clear=True, wrist_camera=use_wrist)
-    elif use_video_diff and hasattr(env, "enable_video_capture"):
+    if should_record and hasattr(env, "enable_video_capture") and not record_during_reset:
         # Video differencing needs frame recording even without record_video
         env.enable_video_capture(True, clear=True, wrist_camera=use_wrist)
 
@@ -760,9 +804,11 @@ def _run_single_trial(
         )
 
     # --- 2. Capture initial visual feedback ---
+    print(f"[capx-trial] trial={trial} initial visual begin", flush=True)
     visual_feedback_imgs, visual_feedback_base64_history, task_description = (
         _capture_initial_visual_feedback(env, obs, config, args, visual_differencing_args)
     )
+    print(f"[capx-trial] trial={trial} initial visual end", flush=True)
 
     # Seed wrist base64 history with initial wrist image
     if use_wrist and wrist_base64_history is not None and hasattr(env, "render_wrist"):
@@ -784,7 +830,9 @@ def _run_single_trial(
         reasoning = None
         ensemble_data = None
     else:
+        print(f"[capx-trial] trial={trial} initial code query begin", flush=True)
         raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
+        print(f"[capx-trial] trial={trial} initial code query end", flush=True)
 
     # Initialize partial artifacts for timeout recovery
     if partial_artifacts is not None:
@@ -816,13 +864,6 @@ def _run_single_trial(
         "initial_prompt": copy.deepcopy(obs["full_prompt"]),
         "reasoning": reasoning if reasoning is not None else "",
     })
-
-    with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
-        json.dump(all_responses, f)
-
-    if args.debug:
-        with open(os.path.join(config["output_dir"], "code_init.txt"), "w") as f:
-            f.write("\n".join(initial_blocks))
 
     # --- 4. Execute code blocks (with optional multi-turn) ---
     info_step = {"sandbox_rc": -1, "stdout": "", "stderr": ""}
@@ -981,6 +1022,7 @@ def _run_single_trial(
     else:
         _save_trial_video(env, config, trial, info_step, reward, num_code_blocks)
     _save_tactile_artifacts(env, config, trial, info_step, reward)
+    _save_env_debug_artifacts(env, config, trial, info_step, reward)
 
     success = info_step["sandbox_rc"] == 0
 

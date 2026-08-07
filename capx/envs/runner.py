@@ -108,6 +108,16 @@ def _setup_output_dir(args, config: dict[str, Any]) -> None:
     if args.use_oracle_code:
         args.model = "oracle"
     if config["output_dir"]:
+        preserve_output_dir = os.getenv("CAPX_PRESERVE_OUTPUT_DIR", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        if preserve_output_dir:
+            Path(config["output_dir"]).mkdir(parents=True, exist_ok=True)
+            return
         parts = config["output_dir"].split("/")
         parts.insert(-1, str(args.model).replace("/", "_"))
         new_out_dir = "/".join(parts)
@@ -160,8 +170,7 @@ def _run_headless_trials(
     _print_and_save_summary(summaries, args, config, start_time)
 
     # Write completion flag
-    os.makedirs(os.path.join(config["output_dir"], "aaa_done_flag"), exist_ok=True)
-    with open(os.path.join(config["output_dir"], "aaa_done_flag", "aaa_done_flag.txt"), "w") as f:
+    with open(os.path.join(config["output_dir"], "aaa_done_flag.txt"), "w") as f:
         f.write("1")
 
 
@@ -200,20 +209,26 @@ def _run_trial_with_retries(
     multi_turn_prompt: str | None,
 ) -> TrialSummary:
     """Attempt a trial up to MAX_TRIAL_RETRIES times, retrying on timeout."""
-    for attempt in range(MAX_TRIAL_RETRIES):
+    max_retries = max(1, int(config.get("max_trial_retries", MAX_TRIAL_RETRIES)))
+    timeout_s = float(config.get("trial_timeout_seconds", TRIAL_TIMEOUT_SECONDS))
+    print(
+        f"[capx-runner] trial={trial} timeout_s={timeout_s:g} "
+        f"max_retries={max_retries}"
+    )
+    for attempt in range(max_retries):
         try:
-            is_last_attempt = attempt == MAX_TRIAL_RETRIES - 1
+            is_last_attempt = attempt == max_retries - 1
             return _run_single_trial_with_timeout(
                 env=env,
                 trial=trial,
                 args=args,
                 config=config,
                 multi_turn_prompt=multi_turn_prompt,
-                timeout_s=TRIAL_TIMEOUT_SECONDS,
+                timeout_s=timeout_s,
                 raise_on_timeout=not is_last_attempt,
             )
         except TimeoutError:
-            print(f"Trial {trial} timed out (attempt {attempt + 1}/{MAX_TRIAL_RETRIES}). Retrying...")
+            print(f"Trial {trial} timed out (attempt {attempt + 1}/{max_retries}). Retrying...")
 
     # All retries exhausted
     return TrialSummary(
@@ -223,7 +238,7 @@ def _run_trial_with_retries(
         terminated=False,
         truncated=True,
         sandbox_rc=1,
-        log=f"Trial {trial} failed after {MAX_TRIAL_RETRIES} timeout retries",
+        log=f"Trial {trial} failed after {max_retries} timeout retries",
         task_completed=False,
         code_path=None,
         num_regenerations=0,

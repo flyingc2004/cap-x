@@ -46,8 +46,8 @@ class ExperimentParser:
 
     The expected directory structure is:
     experiment_root/
-        initial_prompt.txt
         trial_{idx}_sandboxrc_{rc}_reward_{rew}_taskcompleted_{comp}/
+            initial_prompt.txt
             all_responses.json
             ...
     """
@@ -71,7 +71,6 @@ class ExperimentParser:
             Dict[int, TrialData]: A dictionary where keys are trial indices and values are TrialData objects.
         """
         results: dict[int, TrialData] = {}
-        initial_prompt_path = self.experiment_dir / "initial_prompt.txt"
 
         # Iterate over all items in the experiment directory
         for item in self.experiment_dir.iterdir():
@@ -90,7 +89,7 @@ class ExperimentParser:
                     sandbox_rc=sandbox_rc,
                     reward=reward,
                     task_completed=task_completed,
-                    initial_prompt_txt_path=initial_prompt_path.absolute(),
+                    initial_prompt_txt_path=(item / "initial_prompt.txt").absolute(),
                     summary_txt=(item / "summary.txt").absolute(),
                 )
                 results[trial_idx] = trial_data

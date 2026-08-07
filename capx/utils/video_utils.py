@@ -43,7 +43,7 @@ def _write_video(frames: list[np.ndarray], output_dir: str | None, *, suffix: st
         output_dir: Output directory path
         suffix: Filename suffix
     """
-    parent = Path(output_dir)
+    parent = Path(output_dir) / "videos"
     out_path = parent / f"video_{suffix}.mp4"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with imageio.get_writer(out_path, fps=30, format="FFMPEG", codec="libx264") as writer:

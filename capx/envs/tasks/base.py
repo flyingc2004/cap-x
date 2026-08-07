@@ -87,6 +87,7 @@ class CodeExecutionEnvBase(Env):
 
     prompt: str | None = None
     regenerate_prompt: str | None = None
+    record_video_during_reset: bool = False
 
     def __init__(self, cfg: CodeExecEnvConfig) -> None:
         super().__init__()
@@ -94,6 +95,9 @@ class CodeExecutionEnvBase(Env):
         self.low_level_env: BaseEnv = self._build_low_level(
             cfg.low_level, cfg.privileged, cfg.enable_render, cfg.viser_debug
         )  # type: ignore[assignment]
+        self.record_video_during_reset = bool(
+            getattr(self.low_level_env, "record_video_during_reset", False)
+        )
         # Create APIs once; maximize sharing inside a worker via lru_cache in get_api
         self._apis: dict[str, ApiBase] = {n: get_api(n)(self.low_level_env) for n in cfg.apis}
         # for api in self._apis.values():
@@ -154,8 +158,8 @@ class CodeExecutionEnvBase(Env):
         obs = self._get_observation()
         # Update dynamic obs while retaining previously defined variables
         self._exec_globals["obs"] = obs
-        self._exec_globals["env"] = self.low_level_env
-        self._exec_globals["APIS"] = self._apis
+        self._exec_globals["env"] = self._exec_env_binding()
+        self._exec_globals["APIS"] = self._exec_apis_binding()
         # Ensure API helper functions remain bound/current
         for api in self._apis.values():
             for fn_name, fn in api.functions().items():
@@ -191,8 +195,8 @@ class CodeExecutionEnvBase(Env):
         """
         g: dict[str, Any] = {
             "__name__": "__main__",
-            "env": self.low_level_env,
-            "APIS": self._apis,
+            "env": self._exec_env_binding(),
+            "APIS": self._exec_apis_binding(),
             # Populated per-step/reset; keep reference stable across execs
             "INPUTS": {},
             # Users can set and reuse RESULT across steps if desired
@@ -203,6 +207,12 @@ class CodeExecutionEnvBase(Env):
             for fn_name, fn in api.functions().items():
                 g[fn_name] = fn
         self._exec_globals = g
+
+    def _exec_env_binding(self) -> Any:
+        return self.low_level_env
+
+    def _exec_apis_binding(self) -> dict[str, ApiBase]:
+        return self._apis
 
     def _build_low_level(
         self, src: Env | str, privileged: bool = False, enable_render: bool = True, viser_debug: bool = False
@@ -315,16 +325,17 @@ class CodeExecutionEnvBase(Env):
         *,
         clear: bool = True,
         wrist_camera: bool = False,
+        capture_initial_frame: bool = True,
     ) -> None:
         import inspect
 
         sig = inspect.signature(self.low_level_env.enable_video_capture)
+        kwargs = {"clear": clear}
         if "wrist_camera" in sig.parameters:
-            self.low_level_env.enable_video_capture(
-                enabled, clear=clear, wrist_camera=wrist_camera
-            )
-        else:
-            self.low_level_env.enable_video_capture(enabled, clear=clear)
+            kwargs["wrist_camera"] = wrist_camera
+        if "capture_initial_frame" in sig.parameters:
+            kwargs["capture_initial_frame"] = capture_initial_frame
+        self.low_level_env.enable_video_capture(enabled, **kwargs)
 
     def get_video_frames(self, *, clear: bool = False) -> list[np.ndarray]:
         return self.low_level_env.get_video_frames(clear=clear)

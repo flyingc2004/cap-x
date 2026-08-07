@@ -12,11 +12,16 @@ import json
 import os
 import random
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import requests
+try:
+    import requests
+except ImportError:  # pragma: no cover - exercised in lightweight UniVTAC envs.
+    requests = None
 
 if TYPE_CHECKING:
     from capx.envs.launch import LaunchArgs
@@ -97,6 +102,48 @@ class ModelQueryArgs:
     max_tokens: int = 4096
     reasoning_effort: str = "medium"
     debug: bool = False
+
+
+class _SimpleResponse:
+    """Tiny response wrapper used when requests is unavailable."""
+
+    def __init__(self, status_code: int, headers: dict[str, str], text: str) -> None:
+        self.status_code = int(status_code)
+        self.headers = headers
+        self.text = text
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}: {self.text[:500]}")
+
+
+def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float):
+    if requests is not None:
+        return requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout)
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            return _SimpleResponse(resp.status, dict(resp.headers.items()), text)
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        return _SimpleResponse(exc.code, dict(exc.headers.items()), text)
+
+
+def _disable_thinking_requested(args: Any) -> bool:
+    value = os.getenv("CAPX_DISABLE_THINKING", "")
+    if value:
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return str(getattr(args, "model", "")).lower().startswith("qwen")
 
 
 def collapse_text_image_inputs(messages: list[dict]) -> list[dict]:
@@ -206,6 +253,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
                 "reasoning_effort": args.reasoning_effort,
                 "max_completion_tokens": args.max_tokens,  # Total completion tokens = reasoning + output tokens
                 "messages": prompt,
+                "stream": False,
             }
     elif is_openrouter_model(args.model):
         payload = {
@@ -213,6 +261,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
             "messages": prompt,
             "temperature": args.temperature,
             "max_tokens": args.max_tokens,
+            "stream": False,
         }
     elif args.model in CLAUDE_MODELS:
         payload = {
@@ -221,6 +270,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
             "max_tokens": args.max_tokens,
             "thinking": {"type": "enabled", "budget_tokens": 4096},
             "messages": prompt,
+            "stream": False,
         }
     elif args.model in OSS_MODELS:
         payload = {
@@ -228,6 +278,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
             "messages": prompt,
             "temperature": args.temperature,
             "max_tokens": args.max_tokens,
+            "stream": False,
         }
     else:
         payload = {
@@ -235,26 +286,39 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
             "temperature": args.temperature,
             "max_tokens": args.max_tokens,
             "messages": prompt,
+            "stream": False,
         }
     headers = {"Content-Type": "application/json"}
+    if _disable_thinking_requested(args):
+        payload["enable_thinking"] = False
     if args.api_key:
         headers["Authorization"] = f"Bearer {args.api_key}"
     elif os.getenv("OPENAI_API_KEY") is not None and args.model in GPT_MODELS:
         headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY')}"
     start_time = time.time()
 
+    request_timeout = float(os.getenv("CAPX_LLM_TIMEOUT_SECONDS", "200"))
+    max_retries = max(0, int(os.getenv("CAPX_LLM_MAX_RETRIES", "1")))
+    retry_sleep = float(os.getenv("CAPX_LLM_RETRY_SLEEP_SECONDS", "10"))
+
     # keep calling until it works
-    response = requests.post(
-        server_url, headers=headers, data=json.dumps(payload), timeout=200
+    print(
+        f"[capx-llm] querying model={args.model} url={server_url} "
+        f"timeout={request_timeout:g}s max_tokens={args.max_tokens} "
+        f"max_retries={max_retries} "
+        f"disable_thinking={payload.get('enable_thinking') is False}"
     )
+    response = _post_json(server_url, headers=headers, payload=payload, timeout=request_timeout)
     retry = 1
-    while response.status_code in [404, 500, 502, 503, 504]:
-        sleep_time = 240 + random.uniform(-90, 90)
-        print(f"Retry {retry}. Model query failed with status code {response.status_code}. Error: {response.text}. Retrying in {sleep_time} seconds...")
-        time.sleep(sleep_time)
-        response = requests.post(
-            server_url, headers=headers, data=json.dumps(payload), timeout=200
+    while response.status_code in [500, 502, 503, 504] and retry <= max_retries:
+        sleep_time = retry_sleep + random.uniform(0, min(2.0, retry_sleep))
+        print(
+            f"Retry {retry}/{max_retries}. Model query failed with "
+            f"status code {response.status_code}. Error: {response.text[:500]}. "
+            f"Retrying in {sleep_time:.1f} seconds..."
         )
+        time.sleep(sleep_time)
+        response = _post_json(server_url, headers=headers, payload=payload, timeout=request_timeout)
         retry += 1
 
     end_time = time.time()
@@ -262,7 +326,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     response.raise_for_status()
     try:
         body = response.json()
-    except requests.JSONDecodeError as exc:
+    except json.JSONDecodeError as exc:
         content_type = response.headers.get("content-type", "<missing>")
         response_preview = response.text[:500].replace("\n", "\\n")
         raise RuntimeError(
@@ -305,6 +369,9 @@ def query_model_streaming(
     Yields:
         Partial response chunks as they arrive
     """
+    if requests is None:
+        raise RuntimeError("Streaming model queries require the optional 'requests' package")
+
     if args.model in GPT_MODELS:
         payload = {
             "model": args.model,

@@ -126,6 +126,7 @@ _API_FACTORIES: dict[str, Callable[[], ApiBase]] = {}
 
 def register_api(name: str, factory: Callable[[], ApiBase]) -> None:
     _API_FACTORIES[name] = factory
+    get_api.cache_clear()
 
 
 @lru_cache(maxsize=256)

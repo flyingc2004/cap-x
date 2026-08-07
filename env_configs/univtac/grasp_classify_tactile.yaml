@@ -1,0 +1,75 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/UniVTAC
+      task_name: grasp_classify
+      task_config: smoke_capx_manual_grasp
+      seed_base: 0
+      device: cuda:0
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.10
+          max_delta_xyz: 0.04
+          max_delta_rpy: 0.25
+          max_delta_gripper: 0.02
+          default_z_approach: 0.10
+          release_hover_height: 0.10
+          preserve_landmark_orientation: true
+          use_task_place_actor_for_landmarks: false
+          placement_xy_tolerance: 0.08
+          placement_time_dilation_factor: 0.5
+          placement_pre_dis: 0.0
+          placement_dis: 0.0
+          gripper_settle_steps: 10
+          use_task_grasp_actor_for_prism: true
+          grasp_xy_tolerance: 0.08
+          grasp_pre_dis: 0.04
+          grasp_dis: 0.0
+          grasp_height: 0.04
+          lift_after_close: true
+          lift_after_close_z: 0.05
+          close_gripper_qpos: 0.007
+          open_gripper_width: 1.0
+          object_pose_names:
+            prism: prism
+            object: prism
+            target object: prism
+            orange pad: orange_pad
+            orange_pad: orange_pad
+            green pad: green_pad
+            green_pad: green_pad
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis:
+      - FrankaControlApi
+      - UniVTACTactileApi
+    prompt: |
+      You are controlling a Franka robot inside UniVTAC.
+      Task: a prism starts on the table at the public object pose "prism". Grasp it, lift it, use UniVTAC native tactile feedback to classify it, then place a rough prism on the orange pad and a plain prism on the green pad.
+      The orange pad is near position [0.40, -0.08, 0.025]. The green pad is near position [0.40, 0.08, 0.025].
+      The prism public pose is available as get_object_pose("prism"). It does not reveal rough/plain class.
+      Pad poses from get_object_pose describe the object placement target, not a manually offset release height.
+      Prefer this high-level sequence: open_gripper, sample_grasp_pose("prism"), goto_pose(grasp_pos, grasp_quat, z_approach=0.1), close_gripper, wait briefly or read tactile summary, infer rough vs plain from native tactile cues, choose the orange_pad or green_pad pose, call goto_pose directly on that pad position with z_approach=0.1, then open_gripper.
+      Use the high-level FrankaControlApi functions only for motion: get_object_pose, sample_grasp_pose, goto_pose, open_gripper, close_gripper, home_pose.
+      Do not call low-level UniVTAC movement functions such as move_delta_ee, move_ee, or move_qpos; goto_pose already converts requests into safe bounded Isaac/UniVTAC delta motion.
+      For pad placement, do not add extra z offsets such as +0.10 m to the pad position; pass the pad position from get_object_pose to goto_pose with z_approach=0.1. The adapter will execute a legal UniVTAC placement motion.
+      For placement orientation, reuse the quaternion returned by get_object_pose or the current/sample grasp quaternion; the adapter preserves the current end-effector orientation for public pad landmarks.
+      Use only UniVTAC native observations and tactile APIs.
+      Use UniVTAC native tactile observations only. Do not use robosuite/MuJoCo contact proxy tactile APIs.
+      If get_tactile_image(hand, "rgb_marker") is unavailable, it may fall back to rgb automatically.
+      Do not use reward, success, task_completed, or trial id as runtime observations.
+      Do not inspect UniVTAC private task fields such as choice, target, prism, actor names, or any label that directly reveals the class.
+      Do not call or depend on UniVTAC ACT/ViTAL policies.
+      Prefer the original CaP high-level flow:
+      sample_grasp_pose("prism") -> goto_pose(grasp) -> close_gripper -> get_tactile_summary -> get_object_pose(target pad) -> goto_pose(pad_pos, pad_quat, z_approach=0.1) -> open_gripper.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/univtac_grasp_classify_tactile
+trial_timeout_seconds: 180
+max_trial_retries: 1
