@@ -1,0 +1,60 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/UniVTAC
+      task_name: lift_can
+      task_config: smoke_capx_lift_can
+      seed_base: 0
+      device: cuda:0
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.10
+          max_delta_xyz: 0.04
+          max_delta_rpy: 0.25
+          max_delta_gripper: 0.02
+          default_z_approach: 0.08
+          release_hover_height: 0.15
+          preserve_landmark_orientation: true
+          gripper_settle_steps: 10
+          grasp_xy_tolerance: 0.08
+          grasp_pre_dis: 0.04
+          grasp_dis: 0.0
+          grasp_height: 0.04
+          lift_after_close: false
+          lift_after_close_z: 0.05
+          close_gripper_qpos: 0.007
+          open_gripper_width: 1.0
+          object_pose_names:
+            can: can
+            object: can
+            target object: can
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis:
+      - FrankaControlApi
+      - UniVTACTactileApi
+    prompt: |
+      You are controlling a Franka robot inside UniVTAC.
+      Task: grasp the cylindrical can from the table and lift it by at least 0.10 meters while maintaining a stable grasp.
+      The public can pose is available through get_object_pose("can").
+      Use this high-level sequence: open_gripper, sample_grasp_pose("can"), goto_pose(grasp_pos, grasp_quat, z_approach=0.08), close_gripper, inspect UniVTAC native tactile feedback, then goto_pose to a position 0.10 meters above the grasp position.
+      After closing, call get_tactile_summary(window=20, hand="both") and verify contact or grasp stability before lifting.
+      If contact is weak or unbalanced, reopen the gripper, make a small safe adjustment, and retry the grasp before lifting.
+      Use the high-level FrankaControlApi functions only for motion: get_object_pose, sample_grasp_pose, goto_pose, open_gripper, close_gripper, home_pose.
+      Do not call low-level UniVTAC movement functions such as move_delta_ee, move_ee, or move_qpos.
+      Use UniVTAC native tactile observations only. Do not use robosuite or MuJoCo contact proxy tactile APIs.
+      Do not use reward, success, task_completed, or trial id as runtime observations.
+      Do not inspect private task fields, hidden object attributes, metadata, or labels.
+      Do not load or call UniVTAC ACT or ViTAL policies.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/univtac_lift_can_tactile
+trial_timeout_seconds: 240
+max_trial_retries: 1
+

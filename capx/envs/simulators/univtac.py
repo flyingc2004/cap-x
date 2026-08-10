@@ -79,6 +79,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._sim_step_count = 0
         self._start_time = time.time()
         self._debug_records: list[dict[str, Any]] = []
+        self._pre_move_tactile_timeline: list[dict[str, Any]] = []
+        self._pre_move_tactile_last_error: str | None = None
 
         self._prepare_import_path()
         self._build_task()
@@ -99,8 +101,9 @@ class UniVTACLowLevelEnv(BaseEnv):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         trial = int((options or {}).get("trial", 0) or 0)
         actual_seed = self.seed_base + int(seed if seed is not None else trial)
-        self._frame_buffer.clear()
-        self._wrist_frame_buffer.clear()
+        if not self._record_frames:
+            self._frame_buffer.clear()
+            self._wrist_frame_buffer.clear()
         self._tactile_buffer.clear()
         self._last_recorded_tactile_step = None
         self._last_recorded_video_step = None
@@ -109,6 +112,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._sim_step_count = 0
         self._start_time = time.time()
         self._debug_records.clear()
+        self._pre_move_tactile_timeline.clear()
+        self._pre_move_tactile_last_error = None
 
         print(
             f"[capx-univtac] reset begin trial={trial} seed={actual_seed}",
@@ -371,7 +376,7 @@ class UniVTACLowLevelEnv(BaseEnv):
                         tag="capx_lift_after_grasp",
                     )
                 )
-            if exec_success and settle_steps > 0 and not (opening and callable(release_follow)):
+            if exec_success and settle_steps > 0:
                 self._task.delay(int(settle_steps), is_save=True, force=True)
         except Exception as exc:
             exec_success = False
@@ -546,6 +551,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, sort_keys=True)
+        self._export_pre_move_tactile_timeline(path.parent)
         print(f"[capx-univtac] saved private debug diagnostics to {path}", flush=True)
         return str(path)
 
@@ -642,6 +648,7 @@ class UniVTACLowLevelEnv(BaseEnv):
 
         def _capx_step(*args, **kwargs):
             result = original_step(*args, **kwargs)
+            self._record_pre_move_tactile_step()
             self._record_frame_after_task_step()
             return result
 
@@ -723,6 +730,145 @@ class UniVTACLowLevelEnv(BaseEnv):
         record = self._debug_snapshot(label)
         self._debug_records.append(record)
         return record
+
+    def _record_pre_move_tactile_step(self) -> None:
+        if not bool(getattr(self._task, "in_pre_move", False)):
+            return
+        if not bool(self._task_config.get("record_pre_move_tactile_timeline", True)):
+            return
+        step = self.get_step_count()
+        if step <= 0:
+            return
+        stride = max(1, int(self._task_config.get("pre_move_tactile_stride", 1)))
+        if step % stride != 0:
+            return
+        try:
+            obs = self._read_native_observation(
+                include_camera=False,
+                include_tactile=True,
+                include_embodiment=False,
+                include_actor=False,
+                tactile_data_types=["depth", "marker", "pose"],
+            )
+            record = self._pre_move_tactile_record(obs)
+            self._pre_move_tactile_timeline.append(record)
+        except Exception as exc:
+            message = repr(exc)
+            if message != self._pre_move_tactile_last_error:
+                print(
+                    f"WARNING: failed to record UniVTAC pre_move tactile timeline: {message}",
+                    flush=True,
+                )
+                self._pre_move_tactile_last_error = message
+
+    def _pre_move_tactile_record(self, obs: dict[str, Any]) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "step": self.get_step_count(),
+            "atom_id": int(getattr(self._task, "atom_id", 0)),
+            "atom_tag": str(getattr(self._task, "atom_tag", "")),
+            "time_s": float(time.time() - self._start_time),
+        }
+        task = self._task
+        actor = getattr(task, "prism", None)
+        robot_manager = getattr(task, "_robot_manager", None)
+        if actor is not None:
+            try:
+                pose = actor.get_pose()
+                record["prism_position"] = _jsonable(np.asarray(pose.p, dtype=np.float32).reshape(3))
+                record["prism_z"] = float(pose.p[2])
+            except Exception as exc:
+                record["prism_error"] = repr(exc)
+        if robot_manager is not None:
+            try:
+                gripper_pose = robot_manager.get_gripper_center_pose()
+                record["gripper_position"] = _jsonable(np.asarray(gripper_pose.p, dtype=np.float32).reshape(3))
+                record["gripper_z"] = float(gripper_pose.p[2])
+            except Exception as exc:
+                record["gripper_pose_error"] = repr(exc)
+            try:
+                record["gripper_qpos"] = float(robot_manager.get_gripper_qpos())
+            except Exception as exc:
+                record["gripper_qpos_error"] = repr(exc)
+            if actor is not None:
+                try:
+                    inhand_pose = robot_manager.get_inhand_pose(actor)
+                    record["prism_in_gripper_position"] = _jsonable(
+                        np.asarray(inhand_pose.p, dtype=np.float32).reshape(3)
+                    )
+                except Exception as exc:
+                    record["prism_in_gripper_error"] = repr(exc)
+        tactile = obs.get("tactile", {})
+        hands: dict[str, Any] = {}
+        for hand in ("left_tactile", "right_tactile"):
+            hand_obs = tactile.get(hand, {})
+            hands[hand] = self._summarize_native_tactile_hand(hand_obs)
+        record["tactile"] = hands
+        left = hands.get("left_tactile", {})
+        right = hands.get("right_tactile", {})
+        record["contact_balance"] = _balanced_difference(
+            float(left.get("contact_area_px", 0.0)),
+            float(right.get("contact_area_px", 0.0)),
+        )
+        record["marker_balance"] = _balanced_difference(
+            float(left.get("marker_count", 0.0)),
+            float(right.get("marker_count", 0.0)),
+        )
+        return _jsonable(record)
+
+    def _summarize_native_tactile_hand(self, hand_obs: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        depth = hand_obs.get("depth")
+        if depth is not None:
+            depth_arr = np.asarray(_to_numpy(depth), dtype=np.float32)
+            while depth_arr.ndim > 2 and depth_arr.shape[0] == 1:
+                depth_arr = depth_arr[0]
+            finite = depth_arr[np.isfinite(depth_arr)]
+            if finite.size:
+                far_plane = float(getattr(self._task.cfg.robot, "tactile_far_plane", 30.0))
+                margin = max(0.1, float(self._task_config.get("pre_move_depth_contact_margin_mm", 0.5)))
+                contact_mask = finite < (far_plane - margin)
+                indentation = np.clip(far_plane - finite, 0.0, None)
+                summary.update(
+                    {
+                        "depth_min_mm": float(np.min(finite)),
+                        "depth_mean_mm": float(np.mean(finite)),
+                        "depth_max_mm": float(np.max(finite)),
+                        "depth_far_plane_mm": far_plane,
+                        "depth_indentation_max_mm": float(np.max(indentation)),
+                        "depth_indentation_mean_mm": float(np.mean(indentation)),
+                        "contact_area_px": int(np.count_nonzero(contact_mask)),
+                        "contact_area_ratio": float(np.count_nonzero(contact_mask) / finite.size),
+                    }
+                )
+        marker = hand_obs.get("marker")
+        if marker is not None:
+            marker_arr = np.asarray(_to_numpy(marker), dtype=np.float32)
+            marker_stats = _marker_motion_stats(marker_arr)
+            summary.update(marker_stats)
+        return summary
+
+    def _export_pre_move_tactile_timeline(self, output_dir: Path) -> None:
+        if not self._pre_move_tactile_timeline:
+            return
+        json_path = output_dir / "pre_move_tactile_timeline.json"
+        csv_path = output_dir / "pre_move_tactile_timeline.csv"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(self._pre_move_tactile_timeline, f, indent=2, sort_keys=True)
+        rows = [_flatten_timeline_record(record) for record in self._pre_move_tactile_timeline]
+        columns: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in columns:
+                    columns.append(key)
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write(",".join(columns) + "\n")
+            for row in rows:
+                f.write(",".join(_csv_cell(row.get(column, "")) for column in columns) + "\n")
+        print(
+            "[capx-univtac] saved pre_move tactile timeline "
+            f"records={len(self._pre_move_tactile_timeline)} path={json_path}",
+            flush=True,
+        )
 
     def _debug_snapshot(self, label: str) -> dict[str, Any]:
         task = self._task
@@ -837,6 +983,11 @@ class UniVTACLowLevelEnv(BaseEnv):
         if step <= 0 or step % self._video_frame_stride != 0:
             return
         try:
+            # UniVTAC does not update rendered camera tensors during pre_move
+            # unless rendering is requested. CaP-X records reset/pre_move video
+            # for diagnosis, so force a render immediately before sampling.
+            if bool(getattr(self._task, "in_pre_move", False)):
+                self._task._update_render()
             obs = self._read_native_observation(
                 include_camera=True,
                 include_tactile=True,
@@ -1081,6 +1232,65 @@ def _first_present(*values: Any) -> Any:
         if value is not None:
             return value
     return None
+
+
+def _marker_motion_stats(marker: np.ndarray) -> dict[str, Any]:
+    arr = np.asarray(marker, dtype=np.float32)
+    while arr.ndim > 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    stats: dict[str, Any] = {}
+    if arr.ndim >= 3 and arr.shape[-1] >= 2:
+        pts = arr.reshape(-1, arr.shape[-1])[..., :2]
+        finite_mask = np.isfinite(pts).all(axis=1)
+        pts = pts[finite_mask]
+        if pts.size:
+            stats["marker_count"] = int(len(pts))
+            stats["marker_centroid_xy"] = _jsonable(np.mean(pts, axis=0))
+            stats["marker_spread_xy"] = _jsonable(np.std(pts, axis=0))
+    if arr.ndim >= 4 and arr.shape[0] >= 2 and arr.shape[-1] >= 2:
+        before = arr[0].reshape(-1, arr.shape[-1])[..., :2]
+        after = arr[1].reshape(-1, arr.shape[-1])[..., :2]
+        finite_mask = np.isfinite(before).all(axis=1) & np.isfinite(after).all(axis=1)
+        before = before[finite_mask]
+        after = after[finite_mask]
+        if before.size:
+            disp = np.linalg.norm(after - before, axis=1)
+            stats["marker_motion_mean_px"] = float(np.mean(disp))
+            stats["marker_motion_max_px"] = float(np.max(disp))
+            stats["marker_motion_centroid_delta_xy"] = _jsonable(np.mean(after - before, axis=0))
+    return stats
+
+
+def _balanced_difference(left: float, right: float) -> float:
+    denom = abs(left) + abs(right)
+    if denom <= 1e-9:
+        return 0.0
+    return float(abs(left - right) / denom)
+
+
+def _flatten_timeline_record(record: dict[str, Any]) -> dict[str, Any]:
+    flat: dict[str, Any] = {}
+
+    def visit(prefix: str, value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                visit(f"{prefix}.{key}" if prefix else str(key), item)
+        elif isinstance(value, list):
+            flat[prefix] = " ".join(str(v) for v in value)
+        else:
+            flat[prefix] = value
+
+    visit("", record)
+    return flat
+
+
+def _csv_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    if any(ch in text for ch in {",", "\"", "\n"}):
+        text = "\"" + text.replace("\"", "\"\"") + "\""
+    return text
 
 
 def _resize_rgb(value: Any, width: int, height: int) -> np.ndarray:
