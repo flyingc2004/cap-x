@@ -36,7 +36,9 @@ class UniVTACFrankaCompatApi(ApiBase):
         placement_dis: float = 0.0,
         gripper_settle_steps: int = 10,
         use_task_grasp_actor_for_prism: bool = True,
+        use_task_grasp_actor_for_objects: bool | None = None,
         grasp_xy_tolerance: float = 0.08,
+        grasp_z_tolerance: float = 0.04,
         grasp_pre_dis: float = 0.04,
         grasp_dis: float = 0.0,
         grasp_height: float = 0.04,
@@ -70,7 +72,16 @@ class UniVTACFrankaCompatApi(ApiBase):
         self.use_task_grasp_actor_for_prism = bool(
             cfg.get("use_task_grasp_actor_for_prism", use_task_grasp_actor_for_prism)
         )
+        generic_grasp_default = (
+            self.use_task_grasp_actor_for_prism
+            if use_task_grasp_actor_for_objects is None
+            else bool(use_task_grasp_actor_for_objects)
+        )
+        self.use_task_grasp_actor_for_objects = bool(
+            cfg.get("use_task_grasp_actor_for_objects", generic_grasp_default)
+        )
         self.grasp_xy_tolerance = float(cfg.get("grasp_xy_tolerance", grasp_xy_tolerance))
+        self.grasp_z_tolerance = float(cfg.get("grasp_z_tolerance", grasp_z_tolerance))
         self.grasp_pre_dis = float(cfg.get("grasp_pre_dis", grasp_pre_dis))
         self.grasp_dis = float(cfg.get("grasp_dis", grasp_dis))
         self.grasp_height = float(cfg.get("grasp_height", grasp_height))
@@ -106,9 +117,8 @@ class UniVTACFrankaCompatApi(ApiBase):
         """Get a public landmark pose from UniVTAC actor observations.
 
         Args:
-            object_name: Public object or landmark name. Supported first-version
-                names are the task-visible pads such as "orange pad" and
-                "green pad".
+            object_name: Public object or landmark name, including the active
+                lift-can object under the name "can".
             return_bbox_extent: Whether to also return an approximate extent.
 
         Returns:
@@ -127,19 +137,17 @@ class UniVTACFrankaCompatApi(ApiBase):
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return a safe grasp pose compatible with original CaP callers.
 
-        First-version behavior is intentionally conservative: for the grasped
-        prism task, return the current end-effector pose so code can continue to
-        use the familiar high-level flow without relying on hidden private fields.
+        Task-specific contact poses are produced by the UniVTAC low-level
+        adapter so sampling and native execution use the same geometry.
         """
         tool_pos, tool_quat = self._current_tool_pose()
         key = self._resolve_pose_key(object_name)
-        if key == "prism":
-            pos = self._public_prism_pose()
-            if pos is not None:
-                grasp_pos = pos.copy()
-                grasp_pos[2] += self.grasp_height
-                quat = self._native_grasp_quat_wxyz()
-                return grasp_pos.astype(np.float32), quat.astype(np.float32)
+        if key in {"prism", "can"}:
+            grasp_pose = self._public_grasp_pose(key)
+            if grasp_pose is not None:
+                return grasp_pose
+            if key == "can":
+                raise KeyError("object 'can' is not available for UniVTAC grasp sampling")
         return tool_pos, tool_quat
 
     def goto_pose(
@@ -324,6 +332,8 @@ class UniVTACFrankaCompatApi(ApiBase):
     def _estimate_extent_from_pose_name(self, key: str) -> np.ndarray:
         if "pad" in key:
             return np.array([0.10, 0.10, 0.03], dtype=np.float32)
+        if key == "can":
+            return np.array([0.06, 0.06, 0.12], dtype=np.float32)
         return np.array([0.03, 0.03, 0.03], dtype=np.float32)
 
     def _public_landmarks(self) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -350,6 +360,14 @@ class UniVTACFrankaCompatApi(ApiBase):
                 prism_pos.astype(np.float32),
                 self._native_grasp_quat_wxyz(),
                 np.array([0.06, 0.03, 0.03], dtype=np.float32),
+            )
+        can_pose = self._public_actor_pose("can")
+        if can_pose is not None:
+            can_pos, can_quat = can_pose
+            landmarks["can"] = (
+                can_pos,
+                can_quat,
+                self._estimate_extent_from_pose_name("can"),
             )
         return landmarks
 
@@ -399,18 +417,25 @@ class UniVTACFrankaCompatApi(ApiBase):
 
     def _nearest_public_grasp_target(self, position: np.ndarray) -> tuple[str, np.ndarray] | None:
         pos = np.asarray(position, dtype=np.float32).reshape(3)
-        prism_pos = self._public_prism_pose()
-        if prism_pos is None:
-            return None
-        grasp_pos = prism_pos.copy()
-        grasp_pos[2] += self.grasp_height
-        dist = float(np.linalg.norm(pos[:2] - grasp_pos[:2]))
-        if dist > self.grasp_xy_tolerance:
-            return None
-        return "prism", grasp_pos
+        best: tuple[str, np.ndarray] | None = None
+        best_dist = float("inf")
+        for key in ("prism", "can"):
+            sampled = self._public_grasp_pose(key)
+            if sampled is None:
+                continue
+            grasp_pos, _grasp_quat = sampled
+            xy_dist = float(np.linalg.norm(pos[:2] - grasp_pos[:2]))
+            z_dist = abs(float(pos[2] - grasp_pos[2]))
+            if xy_dist > self.grasp_xy_tolerance or z_dist > self.grasp_z_tolerance:
+                continue
+            distance = float(np.linalg.norm(pos - grasp_pos))
+            if distance < best_dist:
+                best = (key, grasp_pos)
+                best_dist = distance
+        return best
 
     def _try_approach_public_grasp(self, position: np.ndarray) -> dict[str, Any] | None:
-        if not self.use_task_grasp_actor_for_prism:
+        if not self.use_task_grasp_actor_for_objects:
             return None
         nearest = self._nearest_public_grasp_target(position)
         if nearest is None:
@@ -466,15 +491,51 @@ class UniVTACFrankaCompatApi(ApiBase):
         return result
 
     def _public_prism_pose(self) -> np.ndarray | None:
+        pose = self._public_actor_pose("prism")
+        return None if pose is None else pose[0]
+
+    def _public_actor_pose(self, key: str) -> tuple[np.ndarray, np.ndarray] | None:
         task = getattr(self._env, "task", None)
-        actor = getattr(task, "prism", None)
+        actor = getattr(task, key, None)
         if actor is None:
             return None
         try:
             pose = actor.get_pose()
-            return np.asarray(pose.p, dtype=np.float32).reshape(3)
+            pos = np.asarray(pose.p, dtype=np.float32).reshape(3)
+            raw_quat = getattr(pose, "q", None)
+            if raw_quat is None:
+                if key != "prism":
+                    return None
+                quat = self._native_grasp_quat_wxyz()
+            else:
+                quat = self._normalize_quat(np.asarray(raw_quat, dtype=np.float32).reshape(4))
+            return pos, quat
         except Exception:
             return None
+
+    def _public_grasp_pose(self, key: str) -> tuple[np.ndarray, np.ndarray] | None:
+        if self._public_actor_pose(key) is None:
+            return None
+        sample_fn = getattr(self._env, "get_public_grasp_pose", None)
+        if callable(sample_fn):
+            try:
+                sampled = sample_fn(key, grasp_height=self.grasp_height)
+            except (KeyError, RuntimeError, ValueError):
+                sampled = None
+            if sampled is not None:
+                pos, quat = sampled
+                return (
+                    np.asarray(pos, dtype=np.float32).reshape(3),
+                    self._normalize_quat(np.asarray(quat, dtype=np.float32).reshape(4)),
+                )
+
+        if key == "prism":
+            pos = self._public_prism_pose()
+            if pos is not None:
+                grasp_pos = pos.copy()
+                grasp_pos[2] += self.grasp_height
+                return grasp_pos.astype(np.float32), self._native_grasp_quat_wxyz()
+        return None
 
     def _native_grasp_quat_wxyz(self) -> np.ndarray:
         try:

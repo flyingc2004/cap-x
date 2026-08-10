@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
+import types
 
 import numpy as np
+import pytest
 import yaml
 
 from capx.envs.runner import _setup_output_dir
@@ -208,6 +211,16 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
     assert "UniVTACTactileApi" in list_apis()
     assert "FrankaControlApi" in list_apis()
 
+    franka_functions = UniVTACFrankaCompatApi.__new__(UniVTACFrankaCompatApi).functions()
+    assert set(franka_functions) == {
+        "get_object_pose",
+        "sample_grasp_pose",
+        "goto_pose",
+        "open_gripper",
+        "close_gripper",
+        "home_pose",
+    }
+
     functions = UniVTACTactileApi.__new__(UniVTACTactileApi).functions()
     assert "get_tactile_summary" in functions
     assert "retrieve_tactile_strategies" not in functions
@@ -253,6 +266,22 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
         ]
         is False
     )
+
+    lift_config_path = config_path.with_name("lift_can_tactile.yaml")
+    lift_config = yaml.safe_load(lift_config_path.read_text(encoding="utf-8"))
+    lift_cfg = lift_config["env"]["cfg"]
+    lift_low_level = lift_cfg["low_level"]
+    lift_franka = lift_low_level["api_configs"]["franka_control_api"]
+    assert lift_low_level["task_name"] == "lift_can"
+    assert lift_low_level["task_config"] == "smoke_capx_lift_can"
+    assert lift_cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
+    assert lift_franka["object_pose_names"] == {
+        "can": "can",
+        "object": "can",
+        "target object": "can",
+    }
+    assert lift_franka["use_task_grasp_actor_for_objects"] is True
+    assert lift_franka["grasp_z_tolerance"] == 0.04
 
 
 def test_univtac_franka_compat_respects_config_and_uses_high_level_api() -> None:
@@ -378,6 +407,219 @@ def test_univtac_franka_compat_routes_prism_to_native_grasp() -> None:
     api.goto_pose(grasp_pos, grasp_quat, z_approach=0.1)
     assert len(env.approach_calls) == 1
     assert env.approach_calls[0]["object_name"] == "prism"
+
+
+def test_univtac_franka_compat_exposes_and_routes_can_grasp() -> None:
+    sampled_pos = np.array([0.635, 0.01, 0.022], dtype=np.float32)
+    sampled_quat = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+
+    class Pose:
+        p = np.array([0.70, 0.01, 0.03], dtype=np.float32)
+        q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    class Actor:
+        def get_pose(self):
+            return Pose()
+
+    class Task:
+        can = Actor()
+
+    class Env:
+        task = Task()
+
+        def __init__(self) -> None:
+            self.approach_calls = []
+            self.motion_calls = []
+            self.api_configs = {
+                "franka_control_api": {
+                    "use_task_grasp_actor_for_objects": True,
+                    "use_task_place_actor_for_landmarks": False,
+                    "grasp_xy_tolerance": 0.08,
+                    "grasp_z_tolerance": 0.04,
+                    "object_pose_names": {
+                        "can": "can",
+                        "object": "can",
+                        "target object": "can",
+                    },
+                }
+            }
+
+        def get_public_grasp_pose(self, object_name, *, grasp_height):
+            assert object_name == "can"
+            assert grasp_height == 0.04
+            return sampled_pos.copy(), sampled_quat.copy()
+
+        def approach_grasped_actor(self, **kwargs):
+            self.approach_calls.append(kwargs)
+            return {"ok": True, "message": "native grasp approach executed"}
+
+        def take_action(self, action, *, action_type: str):
+            self.motion_calls.append((np.asarray(action), action_type))
+            return {"ok": True}
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.30, 0.0, 0.20],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+                "joint": [0.0] * 8,
+            }
+
+        def get_status(self):
+            return {
+                "task": "lift_can",
+                "instruction": "test",
+                "step": 0,
+                "action_count": 0,
+                "max_steps": 10,
+            }
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    for alias in ("can", "object", "target object"):
+        pos, quat, extent = api.get_object_pose(alias)
+        np.testing.assert_allclose(pos, Pose.p)
+        np.testing.assert_allclose(quat, Pose.q)
+        assert extent is None
+
+    grasp_pos, grasp_quat = api.sample_grasp_pose("can")
+    np.testing.assert_allclose(grasp_pos, sampled_pos)
+    np.testing.assert_allclose(grasp_quat, sampled_quat)
+    assert not np.allclose(grasp_pos, env.get_robot_state()["ee_pos"])
+
+    api.goto_pose(grasp_pos, grasp_quat, z_approach=0.08)
+    assert len(env.approach_calls) == 1
+    assert env.approach_calls[0]["object_name"] == "can"
+    assert not env.motion_calls
+
+    lift_pos = grasp_pos + np.array([0.0, 0.0, 0.10], dtype=np.float32)
+    api.goto_pose(lift_pos, grasp_quat, z_approach=0.0)
+    assert len(env.approach_calls) == 1
+    assert env.motion_calls
+    assert all(action_type == "delta_ee" for _action, action_type in env.motion_calls)
+
+
+def test_univtac_franka_compat_can_missing_is_explicit() -> None:
+    class Env:
+        task = object()
+        api_configs = {
+            "franka_control_api": {
+                "object_pose_names": {"can": "can"},
+            }
+        }
+
+        def get_public_grasp_pose(self, object_name, *, grasp_height):
+            raise KeyError(object_name)
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.30, 0.0, 0.20],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+                "joint": [0.0] * 8,
+            }
+
+    api = UniVTACFrankaCompatApi(Env())
+    with pytest.raises(KeyError, match="can"):
+        api.get_object_pose("can")
+    with pytest.raises(KeyError, match="can"):
+        api.sample_grasp_pose("can")
+
+
+def test_univtac_low_level_can_grasp_matches_native_task_geometry(monkeypatch) -> None:
+    captured = {}
+
+    class Pose:
+        def __init__(self, p, q=(1.0, 0.0, 0.0, 0.0)) -> None:
+            self.p = np.asarray(p, dtype=np.float32)
+            self.q = np.asarray(q, dtype=np.float32)
+
+        def add_bias(self, bias):
+            return Pose(self.p + np.asarray(bias, dtype=np.float32), self.q)
+
+        def to_transformation_matrix(self):
+            matrix = np.eye(4, dtype=np.float32)
+            matrix[:3, 3] = self.p
+            return matrix
+
+    def construct_grasp_pose(position, z_axis, x_axis):
+        captured["position"] = np.asarray(position, dtype=np.float32)
+        captured["z_axis"] = np.asarray(z_axis, dtype=np.float32)
+        captured["x_axis"] = np.asarray(x_axis, dtype=np.float32)
+        return Pose(position, (0.5, 0.5, 0.5, 0.5))
+
+    envs_module = types.ModuleType("envs")
+    envs_module.__path__ = []
+    utils_module = types.ModuleType("envs.utils")
+    utils_module.__path__ = []
+    transforms_module = types.ModuleType("envs.utils.transforms")
+    transforms_module.construct_grasp_pose = construct_grasp_pose
+    monkeypatch.setitem(sys.modules, "envs", envs_module)
+    monkeypatch.setitem(sys.modules, "envs.utils", utils_module)
+    monkeypatch.setitem(sys.modules, "envs.utils.transforms", transforms_module)
+
+    class Actor:
+        def __init__(self) -> None:
+            self.registered = []
+
+        def get_pose(self):
+            return Pose([0.70, 0.0, 0.03])
+
+        def register_point(self, pose, *, type):
+            self.registered.append((pose, type))
+            return 7
+
+    actor = Actor()
+
+    class Atom:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def grasp_actor(self, target_actor, **kwargs):
+            self.calls.append((target_actor, kwargs))
+            return ["native-grasp-action"]
+
+    class Task:
+        can = actor
+        atom = Atom()
+        step_count = 0
+        take_action_cnt = 0
+
+        def move(self, actions, **kwargs):
+            self.move_call = (actions, kwargs)
+            return True
+
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._task = Task()
+    env._last_action_result = {}
+    env._update_after_action = lambda: None
+    env._append_debug_record = lambda label: None
+
+    grasp_pos, grasp_quat = env.get_public_grasp_pose("can")
+    np.testing.assert_allclose(grasp_pos, [0.635, 0.0, 0.022], atol=1e-6)
+    np.testing.assert_allclose(grasp_quat, [0.5, 0.5, 0.5, 0.5])
+    np.testing.assert_allclose(captured["z_axis"], [0.0, 0.0, 1.0])
+    np.testing.assert_allclose(captured["x_axis"], [1.0, 0.0, 0.0])
+
+    result = env.approach_grasped_actor(object_name="can")
+    assert result["ok"] is True
+    assert actor.registered[-1][1] == "contact"
+    target_actor, kwargs = env._task.atom.calls[-1]
+    assert target_actor is actor
+    assert kwargs["contact_point_id"] == 7
+    assert kwargs["is_close"] is False
+
+
+def test_univtac_lift_can_instruction_is_public_only() -> None:
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._task = object()
+    env.task_name = "lift_can"
+
+    instruction = env.get_task_instruction()
+    assert "cylindrical can" in instruction
+    assert "native tactile" in instruction
+    assert "0.10 meters" in instruction
+    assert "reward" not in instruction
+    assert "success" not in instruction
+    assert "metadata" not in instruction
 
 
 def test_preserve_output_dir_env_flag(monkeypatch, tmp_path) -> None:

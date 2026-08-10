@@ -19,7 +19,9 @@ env:
           release_hover_height: 0.15
           preserve_landmark_orientation: true
           gripper_settle_steps: 10
+          use_task_grasp_actor_for_objects: true
           grasp_xy_tolerance: 0.08
+          grasp_z_tolerance: 0.04
           grasp_pre_dis: 0.04
           grasp_dis: 0.0
           grasp_height: 0.04
@@ -57,4 +59,3 @@ record_video: true
 output_dir: ./outputs/univtac_lift_can_tactile
 trial_timeout_seconds: 240
 max_trial_retries: 1
-

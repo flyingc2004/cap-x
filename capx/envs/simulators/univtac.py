@@ -293,18 +293,6 @@ class UniVTACLowLevelEnv(BaseEnv):
         sees only ``sample_grasp_pose`` and ``goto_pose``; this method translates
         that CaP-style request into UniVTAC's native motion planner.
         """
-        try:
-            from envs.utils.transforms import construct_grasp_pose
-        except Exception as exc:
-            result = {
-                "ok": False,
-                "step": self.get_step_count(),
-                "action_count": self.get_action_count(),
-                "message": f"could not import UniVTAC grasp helpers: {exc!r}",
-            }
-            self._last_action_result = result
-            return result
-
         actor = self._public_grasp_actor(object_name)
         if actor is None:
             result = {
@@ -317,8 +305,11 @@ class UniVTACLowLevelEnv(BaseEnv):
             return result
 
         try:
-            target_pose = actor.get_pose().add_bias([0.0, 0.0, float(grasp_height)])
-            contact_pose = construct_grasp_pose(target_pose.p, [0, 0, 1], [1, 0, 0])
+            contact_pose = self._make_public_grasp_pose(
+                object_name,
+                actor,
+                grasp_height=float(grasp_height),
+            )
             contact_id = actor.register_point(contact_pose, type="contact")
             actions = self._task.atom.grasp_actor(
                 actor,
@@ -350,6 +341,26 @@ class UniVTACLowLevelEnv(BaseEnv):
         }
         self._last_action_result = result
         return result
+
+    def get_public_grasp_pose(
+        self,
+        object_name: str,
+        *,
+        grasp_height: float = 0.04,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return the public pose used by the matching native grasp approach."""
+        actor = self._public_grasp_actor(object_name)
+        if actor is None:
+            raise KeyError(f"public grasp object '{object_name}' is not available")
+        pose = self._make_public_grasp_pose(
+            object_name,
+            actor,
+            grasp_height=float(grasp_height),
+        )
+        return (
+            np.asarray(pose.p, dtype=np.float32).reshape(3),
+            np.asarray(pose.q, dtype=np.float32).reshape(4),
+        )
 
     def move_gripper_native(
         self,
@@ -417,6 +428,11 @@ class UniVTACLowLevelEnv(BaseEnv):
             return (
                 "Classify the grasped prism using UniVTAC native tactile feedback, "
                 "then place a rough prism on the orange pad and a plain prism on the green pad."
+            )
+        if self.task_name == "lift_can":
+            return (
+                "Grasp the cylindrical can, confirm contact using UniVTAC native tactile "
+                "feedback, and lift it at least 0.10 meters while maintaining a stable grasp."
             )
         return f"Solve the UniVTAC task: {self.task_name}."
 
@@ -1031,9 +1047,42 @@ class UniVTACLowLevelEnv(BaseEnv):
 
     def _public_grasp_actor(self, object_name: str):
         key = str(object_name).strip().lower().replace("_", " ")
+        if key == "can":
+            return getattr(self._task, "can", None)
         if key in {"prism", "object", "block", "grasped object", "target object"}:
-            return getattr(self._task, "prism", None)
+            actor = getattr(self._task, "prism", None)
+            return actor if actor is not None else getattr(self._task, "can", None)
         return None
+
+    def _make_public_grasp_pose(
+        self,
+        object_name: str,
+        actor: Any,
+        *,
+        grasp_height: float,
+    ) -> Any:
+        from envs.utils.transforms import construct_grasp_pose
+
+        key = str(object_name).strip().lower().replace("_", " ")
+        if key == "can" or actor is getattr(self._task, "can", None):
+            target_pose = actor.get_pose().add_bias([-0.065, 0.0, -0.008])
+            target_mat = target_pose.to_transformation_matrix()
+            x_axis = target_mat[:3, 0].reshape(-1)
+            target_mat = np.vstack(
+                [
+                    x_axis,
+                    np.cross(x_axis, [0.0, 0.0, 1.0]),
+                    [0.0, 0.0, 1.0],
+                ]
+            )
+            return construct_grasp_pose(
+                target_pose.p,
+                target_mat[:3, 2],
+                target_mat[:3, 0],
+            )
+
+        target_pose = actor.get_pose().add_bias([0.0, 0.0, float(grasp_height)])
+        return construct_grasp_pose(target_pose.p, [0, 0, 1], [1, 0, 0])
 
     def _compose_frame(self, obs: dict[str, Any]) -> np.ndarray:
         head = _nested_get(obs, ["observation", "head", "rgb"])
