@@ -65,6 +65,7 @@ class UniVTACTactileApi(ApiBase):
             f"left={summary['left_contact']} right={summary['right_contact']} "
             f"force={summary['normal_force']:.3f} depth={summary['depth_delta_mm']:.3f}mm "
             f"shear={summary['shear_magnitude']:.3f} "
+            f"centroid={summary['marker_centroid_displacement']:.3f} "
             f"slip={summary['slip_score']:.3f} event={summary['event']}"
         )
         return summary
@@ -207,15 +208,20 @@ class UniVTACTactileApi(ApiBase):
         right_mean = summary["right"]["marker_mean_displacement"]
         left_max = summary["left"]["marker_max_displacement"]
         right_max = summary["right"]["marker_max_displacement"]
+        left_centroid = summary["left"]["marker_centroid_displacement"]
+        right_centroid = summary["right"]["marker_centroid_displacement"]
         return {
             "hand": hand,
             "shear_magnitude": summary["shear_magnitude"],
+            "marker_centroid_displacement": summary["marker_centroid_displacement"],
             "mean_displacement": max(left_mean, right_mean),
             "max_displacement": max(left_max, right_max),
             "left_marker_mean_displacement": summary["left"]["marker_mean_displacement"],
             "right_marker_mean_displacement": summary["right"]["marker_mean_displacement"],
             "left_marker_max_displacement": summary["left"]["marker_max_displacement"],
             "right_marker_max_displacement": summary["right"]["marker_max_displacement"],
+            "left_marker_centroid_displacement": left_centroid,
+            "right_marker_centroid_displacement": right_centroid,
         }
 
     def get_recent_tactile_events(self, window: int = 50) -> list[str]:

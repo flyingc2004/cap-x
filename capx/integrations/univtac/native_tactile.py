@@ -89,8 +89,19 @@ def summarize_native_tactile(
         "force_full_scale_mm": force_full_scale_mm,
         "depth_contact_margin_mm": depth_contact_margin_mm,
     }
-    left_metrics = _hand_metrics(current.left_depth, current.left_marker, **metric_kwargs)
-    right_metrics = _hand_metrics(current.right_depth, current.right_marker, **metric_kwargs)
+    baseline = frames[0]
+    left_metrics = _hand_metrics(
+        current.left_depth,
+        current.left_marker,
+        baseline_marker=baseline.left_marker,
+        **metric_kwargs,
+    )
+    right_metrics = _hand_metrics(
+        current.right_depth,
+        current.right_marker,
+        baseline_marker=baseline.right_marker,
+        **metric_kwargs,
+    )
 
     selected = _select_metrics(hand, left_metrics, right_metrics)
     contact = any(m["contact"] for m in selected)
@@ -100,6 +111,11 @@ def summarize_native_tactile(
     contact_area = float(np.mean([m["contact_area"] for m in selected])) if selected else 0.0
     shear_magnitude = float(np.mean([m["shear_magnitude"] for m in selected])) if selected else 0.0
     depth_delta_mm = float(np.mean([m["depth_delta_mm"] for m in selected])) if selected else 0.0
+    marker_centroid_displacement = (
+        float(np.mean([m["marker_centroid_displacement"] for m in selected]))
+        if selected
+        else 0.0
+    )
 
     previous_contact = any(
         any(m["contact"] for m in _select_metrics(
@@ -139,6 +155,7 @@ def summarize_native_tactile(
         "contact_area": contact_area,
         "depth_delta_mm": depth_delta_mm,
         "shear_magnitude": shear_magnitude,
+        "marker_centroid_displacement": marker_centroid_displacement,
         "slip_score": slip_score,
         "contact_balance": balance,
         "left": left_metrics,
@@ -179,6 +196,7 @@ def _empty_summary() -> dict[str, Any]:
         "contact_area": 0.0,
         "depth_delta_mm": 0.0,
         "shear_magnitude": 0.0,
+        "marker_centroid_displacement": 0.0,
         "slip_score": 0.0,
         "contact_balance": 0.0,
         "left": _empty_hand_metrics(),
@@ -198,6 +216,7 @@ def _empty_hand_metrics() -> dict[str, Any]:
         "shear_magnitude": 0.0,
         "marker_mean_displacement": 0.0,
         "marker_max_displacement": 0.0,
+        "marker_centroid_displacement": 0.0,
     }
 
 
@@ -205,6 +224,7 @@ def _hand_metrics(
     depth: np.ndarray | None,
     marker: np.ndarray | None,
     *,
+    baseline_marker: np.ndarray | None = None,
     depth_far_plane_mm: float | None = None,
     force_full_scale_mm: float = 2.0,
     depth_contact_margin_mm: float = 0.5,
@@ -217,6 +237,7 @@ def _hand_metrics(
     )
     depth_delta = depth_stats["depth_delta_mm"]
     marker_mean, marker_max = _marker_displacement(marker)
+    marker_centroid_displacement = _marker_centroid_displacement(marker, baseline_marker)
     contact_area = depth_stats["contact_area"]
     force_scale = max(float(force_full_scale_mm), 1e-6)
     # This is a normalized compression proxy, not a Newton estimate. A value
@@ -247,6 +268,7 @@ def _hand_metrics(
             "shear_magnitude": shear,
             "marker_mean_displacement": float(marker_mean),
             "marker_max_displacement": float(marker_max),
+            "marker_centroid_displacement": float(marker_centroid_displacement),
         }
     )
     return metrics
@@ -317,6 +339,31 @@ def _marker_displacement(marker: np.ndarray | None) -> tuple[float, float]:
     if float(np.nanmax(mag)) > 10.0:
         mag = mag / 320.0
     return float(np.mean(mag)), float(np.max(mag))
+
+
+def _marker_centroid_displacement(
+    marker: np.ndarray | None,
+    baseline_marker: np.ndarray | None,
+) -> float:
+    current = _marker_current_points(marker)
+    baseline = _marker_current_points(baseline_marker)
+    if current is None or baseline is None or current.size == 0 or baseline.size == 0:
+        return 0.0
+    return float(np.linalg.norm(np.mean(current, axis=0) - np.mean(baseline, axis=0)))
+
+
+def _marker_current_points(marker: np.ndarray | None) -> np.ndarray | None:
+    if marker is None or marker.size == 0:
+        return None
+    arr = np.asarray(marker, dtype=np.float64)
+    if arr.shape[-1] < 2:
+        return None
+    if arr.ndim >= 3 and arr.shape[0] >= 2:
+        points = arr[-1, ..., :2]
+    else:
+        points = arr[..., :2]
+    points = points.reshape(-1, 2)
+    return points[np.all(np.isfinite(points), axis=1)]
 
 
 def _marker_growth(

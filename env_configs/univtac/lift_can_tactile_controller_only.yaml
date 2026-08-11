@@ -1,0 +1,73 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/UniVTAC
+      task_name: lift_can
+      task_config: smoke_capx_lift_can
+      seed_base: 0
+      device: cuda:0
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.10
+          max_delta_xyz: 0.01
+          max_delta_rpy: 0.25
+          max_delta_gripper: 0.02
+          default_z_approach: 0.08
+          release_hover_height: 0.15
+          preserve_landmark_orientation: true
+          gripper_settle_steps: 10
+          use_task_grasp_actor_for_objects: true
+          grasp_xy_tolerance: 0.08
+          grasp_z_tolerance: 0.04
+          grasp_pre_dis: 0.04
+          grasp_dis: 0.0
+          grasp_height: 0.04
+          lift_after_close: false
+          lift_after_close_z: 0.05
+          close_gripper_qpos: 0.007
+          open_gripper_width: 1.0
+          tactile_adaptive_gripper_enabled: true
+          adaptive_gripper:
+            coarse_qpos_step: 0.0005
+            fine_qpos_step: 0.00005
+            contact_debounce_frames: 2
+            stable_debounce_frames: 3
+            release_debounce_frames: 2
+            settle_steps_per_command: 1
+            contact_force_threshold: 0.08
+            depth_contact_margin_mm: 0.5
+          object_pose_names:
+            can: can
+            object: can
+            target object: can
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis:
+      - FrankaControlApi
+    prompt: |
+      You are controlling a Franka robot inside UniVTAC.
+      Task: grasp the cylindrical can, lift and reorient it, then release it upright on the table as required by the native UniVTAC lift_can benchmark.
+      The public can pose is available as exactly two values: can_pos, can_quat = get_object_pose("can"). Only calls with return_bbox_extent=True return three values.
+      Use this high-level sequence: open_gripper(adaptive=True), sample_grasp_pose("can"), goto_pose(grasp_pos, grasp_quat, z_approach=0.08), close_gripper(adaptive=True, target_force=1.0, max_steps=160), then lift in two 0.05 meter increments.
+      The adaptive close/open controller changes only gripper width. It never moves or lifts the arm and never retries a grasp on its own.
+      Check the close result and lift only when grasp_result["stable"] is true. This coarse stable result is the only contact signal available; direct sensor query functions are not exposed.
+      If the close is unstable, explicitly open, re-approach the sampled grasp pose with a small safe adjustment, and retry once.
+      If all grasp retries fail, open the gripper, return home, and guard the lift code with a boolean so the program reaches its end normally. Do not call exit, quit, raise SystemExit, raise an exception, or use assert for an expected task failure.
+      After completing both lift increments, call open_gripper(adaptive=True) so the can can settle upright on the table. Do not call home_pose before releasing it.
+      Use only get_object_pose, sample_grasp_pose, goto_pose, open_gripper, close_gripper, and home_pose.
+      Do not query sensor observations directly.
+      Do not call low-level UniVTAC movement functions such as move_delta_ee, move_ee, or move_qpos.
+      Do not use reward, success, task_completed, or trial id as runtime observations.
+      Do not inspect private task fields, hidden object attributes, metadata, or labels.
+      Do not load or call UniVTAC ACT or ViTAL policies.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/univtac_lift_can_tactile_controller_only
+trial_timeout_seconds: 240
+max_trial_retries: 1

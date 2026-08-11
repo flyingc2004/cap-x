@@ -127,6 +127,40 @@ def test_native_marker_motion_uses_initial_current_axis_for_live_shape() -> None
     assert summary["shear_magnitude"] == pytest.approx(1.0)
 
 
+def test_native_marker_centroid_displacement_uses_window_baseline() -> None:
+    marker = np.zeros((2, 4, 2), dtype=np.float32)
+    marker[0, :, 0] = np.arange(4)
+    marker[1] = marker[0]
+    baseline = UniVTACTactileFrame(
+        step=0,
+        timestamp=0.0,
+        left_depth=_depth(False),
+        right_depth=_depth(False),
+        left_marker=marker,
+        right_marker=marker,
+        left_pose=None,
+        right_pose=None,
+    )
+
+    moved_marker = marker.copy()
+    moved_marker[1, :, 0] += 2.0
+    moved = UniVTACTactileFrame(
+        step=1,
+        timestamp=1.0,
+        left_depth=_depth(True),
+        right_depth=_depth(True),
+        left_marker=moved_marker,
+        right_marker=moved_marker,
+        left_pose=None,
+        right_pose=None,
+    )
+
+    summary = summarize_native_tactile([baseline, moved])
+
+    assert summary["marker_centroid_displacement"] == pytest.approx(2.0)
+    assert summary["left"]["marker_centroid_displacement"] == pytest.approx(2.0)
+
+
 def test_calibrated_depth_does_not_treat_marker_only_motion_as_contact() -> None:
     frame = _frame(step=0, left_marker=4.0, right_marker=4.0)
 
@@ -762,6 +796,19 @@ def test_univtac_lift_can_instruction_is_public_only() -> None:
     assert "reward" not in instruction
     assert "success" not in instruction
     assert "metadata" not in instruction
+
+
+def test_univtac_lift_can_fixed_instruction_does_not_mention_tactile() -> None:
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._task = object()
+    env.task_name = "lift_can"
+    env.api_configs = {
+        "franka_control_api": {"tactile_adaptive_gripper_enabled": False}
+    }
+
+    instruction = env.get_task_instruction()
+    assert "fixed gripper control" in instruction
+    assert "tactile" not in instruction.lower()
 
 
 def test_preserve_output_dir_env_flag(monkeypatch, tmp_path) -> None:

@@ -270,6 +270,63 @@ def test_adaptive_false_preserves_fixed_native_open_close() -> None:
     assert env.calls[1]["qpos"] == pytest.approx(0.75 * 0.039)
 
 
+def test_config_can_force_adaptive_requests_to_fixed_native_control() -> None:
+    class Env:
+        task = SimpleNamespace(_robot_manager=SimpleNamespace(gripper_max_qpos=0.039))
+        api_configs = {
+            "franka_control_api": {
+                "lift_after_close": False,
+                "tactile_adaptive_gripper_enabled": False,
+            }
+        }
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def move_gripper_native(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"ok": True, "message": "fixed"}
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    api._adaptive_gripper_controller = lambda: pytest.fail(
+        "disabled adaptive control must not construct a tactile controller"
+    )
+
+    close_result = api.close_gripper(adaptive=True)
+    open_result = api.open_gripper(adaptive=True)
+
+    assert api.tactile_adaptive_gripper_enabled is False
+    assert close_result["reason"] == "fixed_close_requires_tactile_confirmation"
+    assert open_result["reason"] == "fixed_open"
+    assert [call["opening"] for call in env.calls] == [False, True]
+
+
+def test_lift_can_ablation_configs_isolate_tactile_access() -> None:
+    config_root = Path(__file__).resolve().parents[1] / "env_configs" / "univtac"
+    controller_only = yaml.safe_load(
+        (config_root / "lift_can_tactile_controller_only.yaml").read_text(encoding="utf-8")
+    )["env"]["cfg"]
+    no_tactile = yaml.safe_load(
+        (config_root / "lift_can_no_tactile.yaml").read_text(encoding="utf-8")
+    )["env"]["cfg"]
+
+    for cfg in (controller_only, no_tactile):
+        assert cfg["apis"] == ["FrankaControlApi"]
+        assert cfg["low_level"]["task_name"] == "lift_can"
+        assert cfg["low_level"]["task_config"] == "smoke_capx_lift_can"
+        assert "get_tactile_summary" not in cfg["prompt"]
+        assert "get_tactile_image" not in cfg["prompt"]
+
+    controller_franka = controller_only["low_level"]["api_configs"]["franka_control_api"]
+    fixed_franka = no_tactile["low_level"]["api_configs"]["franka_control_api"]
+    assert controller_franka["tactile_adaptive_gripper_enabled"] is True
+    assert "close_gripper(adaptive=True" in controller_only["prompt"]
+    assert fixed_franka["tactile_adaptive_gripper_enabled"] is False
+    assert "close_gripper(adaptive=False)" in no_tactile["prompt"]
+    assert "tactile" not in no_tactile["prompt"].lower()
+
+
 def test_univtac_gripper_hook_uses_force_false_without_action_count_change() -> None:
     class RobotManager:
         device = "cpu"

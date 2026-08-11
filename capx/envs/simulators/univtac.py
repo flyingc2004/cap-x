@@ -557,6 +557,16 @@ class UniVTACLowLevelEnv(BaseEnv):
                 "then place a rough prism on the orange pad and a plain prism on the green pad."
             )
         if self.task_name == "lift_can":
+            api_configs = getattr(self, "api_configs", {})
+            franka_cfg = api_configs.get("franka_control_api", {})
+            adaptive_enabled = bool(
+                franka_cfg.get("tactile_adaptive_gripper_enabled", True)
+            )
+            if not adaptive_enabled:
+                return (
+                    "Grasp and lift the cylindrical can using fixed gripper control, "
+                    "then release it upright on the table."
+                )
             return (
                 "Grasp and lift the cylindrical can using UniVTAC native tactile feedback, "
                 "then release it upright on the table."

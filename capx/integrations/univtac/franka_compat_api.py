@@ -51,6 +51,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         lift_after_close_z: float = 0.05,
         close_gripper_qpos: float = 0.007,
         open_gripper_width: float = 1.0,
+        tactile_adaptive_gripper_enabled: bool = True,
         object_pose_names: dict[str, str] | None = None,
     ) -> None:
         super().__init__(env)
@@ -94,6 +95,9 @@ class UniVTACFrankaCompatApi(ApiBase):
         self.lift_after_close_z = float(cfg.get("lift_after_close_z", lift_after_close_z))
         self.close_gripper_qpos = float(cfg.get("close_gripper_qpos", close_gripper_qpos))
         self.open_gripper_width = float(cfg.get("open_gripper_width", open_gripper_width))
+        self.tactile_adaptive_gripper_enabled = bool(
+            cfg.get("tactile_adaptive_gripper_enabled", tactile_adaptive_gripper_enabled)
+        )
         adaptive_cfg = cfg.get("adaptive_gripper", {})
         self.adaptive_gripper_config = dict(adaptive_cfg) if isinstance(adaptive_cfg, dict) else {}
         self.object_pose_names = dict(cfg.get("object_pose_names", object_pose_names or {})) or {
@@ -205,14 +209,14 @@ class UniVTACFrankaCompatApi(ApiBase):
         """Open the gripper, releasing gently while native contact remains.
 
         Args:
-            adaptive: Use CaP-X tactile feedback control when true.
+            adaptive: Use feedback-driven coarse/fine control when enabled by config.
             target_width: Normalized target width from 0 (closed) to 1 (open).
             max_steps: Maximum tactile servo iterations.
 
         Returns:
             Result containing ``released``, final width, and stop reason.
         """
-        if adaptive:
+        if adaptive and self.tactile_adaptive_gripper_enabled:
             controller = self._adaptive_gripper_controller()
             result = controller.open(target_width=target_width, max_steps=max_steps)
             self._save_adaptive_trace(controller.trace)
@@ -256,10 +260,10 @@ class UniVTACFrankaCompatApi(ApiBase):
         target_force: float = 0.35,
         max_steps: int = 80,
     ) -> dict[str, Any]:
-        """Close the gripper using CaP-X native tactile feedback control.
+        """Close the gripper using optional feedback-driven width control.
 
         Args:
-            adaptive: Use tactile coarse/fine closing when true.
+            adaptive: Use feedback-driven coarse/fine closing when enabled by config.
             target_force: Normalized target force used for stable-contact stop.
             max_steps: Maximum tactile servo iterations.
 
@@ -267,7 +271,7 @@ class UniVTACFrankaCompatApi(ApiBase):
             Result containing ``stable``, contact state, and stop reason. The
             caller remains responsible for pose adjustment, retry, and lift.
         """
-        if adaptive:
+        if adaptive and self.tactile_adaptive_gripper_enabled:
             controller = self._adaptive_gripper_controller()
             result = controller.close(target_force=target_force, max_steps=max_steps)
             self._save_adaptive_trace(controller.trace)
