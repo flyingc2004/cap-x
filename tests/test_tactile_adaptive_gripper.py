@@ -440,3 +440,20 @@ def test_code_execution_treats_zero_system_exit_as_normal_completion() -> None:
     assert normal["stderr"] == ""
     assert failed["ok"] is False
     assert "SystemExit: 2" in failed["stderr"]
+
+
+def test_code_execution_always_exposes_numpy_alias() -> None:
+    env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.low_level_env = object()
+    env._apis = {}
+    env._init_exec_globals()
+    env._get_observation = lambda: {}
+
+    result = env._exec_user_code(
+        "if False:\n"
+        "    import numpy as np\n"
+        "RESULT = np.array([0.0, 0.0, 0.05])\n"
+    )
+
+    assert result["ok"] is True
+    np.testing.assert_array_equal(result["result"], np.array([0.0, 0.0, 0.05]))

@@ -1,0 +1,70 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/UniVTAC
+      task_name: lift_can
+      task_config: smoke_capx_lift_can_official
+      seed_base: 0
+      device: cuda:0
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.10
+          default_z_approach: 0.08
+          release_hover_height: 0.15
+          preserve_landmark_orientation: false
+          use_task_place_actor_for_landmarks: false
+          use_task_grasp_actor_for_objects: false
+          use_native_pose_planner: true
+          record_perception_diagnostic: true
+          lift_after_close: false
+          gripper_settle_steps: 10
+          open_gripper_width: 1.0
+          tactile_adaptive_gripper_enabled: true
+          rgbd_perception_enabled: true
+          perception_camera: head
+          perception_prompt_map:
+            can: cylindrical can
+          sam3_service_url: http://127.0.0.1:8114
+          graspnet_service_url: http://127.0.0.1:8115
+          perception_timeout_seconds: 120
+          perception_min_depth_points: 32
+          grasp_local_z_offset: 0.12
+          adaptive_gripper:
+            coarse_qpos_step: 0.0005
+            fine_qpos_step: 0.00005
+            contact_debounce_frames: 2
+            stable_debounce_frames: 3
+            release_debounce_frames: 2
+            settle_steps_per_command: 1
+            contact_force_threshold: 0.08
+            depth_contact_margin_mm: 0.5
+          object_pose_names:
+            can: can
+            object: can
+            target object: can
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis:
+      - FrankaControlApi
+      - UniVTACTactileApi
+    prompt: |
+      You are controlling a Franka robot in the official UniVTAC lift_can evaluation protocol.
+      The official reset has already opened the gripper and moved it to a randomly perturbed pre-grasp pose around the cylindrical can. Do not open or reposition before the first grasp attempt.
+      First call close_gripper(adaptive=True, target_force=1.0, max_steps=160). Inspect its stable/contact fields and UniVTAC native tactile feedback.
+      When the first grasp is stable, call home_pose() to lift the grasped can to a safe hover while preserving the current grasp orientation. Check native tactile contact and slip during the lift, then call open_gripper(adaptive=True) so the can can settle upright on the table.
+      If the first grasp is not stable, open the gripper and perform one explicit non-privileged retry: call get_object_pose("can") or sample_grasp_pose("can"), move with goto_pose(grasp_pos, grasp_quat, z_approach=0.08), and close adaptively again.
+      get_object_pose and sample_grasp_pose use only head-camera RGB-D, SAM3, and Contact-GraspNet. A perception failure is a real failure; do not substitute guessed coordinates or hidden simulator state.
+      Use only the six high-level FrankaControlApi motion functions and UniVTAC native tactile functions. Do not call low-level move_delta_ee, move_ee, or move_qpos functions.
+      Never inspect task actors, metadata, private labels, reward, success, task_completed, or trial id. Do not load or call ACT or ViTAL policies.
+      If a physical action is stopped by the official action budget or early-stop rule, let the program reach its end normally. Do not call exit, quit, assert, or raise an exception for an expected task failure.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/univtac_lift_can_tactile_official
+trial_timeout_seconds: 300
+max_trial_retries: 1

@@ -70,6 +70,7 @@ class SimpleExecutor:
     def run(self, code: str, *, inputs: dict[str, Any] | None = None) -> dict[str, Any]:
         g: dict[str, Any] = {
             "__name__": "__main__",
+            "np": np,
             "env": self._env,
             "APIS": self._apis,
             "INPUTS": inputs or {},
@@ -202,6 +203,7 @@ class CodeExecutionEnvBase(Env):
         """
         g: dict[str, Any] = {
             "__name__": "__main__",
+            "np": np,
             "env": self._exec_env_binding(),
             "APIS": self._exec_apis_binding(),
             # Populated per-step/reset; keep reference stable across execs

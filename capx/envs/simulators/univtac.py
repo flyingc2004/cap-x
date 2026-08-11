@@ -88,6 +88,11 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._tactile_gripper_trace: list[dict[str, Any]] = []
         self._pre_move_tactile_timeline: list[dict[str, Any]] = []
         self._pre_move_tactile_last_error: str | None = None
+        self._perception_artifacts: list[dict[str, Any]] = []
+        self._official_task_protocol = False
+        self._protocol_stopped = False
+        self._protocol_stop_reason: str | None = None
+        self._reset_serial = 0
 
         self._prepare_import_path()
         self._build_task()
@@ -122,6 +127,10 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._tactile_gripper_trace.clear()
         self._pre_move_tactile_timeline.clear()
         self._pre_move_tactile_last_error = None
+        self._perception_artifacts.clear()
+        self._protocol_stopped = False
+        self._protocol_stop_reason = None
+        self._reset_serial += 1
 
         print(
             f"[capx-univtac] reset begin trial={trial} seed={actual_seed}",
@@ -201,6 +210,8 @@ class UniVTACLowLevelEnv(BaseEnv):
             return None
 
     def take_action(self, action: np.ndarray | torch.Tensor | list[float], *, action_type: str) -> dict[str, Any]:
+        if not self.protocol_action_allowed():
+            return self._protocol_blocked_result()
         tensor = self._to_tensor(action)
         exec_success, eval_success = self._task.take_action(tensor, action_type=action_type)
         self._update_after_action()
@@ -210,6 +221,152 @@ class UniVTACLowLevelEnv(BaseEnv):
             "step": self.get_step_count(),
             "action_count": self.get_action_count(),
             "message": "action executed" if exec_success else "UniVTAC action execution failed",
+        }
+        self._last_action_result = result
+        return result
+
+    def get_rgbd_frame(self, camera_name: str = "head"):
+        """Return one calibrated RGB-D frame without actor or task metadata."""
+        from capx.integrations.univtac.rgbd_perception import RgbdFrame
+
+        raw = self._read_native_observation(
+            include_camera=True,
+            include_tactile=False,
+            include_embodiment=False,
+            include_actor=False,
+        )
+        camera_obs = raw.get("observation", {}).get(str(camera_name), {})
+        if not isinstance(camera_obs, dict):
+            raise RuntimeError(f"UniVTAC camera {camera_name!r} is unavailable")
+        if "rgb" not in camera_obs or "depth" not in camera_obs:
+            raise RuntimeError(
+                f"UniVTAC camera {camera_name!r} must provide both rgb and depth"
+            )
+
+        cameras = getattr(getattr(self._task, "_camera_manager", None), "cameras", {})
+        camera = cameras.get(str(camera_name)) if isinstance(cameras, dict) else None
+        data = getattr(camera, "data", None)
+        if data is None:
+            raise RuntimeError(f"calibration for UniVTAC camera {camera_name!r} is unavailable")
+
+        rgb = _to_numpy(camera_obs["rgb"])
+        depth = _to_numpy(camera_obs["depth"])
+        if np.asarray(rgb).ndim == 4:
+            rgb = np.asarray(rgb)[0]
+        depth = np.asarray(depth)
+        if depth.ndim == 4:
+            depth = depth[0]
+        depth = np.squeeze(depth)
+        frame = RgbdFrame(
+            rgb=np.asarray(rgb),
+            depth=depth,
+            intrinsics=_to_numpy(data.intrinsic_matrices[0]),
+            camera_position=_to_numpy(data.pos_w[0]),
+            camera_quaternion_wxyz=_to_numpy(data.quat_w_ros[0]),
+            camera_name=str(camera_name),
+        ).validated()
+        self._current_obs = raw
+        return frame
+
+    def move_to_tool_pose_native(
+        self,
+        position: np.ndarray | list[float],
+        quaternion_wxyz: np.ndarray | list[float],
+    ) -> dict[str, Any]:
+        """Plan to a public gripper-center pose without consulting an actor."""
+        if not self.protocol_action_allowed():
+            return self._protocol_blocked_result()
+        from envs.utils.transforms import Pose
+
+        tool_pose = Pose(
+            np.asarray(position, dtype=np.float32).reshape(3),
+            np.asarray(quaternion_wxyz, dtype=np.float32).reshape(4),
+        )
+        ee_pose = self._task._robot_manager.gripper_center_to_ee(tool_pose)
+        gripper_qpos = float(self._task._robot_manager.get_gripper_qpos())
+        action = np.concatenate(
+            [
+                np.asarray(ee_pose.p, dtype=np.float32).reshape(3),
+                np.asarray(ee_pose.q, dtype=np.float32).reshape(4),
+                np.array([gripper_qpos], dtype=np.float32),
+            ]
+        )
+        return self.take_action(action, action_type="ee")
+
+    def protocol_action_allowed(self) -> bool:
+        """Return whether another official-protocol physical action may run."""
+        if not self._official_task_protocol:
+            return True
+        if self._protocol_stopped:
+            return False
+        if self.get_action_count() >= self.max_steps:
+            self._stop_protocol("action_budget")
+            return False
+        return True
+
+    def begin_high_level_action(self) -> bool:
+        """Count a gripper-only action in the official 300-action budget."""
+        if not self.protocol_action_allowed():
+            return False
+        if self._official_task_protocol:
+            self._task.take_action_cnt += 1
+            logger = getattr(self._task, "logger", None)
+            if logger is not None:
+                logger.info(
+                    f"step: {self.get_action_count()} / {self.max_steps} (CaP gripper action)"
+                )
+        return True
+
+    def finalize_high_level_action(self) -> dict[str, Any]:
+        """Apply native success/early-stop rules after one CaP physical action."""
+        if not self._official_task_protocol:
+            return self.get_protocol_status()
+        if self.get_action_count() >= self.max_steps:
+            self._stop_protocol("action_budget")
+        elif not self._protocol_stopped:
+            try:
+                if bool(self._task.check_success()):
+                    self._task.eval_success = True
+                    self._stop_protocol("native_success")
+                elif bool(self._task.check_early_stop()):
+                    self._stop_protocol("early_stop")
+            except Exception as exc:
+                self._stop_protocol(f"protocol_check_error:{type(exc).__name__}")
+        return self.get_protocol_status()
+
+    def get_protocol_status(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self._official_task_protocol),
+            "stopped": bool(self._protocol_stopped),
+            "reason": self._protocol_stop_reason,
+            "action_count": self.get_action_count(),
+            "max_steps": self.max_steps,
+        }
+
+    def get_reset_serial(self) -> int:
+        return int(self._reset_serial)
+
+    def append_perception_artifact(self, record: dict[str, Any]) -> None:
+        """Keep non-privileged perception inputs and outputs for trial audit."""
+        self._perception_artifacts.append(dict(record))
+
+    def _stop_protocol(self, reason: str) -> None:
+        if self._protocol_stopped:
+            return
+        self._protocol_stopped = True
+        self._protocol_stop_reason = str(reason)
+        print(
+            "[capx-univtac] official protocol stopped "
+            f"reason={self._protocol_stop_reason} action_count={self.get_action_count()}",
+            flush=True,
+        )
+
+    def _protocol_blocked_result(self) -> dict[str, Any]:
+        result = {
+            "ok": False,
+            "step": self.get_step_count(),
+            "action_count": self.get_action_count(),
+            "message": f"official protocol stopped: {self._protocol_stop_reason}",
         }
         self._last_action_result = result
         return result
@@ -639,7 +796,7 @@ class UniVTACLowLevelEnv(BaseEnv):
             "elapsed_time": time.time() - self._start_time,
             "last_action": self._last_action_result,
             "motion_plan_ok": bool(getattr(self._task, "plan_success", True)),
-            "early_stop": bool(self._task.check_early_stop()),
+            "protocol": self.get_protocol_status(),
         }
 
     def current_raw_observation(self) -> dict[str, Any]:
@@ -692,7 +849,11 @@ class UniVTACLowLevelEnv(BaseEnv):
 
     def export_debug_artifacts(self, output_dir: str | os.PathLike[str]) -> str | None:
         """Write private UniVTAC diagnostics for audit, never for LLM prompts."""
-        if not self._debug_records and not self._tactile_gripper_trace:
+        if (
+            not self._debug_records
+            and not self._tactile_gripper_trace
+            and not self._perception_artifacts
+        ):
             return None
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -715,8 +876,84 @@ class UniVTACLowLevelEnv(BaseEnv):
             with open(trace_path, "w", encoding="utf-8") as f:
                 json.dump(self._tactile_gripper_trace, f, indent=2, sort_keys=True)
             print(f"[capx-univtac] saved tactile gripper trace to {trace_path}", flush=True)
+        perception_path = self._export_perception_artifacts(output_path)
         self._export_pre_move_tactile_timeline(output_path)
-        return str(debug_path if self._debug_records else trace_path)
+        if self._debug_records:
+            return str(debug_path)
+        if self._tactile_gripper_trace:
+            return str(trace_path)
+        return str(perception_path) if perception_path is not None else None
+
+    def _export_perception_artifacts(self, output_path: Path) -> Path | None:
+        artifacts = getattr(self, "_perception_artifacts", [])
+        if not artifacts:
+            return None
+        perception_path = output_path / "perception"
+        perception_path.mkdir(parents=True, exist_ok=True)
+        manifest: list[dict[str, Any]] = []
+        array_keys = {
+            "frame",
+            "mask",
+            "points_world",
+            "grasps_camera",
+            "grasp_scores",
+        }
+        for index, record in enumerate(artifacts):
+            kind = str(record.get("kind", "estimate")).replace("/", "_")
+            stem = f"{index:02d}_{kind}"
+            frame = record.get("frame")
+            if frame is not None:
+                rgb = np.asarray(frame.rgb, dtype=np.uint8)
+                depth = np.asarray(frame.depth, dtype=np.float32)
+                Image.fromarray(rgb).save(perception_path / f"{stem}_rgb.png")
+                Image.fromarray(_depth_visualization(depth)).save(
+                    perception_path / f"{stem}_depth.png"
+                )
+                np.savez_compressed(
+                    perception_path / f"{stem}_rgbd.npz",
+                    depth=depth,
+                    intrinsics=np.asarray(frame.intrinsics, dtype=np.float32),
+                    camera_position=np.asarray(frame.camera_position, dtype=np.float32),
+                    camera_quaternion_wxyz=np.asarray(
+                        frame.camera_quaternion_wxyz,
+                        dtype=np.float32,
+                    ),
+                )
+            mask = record.get("mask")
+            if mask is not None:
+                mask_image = np.asarray(mask, dtype=bool).astype(np.uint8) * 255
+                Image.fromarray(mask_image).save(perception_path / f"{stem}_mask.png")
+            points_world = record.get("points_world")
+            if points_world is not None:
+                np.savez_compressed(
+                    perception_path / f"{stem}_points_world.npz",
+                    points_world=np.asarray(points_world, dtype=np.float32),
+                )
+            grasps_camera = record.get("grasps_camera")
+            if grasps_camera is not None:
+                np.savez_compressed(
+                    perception_path / f"{stem}_grasps.npz",
+                    grasps_camera=np.asarray(grasps_camera, dtype=np.float32),
+                    scores=np.asarray(record.get("grasp_scores", []), dtype=np.float32),
+                )
+            metadata = {
+                key: _jsonable(value)
+                for key, value in record.items()
+                if key not in array_keys
+            }
+            metadata["index"] = index
+            metadata["stem"] = stem
+            manifest.append(metadata)
+
+        manifest_path = perception_path / "manifest.json"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+        print(
+            "[capx-univtac] saved RGB-D perception artifacts "
+            f"records={len(manifest)} path={perception_path}",
+            flush=True,
+        )
+        return manifest_path
 
     def render(self, mode: str = "rgb_array") -> np.ndarray:
         if mode != "rgb_array":
@@ -775,6 +1012,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         if self.device_override:
             env_cfg.sim.device = self.device_override
         self._task = task_module.Task(env_cfg, mode="eval")
+        self._official_task_protocol = bool(
+            self._task_config.get("official_task_protocol", False)
+        )
         self._install_task_runtime_patches()
 
     def _task_config_path(self) -> Path:
@@ -1438,6 +1678,21 @@ def _as_uint8_rgb(value: Any) -> np.ndarray:
     if arr.shape[-1] == 4:
         arr = arr[..., :3]
     return np.ascontiguousarray(arr)
+
+
+def _depth_visualization(depth: np.ndarray) -> np.ndarray:
+    depth = np.asarray(depth, dtype=np.float32).squeeze()
+    valid = np.isfinite(depth) & (depth > 0.0)
+    image = np.zeros(depth.shape, dtype=np.uint8)
+    if not np.any(valid):
+        return image
+    low, high = np.percentile(depth[valid], [2.0, 98.0])
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        image[valid] = 127
+        return image
+    normalized = (depth - float(low)) / float(high - low)
+    image[valid] = np.clip(normalized[valid] * 255.0, 0.0, 255.0).astype(np.uint8)
+    return image
 
 
 def _nested_get(data: dict[str, Any], keys: list[str]) -> Any:

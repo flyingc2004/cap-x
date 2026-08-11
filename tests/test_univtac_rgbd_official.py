@@ -1,0 +1,256 @@
+from __future__ import annotations
+
+from pathlib import Path
+import types
+
+import numpy as np
+import pytest
+import yaml
+
+from capx.envs.simulators.univtac import UniVTACLowLevelEnv
+from capx.integrations.univtac.franka_compat_api import UniVTACFrankaCompatApi
+from capx.integrations.univtac.rgbd_perception import (
+    GraspEstimate,
+    ObjectEstimate,
+    RgbdFrame,
+    UniVTACRgbdPerception,
+)
+
+
+def _frame(*, valid_depth: bool = True) -> RgbdFrame:
+    depth = np.ones((8, 8), dtype=np.float32)
+    if not valid_depth:
+        depth[:] = np.nan
+    return RgbdFrame(
+        rgb=np.zeros((8, 8, 3), dtype=np.uint8),
+        depth=depth,
+        intrinsics=np.array(
+            [[100.0, 0.0, 3.5], [0.0, 100.0, 3.5], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        ),
+        camera_position=np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        camera_quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+
+def _mask() -> np.ndarray:
+    mask = np.zeros((8, 8), dtype=bool)
+    mask[2:6, 2:6] = True
+    return mask
+
+
+def test_rgbd_mask_deprojection_and_world_obb(monkeypatch) -> None:
+    perception = UniVTACRgbdPerception(min_depth_points=8)
+    monkeypatch.setattr(perception, "_segment", lambda rgb, prompt: (_mask(), 0.9))
+
+    estimate = perception.estimate_object(_frame(), "cylindrical can")
+
+    assert len(estimate.points_world) == 16
+    np.testing.assert_allclose(estimate.position, [1.0, 2.0, 4.0], atol=1e-6)
+    assert estimate.extent.shape == (3,)
+    assert estimate.quaternion_wxyz.shape == (4,)
+    assert estimate.score == pytest.approx(0.9)
+
+
+def test_rgbd_grasp_camera_to_world_transform(monkeypatch) -> None:
+    perception = UniVTACRgbdPerception(
+        min_depth_points=8,
+        grasp_local_z_offset=0.12,
+    )
+    monkeypatch.setattr(perception, "_segment", lambda rgb, prompt: (_mask(), 0.8))
+    grasps = np.repeat(np.eye(4, dtype=np.float32)[None], 2, axis=0)
+    grasps[0, :3, 3] = [0.0, 0.0, 1.0]
+    grasps[1, :3, 3] = [0.1, 0.2, 1.0]
+    monkeypatch.setattr(
+        perception,
+        "_request_grasps",
+        lambda depth, intrinsics, mask: (grasps, np.array([0.1, 0.9])),
+    )
+
+    estimate = perception.estimate_grasp(_frame(), "cylindrical can")
+
+    assert estimate.selected_index == 1
+    np.testing.assert_allclose(estimate.position, [1.1, 2.2, 4.12], atol=1e-6)
+    np.testing.assert_allclose(estimate.quaternion_wxyz, [1.0, 0.0, 0.0, 0.0])
+    assert estimate.points_world.shape == (16, 3)
+    np.testing.assert_allclose(estimate.object_position, [1.0, 2.0, 4.0], atol=1e-6)
+
+
+def test_rgbd_perception_failures_do_not_fallback(monkeypatch) -> None:
+    perception = UniVTACRgbdPerception(min_depth_points=8)
+    monkeypatch.setattr(perception, "_segment", lambda rgb, prompt: (_mask(), 0.8))
+    with pytest.raises(RuntimeError, match="valid depth points"):
+        perception.estimate_object(_frame(valid_depth=False), "can")
+
+    monkeypatch.setattr(
+        perception,
+        "_request_grasps",
+        lambda depth, intrinsics, mask: (np.empty((0, 4, 4)), np.empty((0,))),
+    )
+    with pytest.raises(RuntimeError, match="invalid grasps"):
+        perception.estimate_grasp(_frame(), "can")
+
+
+def test_official_compat_uses_rgbd_and_never_reads_task_can() -> None:
+    class ForbiddenActor:
+        def get_pose(self):
+            raise AssertionError("task.can ground-truth pose must not be read")
+
+    class Env:
+        task = types.SimpleNamespace(can=ForbiddenActor())
+
+        def __init__(self) -> None:
+            self.api_configs = {
+                "franka_control_api": {
+                    "rgbd_perception_enabled": True,
+                    "use_native_pose_planner": True,
+                    "use_task_grasp_actor_for_objects": False,
+                    "object_pose_names": {
+                        "can": "can",
+                        "object": "can",
+                        "target object": "can",
+                    },
+                    "perception_prompt_map": {"can": "cylindrical can"},
+                }
+            }
+            self.native_moves = []
+            self.artifacts = []
+            self.finalized = 0
+
+        def get_rgbd_frame(self, camera_name):
+            assert camera_name == "head"
+            return _frame()
+
+        def append_perception_artifact(self, record):
+            self.artifacts.append(record)
+
+        def move_to_tool_pose_native(self, position, quaternion):
+            self.native_moves.append((np.asarray(position), np.asarray(quaternion)))
+            return {"ok": True}
+
+        def finalize_high_level_action(self):
+            self.finalized += 1
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    mask = _mask()
+    points = np.zeros((16, 3), dtype=np.float32)
+    object_estimate = ObjectEstimate(
+        position=np.array([0.7, 0.0, 0.03], dtype=np.float32),
+        quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        extent=np.array([0.06, 0.06, 0.12], dtype=np.float32),
+        mask=mask,
+        points_world=points,
+        score=0.9,
+        prompt="cylindrical can",
+    )
+    grasp_estimate = GraspEstimate(
+        position=np.array([0.64, 0.0, 0.04], dtype=np.float32),
+        quaternion_wxyz=np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32),
+        mask=mask,
+        points_world=points,
+        object_position=object_estimate.position,
+        object_quaternion_wxyz=object_estimate.quaternion_wxyz,
+        object_extent=object_estimate.extent,
+        scores=np.array([0.9], dtype=np.float32),
+        grasps_camera=np.eye(4, dtype=np.float32)[None],
+        selected_index=0,
+        prompt="cylindrical can",
+    )
+    api._rgbd_perception = types.SimpleNamespace(
+        estimate_object=lambda frame, prompt: object_estimate,
+        estimate_grasp=lambda frame, prompt: grasp_estimate,
+    )
+
+    pos, quat = api.get_object_pose("can")
+    np.testing.assert_allclose(pos, object_estimate.position)
+    np.testing.assert_allclose(quat, object_estimate.quaternion_wxyz)
+    grasp_pos, grasp_quat = api.sample_grasp_pose("can")
+    np.testing.assert_allclose(grasp_pos, grasp_estimate.position)
+    np.testing.assert_allclose(grasp_quat, grasp_estimate.quaternion_wxyz)
+
+    api.goto_pose(grasp_pos, grasp_quat, z_approach=0.08)
+    assert len(env.native_moves) == 2
+    assert env.finalized == 1
+    assert [record["source"] for record in env.artifacts] == [
+        "rgbd",
+        "rgbd_contact_graspnet",
+    ]
+
+
+def test_official_protocol_budget_and_early_stop() -> None:
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._official_task_protocol = True
+    env._protocol_stopped = False
+    env._protocol_stop_reason = None
+    env.max_steps = 300
+    env._task = types.SimpleNamespace(
+        take_action_cnt=0,
+        logger=None,
+        eval_success=False,
+        check_success=lambda: False,
+        check_early_stop=lambda: True,
+    )
+
+    assert env.begin_high_level_action() is True
+    assert env.get_action_count() == 1
+    status = env.finalize_high_level_action()
+    assert status["stopped"] is True
+    assert status["reason"] == "early_stop"
+    assert env.protocol_action_allowed() is False
+
+
+def test_perception_artifacts_are_saved_under_trial_directory(tmp_path) -> None:
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._perception_artifacts = [
+        {
+            "kind": "diagnostic_grasp_candidates",
+            "source": "rgbd_contact_graspnet_private_diagnostic",
+            "frame": _frame(),
+            "mask": _mask(),
+            "points_world": np.zeros((16, 3), dtype=np.float32),
+            "grasps_camera": np.eye(4, dtype=np.float32)[None],
+            "grasp_scores": np.array([0.9], dtype=np.float32),
+            "selected_index": 0,
+            "used_for_control": False,
+        }
+    ]
+
+    manifest = env._export_perception_artifacts(tmp_path)
+
+    assert manifest == tmp_path / "perception/manifest.json"
+    assert (tmp_path / "perception/00_diagnostic_grasp_candidates_rgb.png").exists()
+    assert (tmp_path / "perception/00_diagnostic_grasp_candidates_depth.png").exists()
+    assert (tmp_path / "perception/00_diagnostic_grasp_candidates_mask.png").exists()
+    assert (tmp_path / "perception/00_diagnostic_grasp_candidates_points_world.npz").exists()
+    assert (tmp_path / "perception/00_diagnostic_grasp_candidates_grasps.npz").exists()
+
+
+def test_official_yaml_uses_native_protocol_without_privileged_pose() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load(
+        (repo / "env_configs/univtac/lift_can_tactile_official.yaml").read_text()
+    )
+    cfg = config["env"]["cfg"]
+    low = cfg["low_level"]
+    franka = low["api_configs"]["franka_control_api"]
+    assert low["task_name"] == "lift_can"
+    assert low["task_config"] == "smoke_capx_lift_can_official"
+    assert low["expose_actor_pose"] is False
+    assert low["privileged"] is False
+    assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
+    assert franka["rgbd_perception_enabled"] is True
+    assert franka["use_native_pose_planner"] is True
+    assert franka["use_task_grasp_actor_for_objects"] is False
+    assert franka["record_perception_diagnostic"] is True
+    assert "api_servers" not in config
+
+    task_config = yaml.safe_load(
+        Path(
+            "/mnt/sdc/ljz/UniVTAC/task_config/smoke_capx_lift_can_official.yml"
+        ).read_text()
+    )
+    assert task_config["skip_task_pre_move"] is False
+    assert task_config["official_task_protocol"] is True
+    assert task_config["step_lim"] == 300
+    assert task_config["observations"]["camera"] == ["rgb", "depth"]
