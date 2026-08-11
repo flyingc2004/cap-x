@@ -19,6 +19,7 @@ from capx.envs.base import BaseEnv
 from capx.integrations.univtac.native_tactile import (
     UniVTACTactileBuffer,
     frame_from_observation,
+    summarize_native_tactile,
 )
 
 
@@ -43,6 +44,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         max_steps: int | None = None,
         video_size: tuple[int, int] = (960, 320),
         tactile_buffer_size: int = 500,
+        lift_success_height_delta: float = 0.10,
+        lift_success_require_contact: bool = True,
         privileged: bool = False,
         enable_render: bool = True,
         viser_debug: bool = False,
@@ -72,6 +75,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._frame_buffer: list[np.ndarray] = []
         self._wrist_frame_buffer: list[np.ndarray] = []
         self._tactile_buffer = UniVTACTactileBuffer(maxlen=tactile_buffer_size)
+        self.lift_success_height_delta = float(lift_success_height_delta)
+        self.lift_success_require_contact = bool(lift_success_require_contact)
+        self._initial_lift_object_z: float | None = None
         self._last_recorded_tactile_step: int | None = None
         self._last_recorded_video_step: int | None = None
         self._video_record_failures = 0
@@ -79,6 +85,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._sim_step_count = 0
         self._start_time = time.time()
         self._debug_records: list[dict[str, Any]] = []
+        self._tactile_gripper_trace: list[dict[str, Any]] = []
         self._pre_move_tactile_timeline: list[dict[str, Any]] = []
         self._pre_move_tactile_last_error: str | None = None
 
@@ -112,6 +119,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._sim_step_count = 0
         self._start_time = time.time()
         self._debug_records.clear()
+        self._tactile_gripper_trace.clear()
         self._pre_move_tactile_timeline.clear()
         self._pre_move_tactile_last_error = None
 
@@ -120,6 +128,7 @@ class UniVTACLowLevelEnv(BaseEnv):
             flush=True,
         )
         self._task.reset(seed=actual_seed, instructions=self._instructions())
+        self._initial_lift_object_z = self._active_object_height("can")
         debug = self._append_debug_record("after_reset")
         print(
             "[capx-univtac] reset diagnostic "
@@ -181,6 +190,15 @@ class UniVTACLowLevelEnv(BaseEnv):
 
     def task_completed(self) -> bool:
         return bool(self._task.check_success())
+
+    def _active_object_height(self, object_name: str) -> float | None:
+        actor = getattr(self._task, str(object_name), None)
+        if actor is None:
+            return None
+        try:
+            return float(actor.get_pose().p[2])
+        except Exception:
+            return None
 
     def take_action(self, action: np.ndarray | torch.Tensor | list[float], *, action_type: str) -> dict[str, Any]:
         tensor = self._to_tensor(action)
@@ -282,6 +300,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self,
         *,
         object_name: str = "prism",
+        position_offset: np.ndarray | list[float] | None = None,
         pre_dis: float = 0.04,
         dis: float = 0.0,
         grasp_height: float = 0.04,
@@ -310,6 +329,14 @@ class UniVTACLowLevelEnv(BaseEnv):
                 actor,
                 grasp_height=float(grasp_height),
             )
+            offset = np.asarray(
+                [0.0, 0.0, 0.0] if position_offset is None else position_offset,
+                dtype=np.float32,
+            ).reshape(3)
+            if not np.all(np.isfinite(offset)):
+                raise ValueError("native grasp position offset must be finite")
+            if float(np.linalg.norm(offset)) > 1e-8:
+                contact_pose = contact_pose.add_bias(offset, coord="world")
             contact_id = actor.register_point(contact_pose, type="contact")
             actions = self._task.atom.grasp_actor(
                 actor,
@@ -406,6 +433,106 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._last_action_result = result
         return result
 
+    def get_gripper_calibration(self) -> dict[str, float]:
+        """Return the public width conversion for the active robot gripper."""
+        robot_manager = self._task._robot_manager
+        max_qpos = float(getattr(robot_manager, "gripper_max_qpos", 0.039))
+        if not np.isfinite(max_qpos) or max_qpos <= 0.0:
+            raise RuntimeError(f"invalid UniVTAC gripper_max_qpos: {max_qpos!r}")
+        current_qpos = float(robot_manager.get_gripper_qpos())
+        current_qpos = float(np.clip(current_qpos, 0.0, max_qpos))
+        return {
+            "gripper_max_qpos": max_qpos,
+            "current_qpos": current_qpos,
+            "current_width": current_qpos / max_qpos,
+        }
+
+    def get_native_tactile_calibration(self) -> dict[str, float]:
+        """Return robot-native depth calibration for tactile summarization."""
+        robot_cfg = self._task.cfg.robot
+        far_plane = float(getattr(robot_cfg, "tactile_far_plane", 30.0))
+        target_depth = float(
+            getattr(
+                self._task.cfg,
+                "adaptive_grasp_depth_threshold",
+                getattr(robot_cfg, "adaptive_grasp_depth_threshold", far_plane - 2.0),
+            )
+        )
+        force_full_scale = far_plane - target_depth
+        if not np.isfinite(force_full_scale) or force_full_scale <= 0.0:
+            force_full_scale = 2.0
+        adaptive_cfg = (
+            self.api_configs.get("franka_control_api", {}).get("adaptive_gripper", {})
+        )
+        contact_margin = float(adaptive_cfg.get("depth_contact_margin_mm", 0.5))
+        return {
+            "depth_far_plane_mm": far_plane,
+            "force_full_scale_mm": force_full_scale,
+            "depth_contact_margin_mm": max(0.0, contact_margin),
+        }
+
+    def command_gripper_width_step(
+        self,
+        width: float,
+        settle_steps: int = 1,
+    ) -> dict[str, Any]:
+        """Execute one normalized gripper servo command without a CaP action.
+
+        This hook performs no tactile decision making. It only converts width
+        to qpos, sends a non-teleporting target, advances simulation, and
+        refreshes the native tactile buffer.
+        """
+        calibration = self.get_gripper_calibration()
+        max_qpos = calibration["gripper_max_qpos"]
+        current_qpos = calibration["current_qpos"]
+        target_width = float(np.clip(width, 0.0, 1.0))
+        target_qpos = target_width * max_qpos
+        robot_manager = self._task._robot_manager
+        device = getattr(robot_manager, "device", getattr(self._task, "device", "cpu"))
+        position = torch.tensor(
+            [target_qpos, target_qpos],
+            dtype=torch.float32,
+            device=device,
+        )
+        sim_cfg = getattr(getattr(self._task, "cfg", None), "sim", None)
+        sim_dt = float(getattr(sim_cfg, "dt", 1.0 / 60.0))
+        velocity = (position - current_qpos) / max(sim_dt, 1e-8)
+        action_count_before = self.get_action_count()
+        robot_manager.set_gripper(position, velocity, force=False)
+        for _ in range(max(1, int(settle_steps))):
+            self._task._step(is_save=True)
+
+        self.refresh_native_observation(
+            include_camera=False,
+            include_tactile=True,
+            include_embodiment=False,
+            include_actor=False,
+            tactile_data_types=["depth", "marker", "pose"],
+        )
+        updated = self.get_gripper_calibration()
+        result = {
+            "ok": True,
+            "step": self.get_step_count(),
+            "action_count": self.get_action_count(),
+            "width": updated["current_width"],
+            "qpos": updated["current_qpos"],
+            "target_width": target_width,
+            "target_qpos": target_qpos,
+            "message": "single gripper servo step executed",
+        }
+        if result["action_count"] != action_count_before:
+            raise RuntimeError("gripper micro-step unexpectedly changed the CaP action count")
+        self._last_action_result = result
+        return result
+
+    def append_tactile_gripper_trace(self, trace: list[dict[str, Any]]) -> None:
+        """Store controller-only close/open trace records for trial audit."""
+        for item in trace:
+            record = dict(item)
+            if record.get("operation") not in {"close", "open"}:
+                raise ValueError("tactile gripper trace may only contain close/open operations")
+            self._tactile_gripper_trace.append(_jsonable(record))
+
     def wait_steps(self, n: int = 1) -> dict[str, Any]:
         steps = max(0, int(n))
         for _ in range(steps):
@@ -431,8 +558,8 @@ class UniVTACLowLevelEnv(BaseEnv):
             )
         if self.task_name == "lift_can":
             return (
-                "Grasp the cylindrical can, confirm contact using UniVTAC native tactile "
-                "feedback, and lift it at least 0.10 meters while maintaining a stable grasp."
+                "Grasp and lift the cylindrical can using UniVTAC native tactile feedback, "
+                "then release it upright on the table."
             )
         return f"Solve the UniVTAC task: {self.task_name}."
 
@@ -555,21 +682,31 @@ class UniVTACLowLevelEnv(BaseEnv):
 
     def export_debug_artifacts(self, output_dir: str | os.PathLike[str]) -> str | None:
         """Write private UniVTAC diagnostics for audit, never for LLM prompts."""
-        if not self._debug_records:
+        if not self._debug_records and not self._tactile_gripper_trace:
             return None
-        path = Path(output_dir) / "univtac_debug.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "task": self.task_name,
-            "task_config": self.task_config_name,
-            "metadata": _jsonable(getattr(self._task, "metadata", {})),
-            "records": self._debug_records,
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, sort_keys=True)
-        self._export_pre_move_tactile_timeline(path.parent)
-        print(f"[capx-univtac] saved private debug diagnostics to {path}", flush=True)
-        return str(path)
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        debug_path = output_path / "univtac_debug.json"
+        if self._debug_records:
+            payload = {
+                "task": self.task_name,
+                "task_config": self.task_config_name,
+                "metadata": _jsonable(getattr(self._task, "metadata", {})),
+                "records": self._debug_records,
+            }
+            with open(debug_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+            print(
+                f"[capx-univtac] saved private debug diagnostics to {debug_path}",
+                flush=True,
+            )
+        if self._tactile_gripper_trace:
+            trace_path = output_path / "tactile_gripper_trace.json"
+            with open(trace_path, "w", encoding="utf-8") as f:
+                json.dump(self._tactile_gripper_trace, f, indent=2, sort_keys=True)
+            print(f"[capx-univtac] saved tactile gripper trace to {trace_path}", flush=True)
+        self._export_pre_move_tactile_timeline(output_path)
+        return str(debug_path if self._debug_records else trace_path)
 
     def render(self, mode: str = "rgb_array") -> np.ndarray:
         if mode != "rgb_array":
@@ -906,14 +1043,23 @@ class UniVTACLowLevelEnv(BaseEnv):
         if target_inhand_pose is not None:
             record["target_inhand_pose"] = _pose_json(target_inhand_pose)
 
+        actor_key = "prism"
         actor = getattr(task, "prism", None)
+        if actor is None:
+            actor_key = "can"
+            actor = getattr(task, "can", None)
         if actor is not None:
             try:
                 pose = actor.get_pose()
-                record["prism_pose"] = _pose_json(pose)
-                record["active_actor_name"] = str(getattr(getattr(actor, "cfg", None), "name", "prism"))
+                pose_json = _pose_json(pose)
+                record[f"{actor_key}_pose"] = pose_json
+                record["object_pose"] = pose_json
+                record["object_height"] = float(pose.p[2])
+                record["active_actor_name"] = str(
+                    getattr(getattr(actor, "cfg", None), "name", actor_key)
+                )
             except Exception as exc:
-                record["prism_pose_error"] = repr(exc)
+                record[f"{actor_key}_pose_error"] = repr(exc)
 
         robot_manager = getattr(task, "_robot_manager", None)
         if robot_manager is not None:
@@ -928,9 +1074,11 @@ class UniVTACLowLevelEnv(BaseEnv):
             if actor is not None:
                 try:
                     inhand_pose = robot_manager.get_inhand_pose(actor)
-                    record["prism_in_gripper"] = _pose_json(inhand_pose)
+                    inhand_json = _pose_json(inhand_pose)
+                    record[f"{actor_key}_in_gripper"] = inhand_json
+                    record["object_in_gripper"] = inhand_json
                 except Exception as exc:
-                    record["prism_in_gripper_error"] = repr(exc)
+                    record[f"{actor_key}_in_gripper_error"] = repr(exc)
             try:
                 record["gripper_qpos"] = float(robot_manager.get_gripper_qpos())
             except Exception as exc:
@@ -959,6 +1107,21 @@ class UniVTACLowLevelEnv(BaseEnv):
             )
         else:
             record["pregrasp_ok"] = False
+        if actor_key == "can":
+            can_pos = _record_position(record.get("can_pose"))
+            if can_pos is not None and ee_pos is not None:
+                record["ee_to_can_distance"] = float(np.linalg.norm(can_pos - ee_pos))
+                record["ee_to_can_xy_distance"] = float(
+                    np.linalg.norm(can_pos[:2] - ee_pos[:2])
+                )
+                record["ee_to_can_abs_z"] = float(abs(float(can_pos[2]) - float(ee_pos[2])))
+                record["can_above_table"] = bool(float(can_pos[2]) > 0.06)
+                if self._initial_lift_object_z is not None:
+                    lift_delta = float(can_pos[2]) - self._initial_lift_object_z
+                    record["can_lift_delta"] = lift_delta
+                    record["can_lift_height_ok"] = bool(
+                        lift_delta >= self.lift_success_height_delta
+                    )
         return _jsonable(record)
 
     def _instructions(self) -> list[str] | None:

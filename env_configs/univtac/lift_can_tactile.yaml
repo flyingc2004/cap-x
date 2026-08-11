@@ -12,7 +12,7 @@ env:
       api_configs:
         franka_control_api:
           min_safe_z: 0.10
-          max_delta_xyz: 0.04
+          max_delta_xyz: 0.01
           max_delta_rpy: 0.25
           max_delta_gripper: 0.02
           default_z_approach: 0.08
@@ -29,6 +29,15 @@ env:
           lift_after_close_z: 0.05
           close_gripper_qpos: 0.007
           open_gripper_width: 1.0
+          adaptive_gripper:
+            coarse_qpos_step: 0.0005
+            fine_qpos_step: 0.00005
+            contact_debounce_frames: 2
+            stable_debounce_frames: 3
+            release_debounce_frames: 2
+            settle_steps_per_command: 1
+            contact_force_threshold: 0.08
+            depth_contact_margin_mm: 0.5
           object_pose_names:
             can: can
             object: can
@@ -42,11 +51,15 @@ env:
       - UniVTACTactileApi
     prompt: |
       You are controlling a Franka robot inside UniVTAC.
-      Task: grasp the cylindrical can from the table and lift it by at least 0.10 meters while maintaining a stable grasp.
-      The public can pose is available through get_object_pose("can").
-      Use this high-level sequence: open_gripper, sample_grasp_pose("can"), goto_pose(grasp_pos, grasp_quat, z_approach=0.08), close_gripper, inspect UniVTAC native tactile feedback, then goto_pose to a position 0.10 meters above the grasp position.
-      After closing, call get_tactile_summary(window=20, hand="both") and verify contact or grasp stability before lifting.
-      If contact is weak or unbalanced, reopen the gripper, make a small safe adjustment, and retry the grasp before lifting.
+      Task: grasp the cylindrical can, lift and reorient it, then release it upright on the table as required by the native UniVTAC lift_can benchmark.
+      The public can pose is available as exactly two values: can_pos, can_quat = get_object_pose("can"). Only calls with return_bbox_extent=True return three values.
+      Use this high-level sequence: open_gripper(adaptive=True), sample_grasp_pose("can"), goto_pose(grasp_pos, grasp_quat, z_approach=0.08), close_gripper(adaptive=True, target_force=1.0, max_steps=160), inspect UniVTAC native tactile feedback, then lift in two 0.05 meter increments.
+      The adaptive close/open controller changes only gripper width. It never moves or lifts the arm and never retries a grasp on its own.
+      Check the close result: grasp_result = close_gripper(adaptive=True, target_force=1.0, max_steps=160). A force value of 1.0 means both native tactile depth maps reached the calibrated lift_can compression target. Only lift when grasp_result["stable"] is true.
+      If grasp_result["stable"] is false, call open_gripper(adaptive=True), make a small safe pose adjustment, and explicitly retry the grasp before lifting.
+      If all grasp retries fail, open the gripper, return home, and guard the lift code with a boolean so the program reaches its end normally. Do not call exit, quit, raise SystemExit, raise an exception, or use assert for an expected task failure.
+      After closing and after each 0.05 meter lift increment, call get_tactile_summary(window=20, hand="both") to inspect contact balance and slip. Continue lifting only while both contacts remain and slip is low; use another explicit adaptive close or plan a regrasp when contact weakens.
+      After lifting while maintaining stable bilateral contact, call open_gripper(adaptive=True) to release the can so it can settle upright on the table. Do not call home_pose before releasing it. End the program after the release.
       Use the high-level FrankaControlApi functions only for motion: get_object_pose, sample_grasp_pose, goto_pose, open_gripper, close_gripper, home_pose.
       Do not call low-level UniVTAC movement functions such as move_delta_ee, move_ee, or move_qpos.
       Use UniVTAC native tactile observations only. Do not use robosuite or MuJoCo contact proxy tactile APIs.

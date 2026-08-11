@@ -91,6 +91,74 @@ def test_native_tactile_summary_events() -> None:
     assert lost["event"] == "contact_lost"
 
 
+def test_native_marker_motion_uses_initial_current_axis_for_live_shape() -> None:
+    marker = np.zeros((2, 12, 2), dtype=np.float32)
+    marker[0, :, 0] = np.linspace(20.0, 300.0, 12)
+    marker[0, :, 1] = np.linspace(10.0, 220.0, 12)
+    marker[1] = marker[0]
+    no_motion = UniVTACTactileFrame(
+        step=0,
+        timestamp=0.0,
+        left_depth=_depth(False),
+        right_depth=_depth(False),
+        left_marker=marker,
+        right_marker=marker,
+        left_pose=None,
+        right_pose=None,
+    )
+    summary = summarize_native_tactile([no_motion])
+    assert summary["contact"] is False
+    assert summary["shear_magnitude"] == 0.0
+
+    displaced = marker.copy()
+    displaced[1, :, 0] += 4.0
+    motion = UniVTACTactileFrame(
+        step=1,
+        timestamp=1.0,
+        left_depth=_depth(False),
+        right_depth=_depth(False),
+        left_marker=displaced,
+        right_marker=displaced,
+        left_pose=None,
+        right_pose=None,
+    )
+    summary = summarize_native_tactile([motion])
+    assert summary["contact"] is True
+    assert summary["shear_magnitude"] == pytest.approx(1.0)
+
+
+def test_calibrated_depth_does_not_treat_marker_only_motion_as_contact() -> None:
+    frame = _frame(step=0, left_marker=4.0, right_marker=4.0)
+
+    summary = summarize_native_tactile(
+        [frame],
+        depth_far_plane_mm=34.0,
+        force_full_scale_mm=6.5,
+        depth_contact_margin_mm=0.5,
+    )
+
+    assert summary["contact"] is False
+    assert summary["normal_force"] == 0.0
+    assert summary["shear_magnitude"] == pytest.approx(1.0)
+    assert summary["event"] == "no_contact"
+
+
+def test_calibrated_depth_uses_robot_far_plane_for_force() -> None:
+    summary = summarize_native_tactile(
+        [_frame(step=0, left_contact=True, right_contact=True)],
+        depth_far_plane_mm=34.0,
+        force_full_scale_mm=6.5,
+        depth_contact_margin_mm=0.5,
+    )
+
+    assert summary["left_contact"] is True
+    assert summary["right_contact"] is True
+    assert summary["left"]["depth_min_mm"] == pytest.approx(30.0)
+    assert summary["left"]["depth_delta_mm"] == pytest.approx(4.0)
+    assert summary["normal_force"] == pytest.approx(4.0 / 6.5)
+    assert summary["event"] == "stable_grasp"
+
+
 def test_native_tactile_event_sequence_deduplicates() -> None:
     events = tactile_event_sequence(
         [
@@ -282,6 +350,25 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
     }
     assert lift_franka["use_task_grasp_actor_for_objects"] is True
     assert lift_franka["grasp_z_tolerance"] == 0.04
+    assert lift_franka["max_delta_xyz"] == 0.01
+    assert "lift_success_height_delta" not in lift_low_level
+    assert "lift_success_require_contact" not in lift_low_level
+    assert "target_force=1.0, max_steps=160" in lift_cfg["prompt"]
+    assert "two 0.05 meter increments" in lift_cfg["prompt"]
+    assert "call open_gripper(adaptive=True) to release the can" in lift_cfg["prompt"]
+
+
+def test_lift_can_completion_uses_native_task_check() -> None:
+    native_result = {"value": True}
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env.task_name = "lift_can"
+    env._task = types.SimpleNamespace(
+        check_success=lambda: native_result["value"],
+    )
+
+    assert env.task_completed() is True
+    native_result["value"] = False
+    assert env.task_completed() is False
 
 
 def test_univtac_franka_compat_respects_config_and_uses_high_level_api() -> None:
@@ -314,17 +401,53 @@ def test_univtac_franka_compat_respects_config_and_uses_high_level_api() -> None
     api = UniVTACFrankaCompatApi(Env())
     assert api.min_safe_z == 0.2
     assert api.default_z_approach == 0.12
-    pos, quat, extent = api.get_object_pose("orange pad")
+    pos, quat = api.get_object_pose("orange pad")
     assert pos.shape == (3,)
     assert quat.shape == (4,)
     np.testing.assert_allclose(quat, [0.5, 0.5, 0.5, 0.5])
-    assert extent is None
     _, _, extent = api.get_object_pose("orange pad", return_bbox_extent=True)
     assert extent.shape == (3,)
     api.goto_pose(np.array([0.1, 0.1, 0.05]), np.array([0.5, 0.5, 0.5, 0.5]))
     assert api._env.calls
     assert all(call[1] == "delta_ee" for call in api._env.calls)
     assert all(float(action[2]) >= 0.0 for action, _ in api._env.calls)
+
+
+def test_univtac_franka_zero_z_approach_moves_directly() -> None:
+    class Env:
+        task = None
+        api_configs = {
+            "franka_control_api": {
+                "default_z_approach": 0.12,
+                "use_task_grasp_actor_for_objects": False,
+                "use_task_place_actor_for_landmarks": False,
+            }
+        }
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.1, 0.1, 0.2],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+                "joint": [0.0] * 8,
+            }
+
+    api = UniVTACFrankaCompatApi(Env())
+    moves = []
+    api._move_to_pose_bounded = lambda target, quat, current, current_quat: moves.append(
+        np.asarray(target).copy()
+    )
+    target = np.array([0.2, 0.2, 0.3], dtype=np.float32)
+    quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    api.goto_pose(target, quat, z_approach=0.0)
+    assert len(moves) == 1
+    np.testing.assert_allclose(moves[0], target)
+
+    moves.clear()
+    api.goto_pose(target, quat, z_approach=0.1)
+    assert len(moves) == 2
+    np.testing.assert_allclose(moves[0], target + [0.0, 0.0, 0.1])
+    np.testing.assert_allclose(moves[1], target)
 
 
 def test_univtac_franka_compat_routes_public_pad_to_native_placement() -> None:
@@ -476,10 +599,11 @@ def test_univtac_franka_compat_exposes_and_routes_can_grasp() -> None:
     env = Env()
     api = UniVTACFrankaCompatApi(env)
     for alias in ("can", "object", "target object"):
-        pos, quat, extent = api.get_object_pose(alias)
+        pos, quat = api.get_object_pose(alias)
         np.testing.assert_allclose(pos, Pose.p)
         np.testing.assert_allclose(quat, Pose.q)
-        assert extent is None
+    _pos, _quat, extent = api.get_object_pose("can", return_bbox_extent=True)
+    assert extent.shape == (3,)
 
     grasp_pos, grasp_quat = api.sample_grasp_pose("can")
     np.testing.assert_allclose(grasp_pos, sampled_pos)
@@ -489,11 +613,21 @@ def test_univtac_franka_compat_exposes_and_routes_can_grasp() -> None:
     api.goto_pose(grasp_pos, grasp_quat, z_approach=0.08)
     assert len(env.approach_calls) == 1
     assert env.approach_calls[0]["object_name"] == "can"
+    np.testing.assert_allclose(env.approach_calls[0]["position_offset"], [0.0, 0.0, 0.0])
     assert not env.motion_calls
+
+    adjusted_pos = grasp_pos + np.array([0.01, -0.01, 0.02], dtype=np.float32)
+    api.goto_pose(adjusted_pos, grasp_quat, z_approach=0.08)
+    assert len(env.approach_calls) == 2
+    np.testing.assert_allclose(
+        env.approach_calls[1]["position_offset"],
+        [0.01, -0.01, 0.02],
+        atol=1e-6,
+    )
 
     lift_pos = grasp_pos + np.array([0.0, 0.0, 0.10], dtype=np.float32)
     api.goto_pose(lift_pos, grasp_quat, z_approach=0.0)
-    assert len(env.approach_calls) == 1
+    assert len(env.approach_calls) == 2
     assert env.motion_calls
     assert all(action_type == "delta_ee" for _action, action_type in env.motion_calls)
 
@@ -532,7 +666,7 @@ def test_univtac_low_level_can_grasp_matches_native_task_geometry(monkeypatch) -
             self.p = np.asarray(p, dtype=np.float32)
             self.q = np.asarray(q, dtype=np.float32)
 
-        def add_bias(self, bias):
+        def add_bias(self, bias, coord="local"):
             return Pose(self.p + np.asarray(bias, dtype=np.float32), self.q)
 
         def to_transformation_matrix(self):
@@ -607,6 +741,14 @@ def test_univtac_low_level_can_grasp_matches_native_task_geometry(monkeypatch) -
     assert kwargs["contact_point_id"] == 7
     assert kwargs["is_close"] is False
 
+    result = env.approach_grasped_actor(
+        object_name="can",
+        position_offset=[0.01, -0.01, 0.02],
+    )
+    assert result["ok"] is True
+    shifted_pose = actor.registered[-1][0]
+    np.testing.assert_allclose(shifted_pose.p, [0.645, -0.01, 0.042], atol=1e-6)
+
 
 def test_univtac_lift_can_instruction_is_public_only() -> None:
     env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
@@ -616,7 +758,7 @@ def test_univtac_lift_can_instruction_is_public_only() -> None:
     instruction = env.get_task_instruction()
     assert "cylindrical can" in instruction
     assert "native tactile" in instruction
-    assert "0.10 meters" in instruction
+    assert "release it upright on the table" in instruction
     assert "reward" not in instruction
     assert "success" not in instruction
     assert "metadata" not in instruction

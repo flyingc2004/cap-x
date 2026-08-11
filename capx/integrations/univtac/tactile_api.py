@@ -54,12 +54,17 @@ class UniVTACTactileApi(ApiBase):
         """
         _refresh_native_tactile(self._env, data_types=["rgb", "rgb_marker", "marker", "depth", "pose"])
         frames = self._env.tactile_buffer.recent(window)
-        summary = summarize_native_tactile(frames, hand=hand)
+        summary = summarize_native_tactile(
+            frames,
+            hand=hand,
+            **_native_tactile_calibration(self._env),
+        )
         print(
             "[univtac-tactile] "
             f"hand={hand} contact={summary['contact']} "
             f"left={summary['left_contact']} right={summary['right_contact']} "
-            f"force={summary['normal_force']:.3f} shear={summary['shear_magnitude']:.3f} "
+            f"force={summary['normal_force']:.3f} depth={summary['depth_delta_mm']:.3f}mm "
+            f"shear={summary['shear_magnitude']:.3f} "
             f"slip={summary['slip_score']:.3f} event={summary['event']}"
         )
         return summary
@@ -224,10 +229,12 @@ class UniVTACTactileApi(ApiBase):
             stable_grasp, slip_detected, or contact_lost.
         """
         _refresh_native_tactile(self._env, data_types=["rgb", "rgb_marker", "marker", "depth", "pose"])
-        events = tactile_event_sequence(self._env.tactile_buffer.recent(window))
+        events = tactile_event_sequence(
+            self._env.tactile_buffer.recent(window),
+            **_native_tactile_calibration(self._env),
+        )
         print(f"[univtac-tactile] recent_events={events}")
         return events
-
     def _hand_observation(
         self,
         hand: str,
@@ -247,6 +254,13 @@ class UniVTACTactileApi(ApiBase):
                 )
             key = alternate
         return tactile[key]
+
+
+def _native_tactile_calibration(env: BaseEnv) -> dict[str, float]:
+    calibration_fn = getattr(env, "get_native_tactile_calibration", None)
+    if not callable(calibration_fn):
+        return {}
+    return dict(calibration_fn())
 
 
 def _hand_key(hand: str) -> str:

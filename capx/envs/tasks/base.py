@@ -176,6 +176,13 @@ class CodeExecutionEnvBase(Env):
                 contextlib.redirect_stderr(tee_err),
             ):
                 exec(code, self._exec_globals, self._exec_globals)
+        except SystemExit as exc:
+            # Generated programs may use exit()/quit() to stop an expected
+            # fallback branch. A zero/None status is normal completion; retain
+            # non-zero exits as sandbox failures.
+            if exc.code not in (None, 0):
+                ok = False
+                traceback.print_exc(file=tee_err)
         except BaseException:  # defensive; propagate minimal info
             ok = False
             # Always print full traceback to the redirected stderr (tee -> console and buffer)

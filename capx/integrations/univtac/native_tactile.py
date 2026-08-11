@@ -74,6 +74,9 @@ def summarize_native_tactile(
     frames: list[UniVTACTactileFrame],
     *,
     hand: str = "both",
+    depth_far_plane_mm: float | None = None,
+    force_full_scale_mm: float = 2.0,
+    depth_contact_margin_mm: float = 0.5,
 ) -> dict[str, Any]:
     """Summarize recent native UniVTAC tactile frames."""
     if not frames:
@@ -81,8 +84,13 @@ def summarize_native_tactile(
 
     hand = _normalize_hand(hand)
     current = frames[-1]
-    left_metrics = _hand_metrics(current.left_depth, current.left_marker)
-    right_metrics = _hand_metrics(current.right_depth, current.right_marker)
+    metric_kwargs = {
+        "depth_far_plane_mm": depth_far_plane_mm,
+        "force_full_scale_mm": force_full_scale_mm,
+        "depth_contact_margin_mm": depth_contact_margin_mm,
+    }
+    left_metrics = _hand_metrics(current.left_depth, current.left_marker, **metric_kwargs)
+    right_metrics = _hand_metrics(current.right_depth, current.right_marker, **metric_kwargs)
 
     selected = _select_metrics(hand, left_metrics, right_metrics)
     contact = any(m["contact"] for m in selected)
@@ -96,15 +104,15 @@ def summarize_native_tactile(
     previous_contact = any(
         any(m["contact"] for m in _select_metrics(
             hand,
-            _hand_metrics(frame.left_depth, frame.left_marker),
-            _hand_metrics(frame.right_depth, frame.right_marker),
+            _hand_metrics(frame.left_depth, frame.left_marker, **metric_kwargs),
+            _hand_metrics(frame.right_depth, frame.right_marker, **metric_kwargs),
         ))
         for frame in frames[:-1]
     )
     contact_lost = previous_contact and not contact
 
-    marker_growth = _marker_growth(frames, hand)
-    area_change = _contact_area_change(frames, hand)
+    marker_growth = _marker_growth(frames, hand, metric_kwargs)
+    area_change = _contact_area_change(frames, hand, metric_kwargs)
     balance = _contact_balance(left_metrics, right_metrics)
     slip_score = float(np.clip(0.65 * marker_growth + 0.25 * area_change + 0.10 * abs(balance), 0.0, 1.0))
     if contact_lost:
@@ -139,11 +147,24 @@ def summarize_native_tactile(
     }
 
 
-def tactile_event_sequence(frames: list[UniVTACTactileFrame], *, hand: str = "both") -> list[str]:
+def tactile_event_sequence(
+    frames: list[UniVTACTactileFrame],
+    *,
+    hand: str = "both",
+    depth_far_plane_mm: float | None = None,
+    force_full_scale_mm: float = 2.0,
+    depth_contact_margin_mm: float = 0.5,
+) -> list[str]:
     """Return a deduplicated sequence of tactile events over recent frames."""
     events: list[str] = []
     for idx in range(len(frames)):
-        event = summarize_native_tactile(frames[: idx + 1], hand=hand)["event"]
+        event = summarize_native_tactile(
+            frames[: idx + 1],
+            hand=hand,
+            depth_far_plane_mm=depth_far_plane_mm,
+            force_full_scale_mm=force_full_scale_mm,
+            depth_contact_margin_mm=depth_contact_margin_mm,
+        )["event"]
         if not events or events[-1] != event:
             events.append(event)
     return events
@@ -172,26 +193,57 @@ def _empty_hand_metrics() -> dict[str, Any]:
         "normal_force": 0.0,
         "contact_area": 0.0,
         "depth_delta_mm": 0.0,
+        "depth_min_mm": None,
+        "depth_far_plane_mm": None,
         "shear_magnitude": 0.0,
         "marker_mean_displacement": 0.0,
         "marker_max_displacement": 0.0,
     }
 
 
-def _hand_metrics(depth: np.ndarray | None, marker: np.ndarray | None) -> dict[str, Any]:
+def _hand_metrics(
+    depth: np.ndarray | None,
+    marker: np.ndarray | None,
+    *,
+    depth_far_plane_mm: float | None = None,
+    force_full_scale_mm: float = 2.0,
+    depth_contact_margin_mm: float = 0.5,
+) -> dict[str, Any]:
     metrics = _empty_hand_metrics()
-    depth_delta = _depth_indentation(depth)
+    depth_stats = _depth_metrics(
+        depth,
+        far_plane_mm=depth_far_plane_mm,
+        contact_margin_mm=depth_contact_margin_mm,
+    )
+    depth_delta = depth_stats["depth_delta_mm"]
     marker_mean, marker_max = _marker_displacement(marker)
-    contact_area = _contact_area(depth, depth_delta)
-    normal_force = float(np.clip(0.65 * (depth_delta / 2.0) + 0.35 * contact_area, 0.0, 1.0))
+    contact_area = depth_stats["contact_area"]
+    force_scale = max(float(force_full_scale_mm), 1e-6)
+    # This is a normalized compression proxy, not a Newton estimate. A value
+    # of 1.0 means the robot-specific adaptive grasp depth has been reached.
+    # Contact area remains a separate stability feature and must not make the
+    # controller stop before the calibrated compression target.
+    normal_force = float(np.clip(depth_delta / force_scale, 0.0, 1.0))
     shear = float(np.clip(marker_mean / 4.0, 0.0, 1.0))
-    contact = normal_force >= 0.08 or marker_mean >= 0.35 or contact_area >= 0.01
+    depth_contact = bool(
+        depth_delta >= max(0.0, float(depth_contact_margin_mm))
+        and contact_area > 0.0
+    )
+    # With a calibrated native depth plane, marker motion is a shear/slip
+    # signal only. Treating marker motion alone as contact caused false stops
+    # while the GelSight depth maps were still at their no-load far plane.
+    if depth_far_plane_mm is not None and depth_stats["depth_available"]:
+        contact = depth_contact
+    else:
+        contact = depth_contact or marker_mean >= 0.35
     metrics.update(
         {
             "contact": bool(contact),
             "normal_force": normal_force,
             "contact_area": float(contact_area),
             "depth_delta_mm": float(depth_delta),
+            "depth_min_mm": depth_stats["depth_min_mm"],
+            "depth_far_plane_mm": depth_stats["depth_far_plane_mm"],
             "shear_magnitude": shear,
             "marker_mean_displacement": float(marker_mean),
             "marker_max_displacement": float(marker_max),
@@ -200,28 +252,46 @@ def _hand_metrics(depth: np.ndarray | None, marker: np.ndarray | None) -> dict[s
     return metrics
 
 
-def _depth_indentation(depth: np.ndarray | None) -> float:
+def _depth_metrics(
+    depth: np.ndarray | None,
+    *,
+    far_plane_mm: float | None,
+    contact_margin_mm: float,
+) -> dict[str, Any]:
+    empty = {
+        "depth_available": False,
+        "depth_delta_mm": 0.0,
+        "depth_min_mm": None,
+        "depth_far_plane_mm": far_plane_mm,
+        "contact_area": 0.0,
+    }
     if depth is None or depth.size == 0:
-        return 0.0
+        return empty
     arr = np.asarray(depth, dtype=np.float64)
     valid = arr[np.isfinite(arr)]
     if valid.size == 0:
-        return 0.0
-    far_plane = float(np.nanpercentile(valid, 95))
-    near = float(np.nanpercentile(valid, 5))
-    return max(0.0, far_plane - near)
+        return empty
 
-
-def _contact_area(depth: np.ndarray | None, depth_delta: float) -> float:
-    if depth is None or depth.size == 0 or depth_delta <= 1e-6:
-        return 0.0
-    arr = np.asarray(depth, dtype=np.float64)
-    valid = arr[np.isfinite(arr)]
-    if valid.size == 0:
-        return 0.0
-    far_plane = float(np.nanpercentile(valid, 95))
-    threshold = far_plane - max(0.25, depth_delta * 0.35)
-    return float(np.mean(valid < threshold))
+    calibrated = far_plane_mm is not None
+    far_plane = (
+        float(far_plane_mm)
+        if calibrated
+        else float(np.nanpercentile(valid, 95))
+    )
+    near = float(np.nanmin(valid) if calibrated else np.nanpercentile(valid, 5))
+    depth_delta = max(0.0, far_plane - near)
+    if calibrated:
+        threshold = far_plane - max(0.0, float(contact_margin_mm))
+    else:
+        threshold = far_plane - max(0.25, depth_delta * 0.35)
+    contact_area = float(np.mean(valid < threshold)) if depth_delta > 1e-6 else 0.0
+    return {
+        "depth_available": True,
+        "depth_delta_mm": depth_delta,
+        "depth_min_mm": near,
+        "depth_far_plane_mm": far_plane,
+        "contact_area": contact_area,
+    }
 
 
 def _marker_displacement(marker: np.ndarray | None) -> tuple[float, float]:
@@ -230,7 +300,10 @@ def _marker_displacement(marker: np.ndarray | None) -> tuple[float, float]:
     arr = np.asarray(marker, dtype=np.float64)
     if arr.shape[-1] < 2:
         return 0.0, 0.0
-    if arr.ndim >= 4 and arr.shape[0] >= 2:
+    # UniVTAC removes the environment dimension before exposing marker data,
+    # leaving [initial/current, num_markers, xy]. Synthetic grids may retain
+    # one extra marker-grid dimension, so both 3-D and 4-D layouts use axis 0.
+    if arr.ndim >= 3 and arr.shape[0] >= 2:
         disp = arr[-1, ..., :2] - arr[0, ..., :2]
     else:
         disp = arr[..., :2]
@@ -246,35 +319,43 @@ def _marker_displacement(marker: np.ndarray | None) -> tuple[float, float]:
     return float(np.mean(mag)), float(np.max(mag))
 
 
-def _marker_growth(frames: list[UniVTACTactileFrame], hand: str) -> float:
+def _marker_growth(
+    frames: list[UniVTACTactileFrame],
+    hand: str,
+    metric_kwargs: dict[str, Any],
+) -> float:
     if len(frames) < 2:
         return 0.0
     first = frames[0]
     last = frames[-1]
     first_metrics = _select_metrics(
         hand,
-        _hand_metrics(first.left_depth, first.left_marker),
-        _hand_metrics(first.right_depth, first.right_marker),
+        _hand_metrics(first.left_depth, first.left_marker, **metric_kwargs),
+        _hand_metrics(first.right_depth, first.right_marker, **metric_kwargs),
     )
     last_metrics = _select_metrics(
         hand,
-        _hand_metrics(last.left_depth, last.left_marker),
-        _hand_metrics(last.right_depth, last.right_marker),
+        _hand_metrics(last.left_depth, last.left_marker, **metric_kwargs),
+        _hand_metrics(last.right_depth, last.right_marker, **metric_kwargs),
     )
     first_shear = float(np.mean([m["shear_magnitude"] for m in first_metrics])) if first_metrics else 0.0
     last_shear = float(np.mean([m["shear_magnitude"] for m in last_metrics])) if last_metrics else 0.0
     return float(np.clip(last_shear - first_shear, 0.0, 1.0))
 
 
-def _contact_area_change(frames: list[UniVTACTactileFrame], hand: str) -> float:
+def _contact_area_change(
+    frames: list[UniVTACTactileFrame],
+    hand: str,
+    metric_kwargs: dict[str, Any],
+) -> float:
     if len(frames) < 2:
         return 0.0
     areas = []
     for frame in frames:
         metrics = _select_metrics(
             hand,
-            _hand_metrics(frame.left_depth, frame.left_marker),
-            _hand_metrics(frame.right_depth, frame.right_marker),
+            _hand_metrics(frame.left_depth, frame.left_marker, **metric_kwargs),
+            _hand_metrics(frame.right_depth, frame.right_marker, **metric_kwargs),
         )
         areas.append(float(np.mean([m["contact_area"] for m in metrics])) if metrics else 0.0)
     return float(np.clip(max(areas) - areas[-1], 0.0, 1.0))

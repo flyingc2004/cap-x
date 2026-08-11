@@ -13,6 +13,11 @@ from scipy.spatial.transform import Rotation as SciRotation
 
 from capx.envs.base import BaseEnv
 from capx.integrations.base_api import ApiBase
+from capx.integrations.tactile.adaptive_gripper import (
+    AdaptiveGripperConfig,
+    TactileAdaptiveGripperController,
+)
+from capx.integrations.univtac.native_tactile import summarize_native_tactile
 
 
 class UniVTACFrankaCompatApi(ApiBase):
@@ -89,6 +94,8 @@ class UniVTACFrankaCompatApi(ApiBase):
         self.lift_after_close_z = float(cfg.get("lift_after_close_z", lift_after_close_z))
         self.close_gripper_qpos = float(cfg.get("close_gripper_qpos", close_gripper_qpos))
         self.open_gripper_width = float(cfg.get("open_gripper_width", open_gripper_width))
+        adaptive_cfg = cfg.get("adaptive_gripper", {})
+        self.adaptive_gripper_config = dict(adaptive_cfg) if isinstance(adaptive_cfg, dict) else {}
         self.object_pose_names = dict(cfg.get("object_pose_names", object_pose_names or {})) or {
             "prism": "prism",
             "object": "prism",
@@ -113,7 +120,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         self,
         object_name: str,
         return_bbox_extent: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Get a public landmark pose from UniVTAC actor observations.
 
         Args:
@@ -122,14 +129,18 @@ class UniVTACFrankaCompatApi(ApiBase):
             return_bbox_extent: Whether to also return an approximate extent.
 
         Returns:
-            Pose tuple, optionally with extent.
+            ``(position, quaternion_wxyz)`` by default. When
+            ``return_bbox_extent=True``, returns
+            ``(position, quaternion_wxyz, bbox_extent)``.
         """
         key = self._resolve_pose_key(object_name)
         landmarks = self._public_landmarks()
         if key not in landmarks:
             raise KeyError(f"object '{object_name}' not available in UniVTAC public poses")
         pos, quat, extent = landmarks[key]
-        return pos, quat, extent if return_bbox_extent else None
+        if return_bbox_extent:
+            return pos, quat, extent
+        return pos, quat
 
     def sample_grasp_pose(
         self,
@@ -172,7 +183,9 @@ class UniVTACFrankaCompatApi(ApiBase):
         if self._nearest_public_landmark(pos) is not None and self.preserve_landmark_orientation:
             quat = cur_quat
 
-        approach = float(z_approach) if float(z_approach) > 0.0 else float(self.default_z_approach)
+        # Preserve the original CaP contract: zero means a direct bounded move.
+        # Callers request a staged approach explicitly with a positive value.
+        approach = max(0.0, float(z_approach))
         if approach > 0.0:
             approach_target = pos.copy()
             approach_target[2] = max(approach_target[2] + approach, self.min_safe_z)
@@ -183,12 +196,38 @@ class UniVTACFrankaCompatApi(ApiBase):
         final_target[2] = max(final_target[2], self.min_safe_z)
         self._move_to_pose_bounded(final_target, quat, cur_pos, cur_quat)
 
-    def open_gripper(self) -> None:
-        """Open the gripper fully."""
+    def open_gripper(
+        self,
+        adaptive: bool = True,
+        target_width: float = 1.0,
+        max_steps: int = 80,
+    ) -> dict[str, Any]:
+        """Open the gripper, releasing gently while native contact remains.
+
+        Args:
+            adaptive: Use CaP-X tactile feedback control when true.
+            target_width: Normalized target width from 0 (closed) to 1 (open).
+            max_steps: Maximum tactile servo iterations.
+
+        Returns:
+            Result containing ``released``, final width, and stop reason.
+        """
+        if adaptive:
+            controller = self._adaptive_gripper_controller()
+            result = controller.open(target_width=target_width, max_steps=max_steps)
+            self._save_adaptive_trace(controller.trace)
+            print(
+                "[univtac-franka] adaptive_open "
+                f"released={result['released']} reason={result['reason']} "
+                f"width={result['width']:.4f} steps={result['steps']}",
+                flush=True,
+            )
+            return result
+
         native_gripper = getattr(self._env, "move_gripper_native", None)
         if callable(native_gripper):
             result = native_gripper(
-                qpos=self._width_to_qpos(self.open_gripper_width),
+                qpos=self._width_to_qpos(target_width),
                 opening=True,
                 settle_steps=self.gripper_settle_steps,
             )
@@ -197,11 +236,50 @@ class UniVTACFrankaCompatApi(ApiBase):
                 f"ok={bool(result.get('ok', False))} message={result.get('message', '')}",
                 flush=True,
             )
-            return
-        self._move_gripper(1.0)
+            return {
+                **result,
+                "released": bool(result.get("ok", False)),
+                "reason": "fixed_open",
+                "target_width": float(np.clip(target_width, 0.0, 1.0)),
+            }
+        self._move_gripper(target_width)
+        return {
+            "ok": True,
+            "released": True,
+            "reason": "fixed_open",
+            "target_width": float(np.clip(target_width, 0.0, 1.0)),
+        }
 
-    def close_gripper(self) -> None:
-        """Close the gripper fully."""
+    def close_gripper(
+        self,
+        adaptive: bool = True,
+        target_force: float = 0.35,
+        max_steps: int = 80,
+    ) -> dict[str, Any]:
+        """Close the gripper using CaP-X native tactile feedback control.
+
+        Args:
+            adaptive: Use tactile coarse/fine closing when true.
+            target_force: Normalized target force used for stable-contact stop.
+            max_steps: Maximum tactile servo iterations.
+
+        Returns:
+            Result containing ``stable``, contact state, and stop reason. The
+            caller remains responsible for pose adjustment, retry, and lift.
+        """
+        if adaptive:
+            controller = self._adaptive_gripper_controller()
+            result = controller.close(target_force=target_force, max_steps=max_steps)
+            self._save_adaptive_trace(controller.trace)
+            print(
+                "[univtac-franka] adaptive_close "
+                f"stable={result['stable']} reason={result['reason']} "
+                f"force={result['normal_force']:.3f} width={result['width']:.4f} "
+                f"steps={result['steps']}",
+                flush=True,
+            )
+            return result
+
         native_gripper = getattr(self._env, "move_gripper_native", None)
         if callable(native_gripper):
             result = native_gripper(
@@ -216,8 +294,17 @@ class UniVTACFrankaCompatApi(ApiBase):
                 f"ok={bool(result.get('ok', False))} message={result.get('message', '')}",
                 flush=True,
             )
-            return
+            return {
+                **result,
+                "stable": False,
+                "reason": "fixed_close_requires_tactile_confirmation",
+            }
         self._move_gripper(0.0)
+        return {
+            "ok": True,
+            "stable": False,
+            "reason": "fixed_close_requires_tactile_confirmation",
+        }
 
     def home_pose(self) -> None:
         """Move to a conservative hover/home pose."""
@@ -249,6 +336,69 @@ class UniVTACFrankaCompatApi(ApiBase):
         self._env.take_action(np.concatenate([arm, [target]]), action_type="qpos")
         if self.gripper_settle_steps > 0:
             self._env.wait_steps(self.gripper_settle_steps)
+
+    def _adaptive_gripper_controller(self) -> TactileAdaptiveGripperController:
+        calibration_fn = getattr(self._env, "get_gripper_calibration", None)
+        command_fn = getattr(self._env, "command_gripper_width_step", None)
+        if not callable(calibration_fn) or not callable(command_fn):
+            raise RuntimeError("UniVTAC environment does not provide adaptive gripper hooks")
+
+        calibration = calibration_fn()
+        max_qpos = float(calibration["gripper_max_qpos"])
+        if max_qpos <= 0.0:
+            raise RuntimeError("gripper_max_qpos must be positive")
+        cfg = self.adaptive_gripper_config
+        coarse_qpos_step = float(cfg.get("coarse_qpos_step", 0.0005))
+        fine_qpos_step = float(cfg.get("fine_qpos_step", 0.00005))
+        controller_config = AdaptiveGripperConfig(
+            coarse_step=coarse_qpos_step / max_qpos,
+            fine_step=fine_qpos_step / max_qpos,
+            contact_debounce_frames=int(cfg.get("contact_debounce_frames", 2)),
+            stable_debounce_frames=int(cfg.get("stable_debounce_frames", 3)),
+            release_debounce_frames=int(cfg.get("release_debounce_frames", 2)),
+            settle_steps_per_command=int(cfg.get("settle_steps_per_command", 1)),
+            contact_force_threshold=float(cfg.get("contact_force_threshold", 0.08)),
+            contact_balance_threshold=float(cfg.get("contact_balance_threshold", 0.45)),
+            slip_threshold=float(cfg.get("slip_threshold", 0.60)),
+            one_sided_force_limit=float(cfg.get("one_sided_force_limit", 0.90)),
+            max_qpos=max_qpos,
+        )
+        return TactileAdaptiveGripperController(
+            get_width=lambda: float(calibration_fn()["current_width"]),
+            command_width=lambda width, settle_steps: command_fn(
+                width,
+                settle_steps=settle_steps,
+            ),
+            read_tactile_summary=self._read_adaptive_tactile_summary,
+            config=controller_config,
+        )
+
+    def _read_adaptive_tactile_summary(self) -> dict[str, Any]:
+        buffer = getattr(self._env, "tactile_buffer", None)
+        if buffer is None:
+            raise RuntimeError("UniVTAC native tactile buffer is unavailable")
+        window = max(1, int(self.adaptive_gripper_config.get("tactile_window", 5)))
+        frames = buffer.recent(window)
+        if not frames:
+            refresh_fn = getattr(self._env, "refresh_native_observation", None)
+            if not callable(refresh_fn):
+                raise RuntimeError("UniVTAC native tactile observation is unavailable")
+            refresh_fn(
+                include_camera=False,
+                include_tactile=True,
+                include_embodiment=False,
+                include_actor=False,
+                tactile_data_types=["depth", "marker", "pose"],
+            )
+            frames = buffer.recent(window)
+        calibration_fn = getattr(self._env, "get_native_tactile_calibration", None)
+        calibration = calibration_fn() if callable(calibration_fn) else {}
+        return summarize_native_tactile(frames, hand="both", **calibration)
+
+    def _save_adaptive_trace(self, trace: list[dict[str, Any]]) -> None:
+        save_fn = getattr(self._env, "append_tactile_gripper_trace", None)
+        if callable(save_fn):
+            save_fn(trace)
 
     def _move_to_pose_bounded(
         self,
@@ -440,13 +590,14 @@ class UniVTACFrankaCompatApi(ApiBase):
         nearest = self._nearest_public_grasp_target(position)
         if nearest is None:
             return None
-        key, _grasp_pos = nearest
+        key, grasp_pos = nearest
         approach_fn = getattr(self._env, "approach_grasped_actor", None)
         if not callable(approach_fn):
             return None
 
         result = approach_fn(
             object_name=key,
+            position_offset=(np.asarray(position, dtype=np.float32) - grasp_pos),
             pre_dis=self.grasp_pre_dis,
             dis=self.grasp_dis,
             grasp_height=self.grasp_height,
@@ -454,6 +605,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         print(
             "[univtac-franka] approach_grasp_via_task_atom "
             f"object={key} requested={np.array2string(np.asarray(position), precision=3)} "
+            f"offset={np.array2string(np.asarray(position) - grasp_pos, precision=3)} "
             f"ok={bool(result.get('ok', False))} message={result.get('message', '')}",
             flush=True,
         )
