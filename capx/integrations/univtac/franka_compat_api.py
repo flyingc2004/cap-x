@@ -34,6 +34,8 @@ class UniVTACFrankaCompatApi(ApiBase):
         max_delta_gripper: float = 0.02,
         default_z_approach: float = 0.10,
         release_hover_height: float = 0.10,
+        home_pose_relative_lift: bool = False,
+        home_lift_delta_z: float = 0.10,
         preserve_landmark_orientation: bool = True,
         use_task_place_actor_for_landmarks: bool = False,
         placement_xy_tolerance: float = 0.08,
@@ -73,6 +75,12 @@ class UniVTACFrankaCompatApi(ApiBase):
         self.max_delta_gripper = float(cfg.get("max_delta_gripper", max_delta_gripper))
         self.default_z_approach = float(cfg.get("default_z_approach", default_z_approach))
         self.release_hover_height = float(cfg.get("release_hover_height", release_hover_height))
+        self.home_pose_relative_lift = bool(
+            cfg.get("home_pose_relative_lift", home_pose_relative_lift)
+        )
+        self.home_lift_delta_z = float(cfg.get("home_lift_delta_z", home_lift_delta_z))
+        if not np.isfinite(self.home_lift_delta_z) or self.home_lift_delta_z <= 0.0:
+            raise ValueError("home_lift_delta_z must be a positive finite distance")
         self.preserve_landmark_orientation = bool(
             cfg.get("preserve_landmark_orientation", preserve_landmark_orientation)
         )
@@ -433,7 +441,13 @@ class UniVTACFrankaCompatApi(ApiBase):
         """Move to a conservative hover/home pose."""
         tool_pos, tool_quat = self._current_tool_pose()
         target = tool_pos.copy()
-        target[2] = max(self.release_hover_height, self.min_safe_z)
+        if self.home_pose_relative_lift:
+            target[2] = max(
+                float(tool_pos[2]) + self.home_lift_delta_z,
+                self.min_safe_z,
+            )
+        else:
+            target[2] = max(self.release_hover_height, self.min_safe_z)
         if self.use_native_pose_planner:
             self._goto_pose_native(target, tool_quat, z_approach=0.0)
             return

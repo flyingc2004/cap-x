@@ -240,10 +240,17 @@ def test_official_yaml_uses_native_protocol_without_privileged_pose() -> None:
     assert low["privileged"] is False
     assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
     assert franka["rgbd_perception_enabled"] is True
-    assert franka["use_native_pose_planner"] is True
+    assert franka["use_native_pose_planner"] is False
     assert franka["use_task_grasp_actor_for_objects"] is False
     assert franka["record_perception_diagnostic"] is True
+    assert franka["home_pose_relative_lift"] is True
+    assert franka["home_lift_delta_z"] == pytest.approx(0.10)
+    assert franka["max_delta_xyz"] == pytest.approx(0.01)
     assert "api_servers" not in config
+    assert "home_pose()" in cfg["prompt"]
+    assert "bounded 0.01 meter steps" in cfg["prompt"]
+    assert "Do not command a wrist rotation" in cfg["prompt"]
+    assert "relative=True" not in cfg["prompt"]
 
     task_config = yaml.safe_load(
         Path(

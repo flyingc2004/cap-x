@@ -12,12 +12,14 @@ env:
       api_configs:
         franka_control_api:
           min_safe_z: 0.10
+          max_delta_xyz: 0.01
           default_z_approach: 0.08
-          release_hover_height: 0.15
+          home_pose_relative_lift: true
+          home_lift_delta_z: 0.10
           preserve_landmark_orientation: false
           use_task_place_actor_for_landmarks: false
           use_task_grasp_actor_for_objects: false
-          use_native_pose_planner: true
+          use_native_pose_planner: false
           record_perception_diagnostic: true
           lift_after_close: false
           gripper_settle_steps: 10
@@ -56,7 +58,7 @@ env:
       You are controlling a Franka robot in the official UniVTAC lift_can evaluation protocol.
       The official reset has already opened the gripper and moved it to a randomly perturbed pre-grasp pose around the cylindrical can. Do not open or reposition before the first grasp attempt.
       First call close_gripper(adaptive=True, target_force=1.0, max_steps=160). Inspect its stable/contact fields and UniVTAC native tactile feedback.
-      When the first grasp is stable, call home_pose() to lift the grasped can to a safe hover while preserving the current grasp orientation. Check native tactile contact and slip during the lift, then call open_gripper(adaptive=True) so the can can settle upright on the table.
+      When the first grasp is stable, call home_pose() to lift the grasped can straight upward by 0.10 meters in bounded 0.01 meter steps while preserving the current grasp orientation. Do not command a wrist rotation: the side grasp, vertical lift, contact constraints, and gravity allow the can to turn upright passively. Check native tactile contact and slip after the lift, then call open_gripper(adaptive=True) so the can can settle upright on the table.
       If the first grasp is not stable, open the gripper and perform one explicit non-privileged retry: call get_object_pose("can") or sample_grasp_pose("can"), move with goto_pose(grasp_pos, grasp_quat, z_approach=0.08), and close adaptively again.
       get_object_pose and sample_grasp_pose use only head-camera RGB-D, SAM3, and Contact-GraspNet. A perception failure is a real failure; do not substitute guessed coordinates or hidden simulator state.
       Use only the six high-level FrankaControlApi motion functions and UniVTAC native tactile functions. Do not call low-level move_delta_ee, move_ee, or move_qpos functions.

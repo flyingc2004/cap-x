@@ -447,6 +447,47 @@ def test_univtac_franka_compat_respects_config_and_uses_high_level_api() -> None
     assert all(float(action[2]) >= 0.0 for action, _ in api._env.calls)
 
 
+def test_univtac_home_pose_relative_lift_uses_bounded_vertical_steps() -> None:
+    class Env:
+        task = None
+        api_configs = {
+            "franka_control_api": {
+                "min_safe_z": 0.10,
+                "max_delta_xyz": 0.01,
+                "home_pose_relative_lift": True,
+                "home_lift_delta_z": 0.10,
+                "use_native_pose_planner": False,
+            }
+        }
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.60, 0.0, 0.15],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+            }
+
+        def take_action(self, action, *, action_type: str):
+            self.calls.append((np.asarray(action, dtype=np.float32), action_type))
+            return {"ok": True}
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+
+    api.home_pose()
+
+    assert len(env.calls) == 10
+    assert all(action_type == "delta_ee" for _, action_type in env.calls)
+    deltas = np.stack([action for action, _ in env.calls])
+    np.testing.assert_allclose(deltas[:, :2], 0.0, atol=1e-7)
+    assert np.all(deltas[:, 2] > 0.0)
+    assert np.all(deltas[:, 2] <= 0.01 + 1e-6)
+    assert float(deltas[:, 2].sum()) == pytest.approx(0.10, abs=1e-6)
+    np.testing.assert_allclose(deltas[:, 3:6], 0.0, atol=1e-7)
+
+
 def test_univtac_franka_zero_z_approach_moves_directly() -> None:
     class Env:
         task = None
