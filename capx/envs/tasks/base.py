@@ -12,6 +12,7 @@ from gymnasium import Env, spaces
 from capx.envs.base import BaseEnv, ObsType, get_env
 from capx.envs.configs.instantiate import instantiate as cfg_instantiate
 from capx.envs.configs.loader import DictLoader
+from capx.envs.tasks.exceptions import HardStopTrial, RecoverableTaskFailure
 from capx.integrations.base_api import ApiBase, get_api
 
 
@@ -79,6 +80,17 @@ class SimpleExecutor:
         try:
             exec(code, g, g)
             return {"ok": True, "result": g.get("RESULT")}
+        except HardStopTrial:
+            raise
+        except RecoverableTaskFailure as exc:
+            return {
+                "ok": True,
+                "result": {
+                    "recoverable_task_failure": True,
+                    "reason": exc.reason,
+                    "details": exc.details,
+                },
+            }
         except BaseException as exc:  # defensive; propagate minimal info
             return {"ok": False, "error": repr(exc)}
 
@@ -177,6 +189,19 @@ class CodeExecutionEnvBase(Env):
                 contextlib.redirect_stderr(tee_err),
             ):
                 exec(code, self._exec_globals, self._exec_globals)
+        except HardStopTrial:
+            raise
+        except RecoverableTaskFailure as exc:
+            self._exec_globals["RESULT"] = {
+                "recoverable_task_failure": True,
+                "reason": exc.reason,
+                "details": exc.details,
+            }
+            print(
+                "[capx-task] recoverable_failure "
+                f"reason={exc.reason} message={exc}",
+                file=tee_out,
+            )
         except SystemExit as exc:
             # Generated programs may use exit()/quit() to stop an expected
             # fallback branch. A zero/None status is normal completion; retain
@@ -219,6 +244,18 @@ class CodeExecutionEnvBase(Env):
 
     def _exec_env_binding(self) -> Any:
         return self.low_level_env
+
+    def set_trial_deadline(self, timeout_seconds: float) -> None:
+        """Forward a wall-clock hard deadline to low-level environments."""
+        setter = getattr(self.low_level_env, "set_trial_deadline", None)
+        if callable(setter):
+            setter(timeout_seconds)
+
+    def clear_trial_deadline(self) -> None:
+        """Clear a low-level trial deadline after normal or timeout completion."""
+        clearer = getattr(self.low_level_env, "clear_trial_deadline", None)
+        if callable(clearer):
+            clearer()
 
     def _exec_apis_binding(self) -> dict[str, ApiBase]:
         return self._apis

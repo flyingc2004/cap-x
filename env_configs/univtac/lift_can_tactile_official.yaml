@@ -21,6 +21,14 @@ env:
           use_task_grasp_actor_for_objects: false
           use_native_pose_planner: false
           record_perception_diagnostic: true
+          official_anchor_fallback_enabled: true
+          official_anchor_fallback_objects:
+            - can
+          max_goto_pose_actions: 40
+          max_home_pose_actions: 15
+          max_native_pose_actions: 2
+          max_gripper_servo_steps: 200
+          max_gripper_settle_steps: 20
           lift_after_close: false
           gripper_settle_steps: 10
           open_gripper_width: 1.0
@@ -29,6 +37,12 @@ env:
           perception_camera: head
           perception_prompt_map:
             can: cylindrical can
+          perception_prompt_fallbacks:
+            can:
+              - can
+              - cylindrical object
+              - small cylinder
+          perception_retry_attempts: 2
           sam3_service_url: http://127.0.0.1:8114
           graspnet_service_url: http://127.0.0.1:8115
           perception_timeout_seconds: 120
@@ -56,12 +70,12 @@ env:
       - UniVTACTactileApi
     prompt: |
       You are controlling a Franka robot in the official UniVTAC lift_can evaluation protocol.
-      The official reset has already opened the gripper and moved it to a randomly perturbed pre-grasp pose around the cylindrical can. Do not open or reposition before the first grasp attempt.
-      First call close_gripper(adaptive=True, target_force=1.0, max_steps=160). Inspect its stable/contact fields and UniVTAC native tactile feedback.
-      When the first grasp is stable, call home_pose() to lift the grasped can straight upward by 0.10 meters in bounded 0.01 meter steps while preserving the current grasp orientation. Do not command a wrist rotation: the side grasp, vertical lift, contact constraints, and gravity allow the can to turn upright passively. Check native tactile contact and slip after the lift, then call open_gripper(adaptive=True) so the can can settle upright on the table.
-      If the first grasp is not stable, open the gripper and perform one explicit non-privileged retry: call get_object_pose("can") or sample_grasp_pose("can"), move with goto_pose(grasp_pos, grasp_quat, z_approach=0.08), and close adaptively again.
-      get_object_pose and sample_grasp_pose use only head-camera RGB-D, SAM3, and Contact-GraspNet. A perception failure is a real failure; do not substitute guessed coordinates or hidden simulator state.
-      Use only the six high-level FrankaControlApi motion functions and UniVTAC native tactile functions. Do not call low-level move_delta_ee, move_ee, or move_qpos functions.
+      Goal: use the official pre-grasp state, native tactile feedback, and compact recovery actions to grasp the cylindrical can, lift it, and release it so it can settle upright according to the official task rules.
+      The official reset has already opened the gripper and moved it to a randomly perturbed pre-grasp pose near the can. The first grasp attempt must use this current pre-grasp pose directly. Do not call sample_grasp_pose(), get_object_pose(), or goto_pose() before the first close_gripper().
+      Use short bounded loops when useful. A recovery loop should usually retry from the current pre-grasp neighborhood: open or loosen the gripper, query tactile feedback, and close again. Do not begin every retry by sampling a new RGB-D grasp. Prefer at most 2-3 grasp attempts, and never use unbounded while loops, long waits, or repeated identical actions without new tactile or perception feedback.
+      Tactile hints: stable_grasp or stable=True means lifting is reasonable; one-sided contact usually means the grasp is off-center, so release or loosen and try another compact close from the current pre-grasp neighborhood; slip_detected or contact_lost means the grasp is unsafe for lifting; weak or missing contact means the attempt may be a normal task failure.
+      Use RGB-D regrasp only as a last fallback after tactile recovery around the official pre-grasp fails. If you use sample_grasp_pose("can"), check the goto_pose(...) return value. If perception or motion fails, end the program normally without raising, asserting, exiting, or substituting guessed coordinates.
+      Use only the six high-level FrankaControlApi motion functions and UniVTAC native tactile functions. Do not call low-level move_delta_ee, move_ee, or move_qpos functions. Keep physical actions compact and check API return values such as stable, released, ok, reason, contact, and slip when available.
       Never inspect task actors, metadata, private labels, reward, success, task_completed, or trial id. Do not load or call ACT or ViTAL policies.
       If a physical action is stopped by the official action budget or early-stop rule, let the program reach its end normally. Do not call exit, quit, assert, or raise an exception for an expected task failure.
 trials: 1

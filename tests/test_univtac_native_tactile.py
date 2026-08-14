@@ -159,6 +159,71 @@ def test_native_marker_centroid_displacement_uses_window_baseline() -> None:
 
     assert summary["marker_centroid_displacement"] == pytest.approx(2.0)
     assert summary["left"]["marker_centroid_displacement"] == pytest.approx(2.0)
+    assert summary["slip_score"] >= 0.6
+    assert summary["slip_risk"] == "high"
+    assert summary["incipient_slip"] is True
+    assert summary["event"] == "slip_detected"
+
+
+def test_native_tactile_preslip_risk_fields() -> None:
+    stable = summarize_native_tactile(
+        [
+            _frame(step=0, left_contact=True, right_contact=True),
+            _frame(step=1, left_contact=True, right_contact=True),
+        ]
+    )
+    assert stable["slip_risk"] == "low"
+    assert stable["incipient_slip"] is False
+    assert stable["correction_hint"] == "continue"
+
+    warning = summarize_native_tactile(
+        [
+            _frame(step=0, left_contact=True, right_contact=True),
+            _frame(
+                step=1,
+                left_contact=True,
+                right_contact=True,
+                left_marker=0.6,
+                right_marker=0.6,
+            ),
+        ]
+    )
+    assert warning["slip_risk"] == "medium"
+    assert warning["incipient_slip"] is True
+    assert warning["drift_trend"] == "increasing"
+    assert warning["correction_hint"] == "reduce_down_step"
+
+    left_depth = _depth(True)
+    right_depth = np.full((16, 16), 34.0, dtype=np.float32)
+    right_depth[4:12, 4:12] = 33.0
+    side_bias = summarize_native_tactile(
+        [
+            UniVTACTactileFrame(
+                step=0,
+                timestamp=0.0,
+                left_depth=left_depth,
+                right_depth=right_depth,
+                left_marker=_marker(0.0),
+                right_marker=_marker(0.0),
+                left_pose=None,
+                right_pose=None,
+            ),
+            UniVTACTactileFrame(
+                step=1,
+                timestamp=1.0,
+                left_depth=left_depth,
+                right_depth=right_depth,
+                left_marker=_marker(2.0),
+                right_marker=_marker(0.0),
+                left_pose=None,
+                right_pose=None,
+            )
+        ]
+    )
+    assert side_bias["pressure_side"] == "left"
+    assert side_bias["shear_side"] == "left"
+    assert side_bias["slip_risk"] == "high"
+    assert side_bias["correction_hint"] == "try_lateral_probe"
 
 
 def test_calibrated_depth_does_not_treat_marker_only_motion_as_contact() -> None:
@@ -321,6 +386,7 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
         "open_gripper",
         "close_gripper",
         "home_pose",
+        "move_relative",
     }
 
     functions = UniVTACTactileApi.__new__(UniVTACTactileApi).functions()

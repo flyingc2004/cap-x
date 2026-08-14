@@ -31,6 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reasoning-effort", default="medium")
     parser.add_argument("--api-key", default=os.getenv("CAPX_API_KEY"))
     parser.add_argument("--total-trials", type=int, default=None)
+    parser.add_argument(
+        "--trial-ids",
+        default=os.getenv("CAPX_TRIAL_IDS"),
+        help="Comma-separated trial IDs or ranges to run, e.g. 8,13,20-25.",
+    )
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--record-video", type=_str2bool, default=None)
     parser.add_argument("--output-dir", default=None)

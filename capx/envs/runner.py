@@ -23,6 +23,10 @@ from capx.envs.trial import (
     _annotate_code_blocks,
     _build_log_lines,
     _run_single_trial,
+    _save_env_debug_artifacts,
+    _save_tactile_artifacts,
+    _save_turn_and_combined_videos,
+    _save_trial_video,
 )
 from capx.utils.launch_utils import (
     TrialSummary,
@@ -38,6 +42,44 @@ from capx.utils.parallel_eval import run_parallel_with_setup
 
 TRIAL_TIMEOUT_SECONDS = 1000
 MAX_TRIAL_RETRIES = 3
+
+
+# ---------------------------------------------------------------------------
+# Trial ID parsing
+# ---------------------------------------------------------------------------
+
+def _parse_trial_ids(raw: str | Iterable[int] | None) -> list[int] | None:
+    """Parse comma-separated trial IDs/ranges while preserving user order."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        values: list[int] = []
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if "-" in token:
+                start_s, end_s = token.split("-", 1)
+                start = int(start_s.strip())
+                end = int(end_s.strip())
+                if start <= 0 or end <= 0 or end < start:
+                    raise ValueError(f"invalid trial id range {token!r}")
+                values.extend(range(start, end + 1))
+            else:
+                value = int(token)
+                if value <= 0:
+                    raise ValueError(f"trial id must be positive, got {value}")
+                values.append(value)
+    else:
+        values = [int(value) for value in raw]
+        if any(value <= 0 for value in values):
+            raise ValueError(f"trial ids must be positive, got {values}")
+
+    deduped = list(dict.fromkeys(values))
+    return deduped or None
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +181,8 @@ def _run_headless_trials(
 
     Dispatches to parallel or sequential execution depending on ``num_workers``.
     """
-    if config["total_trials"] <= 0:
+    explicit_trial_ids = _parse_trial_ids(config.get("trial_ids"))
+    if explicit_trial_ids is None and config["total_trials"] <= 0:
         print("No trials requested; exiting.")
         return
 
@@ -149,9 +192,15 @@ def _run_headless_trials(
     _setup_output_dir(args, config)
 
     # Determine which trials to run (supports resume)
-    trial_ids = list(range(1, config["total_trials"] + 1))
-    if config.get("resume_idx") is not None:
+    if explicit_trial_ids is not None:
+        trial_ids = explicit_trial_ids
+    else:
+        trial_ids = list(range(1, config["total_trials"] + 1))
+    if config.get("resume_idx") is not None and explicit_trial_ids is None:
         trial_ids = list(range(config["resume_idx"], config["total_trials"] + 1))
+    elif config.get("resume_idx") is not None:
+        trial_ids = [trial for trial in trial_ids if trial >= int(config["resume_idx"])]
+    print(f"[capx-runner] trial_ids={trial_ids}", flush=True)
 
     # Execute trials
     if config["num_workers"] > 1:
@@ -325,13 +374,17 @@ def _run_single_trial_with_timeout(
             raise TimeoutError(f"Trial {trial} timed out") from exc
 
         print(f"Trial {trial} timed out after {timeout_seconds} seconds")
-        return _build_timeout_summary(trial, timeout_seconds, partial_artifacts, config, exc)
+        return _build_timeout_summary(env, trial, timeout_seconds, partial_artifacts, config, exc)
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)
+        clear_deadline = getattr(env, "clear_trial_deadline", None)
+        if callable(clear_deadline):
+            clear_deadline()
 
 
 def _build_timeout_summary(
+    env: CodeExecutionEnvBase,
     trial: int,
     timeout_seconds: int,
     pa: dict[str, Any],
@@ -345,6 +398,7 @@ def _build_timeout_summary(
     final_code = _annotate_code_blocks(code_blocks, code_block_metadata)
 
     info_step = pa.get("info_step", {"sandbox_rc": 1, "stdout": "", "stderr": str(exc)})
+    info_step["sandbox_rc"] = 1
     if info_step.get("stderr") == "":
         info_step["stderr"] = str(exc)
     else:
@@ -376,6 +430,7 @@ def _build_timeout_summary(
         ensemble_data=pa.get("ensemble_data"),
         multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
     )
+    _save_timeout_runtime_artifacts(env, config, trial, info_step, reward, pa)
 
     return TrialSummary(
         trial=trial,
@@ -391,3 +446,42 @@ def _build_timeout_summary(
         num_finishes=num_finishes,
         num_code_blocks=num_code_blocks,
     )
+
+
+def _save_timeout_runtime_artifacts(
+    env: CodeExecutionEnvBase,
+    config: dict[str, Any],
+    trial: int,
+    info_step: dict[str, Any],
+    reward: float,
+    pa: dict[str, Any],
+) -> None:
+    """Flush video and simulator diagnostics after a timeout summary is built."""
+    try:
+        turn_frame_ranges = list(pa.get("turn_frame_ranges", []) or [])
+        if (
+            config.get("record_video")
+            and hasattr(env, "get_video_frame_count")
+            and not turn_frame_ranges
+        ):
+            frame_count = int(env.get_video_frame_count())
+            if frame_count > 0:
+                turn_frame_ranges = [(0, frame_count)]
+        if turn_frame_ranges:
+            _save_turn_and_combined_videos(
+                env, config, trial, info_step, reward, turn_frame_ranges
+            )
+        else:
+            _save_trial_video(env, config, trial, info_step, reward, 0, suffix_extra="timeout")
+    except Exception as artifact_exc:
+        print(f"WARNING: Failed to save timeout video artifacts: {artifact_exc}", flush=True)
+
+    try:
+        _save_tactile_artifacts(env, config, trial, info_step, reward)
+    except Exception as artifact_exc:
+        print(f"WARNING: Failed to save timeout tactile artifacts: {artifact_exc}", flush=True)
+
+    try:
+        _save_env_debug_artifacts(env, config, trial, info_step, reward)
+    except Exception as artifact_exc:
+        print(f"WARNING: Failed to save timeout debug artifacts: {artifact_exc}", flush=True)

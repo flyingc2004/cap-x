@@ -135,6 +135,9 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "total_trials": args.total_trials
         if args.total_trials is not None
         else configs_dict.get("trials", 10),
+        "trial_ids": getattr(args, "trial_ids", None)
+        if getattr(args, "trial_ids", None) is not None
+        else configs_dict.get("trial_ids", None),
         "num_workers": args.num_workers
         if args.num_workers is not None
         else configs_dict.get("num_workers", 1),

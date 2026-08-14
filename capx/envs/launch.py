@@ -94,6 +94,9 @@ class LaunchArgs:
     total_trials: int | None = None
     """Total number of trials to run. Overrides the value in the YAML config."""
 
+    trial_ids: str | None = None
+    """Comma-separated trial IDs or ranges to run, e.g. 8,13,20-25."""
+
     num_workers: int | None = None
     """Number of parallel worker processes to use. Overrides the value in the YAML config."""
 

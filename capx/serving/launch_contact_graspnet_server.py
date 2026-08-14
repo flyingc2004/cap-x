@@ -513,10 +513,13 @@ def main(device: str = "cuda", port: int = 8115, host: str = "127.0.0.1"):
     # --- Setup Paths & Import ---
 
     here = os.path.dirname(os.path.abspath(__file__))
-    # Assume capx/serving -> go up to capx -> go to third_party
-    vendor_root = os.path.normpath(
-        os.path.join(here, "..", "third_party", "contact_graspnet_pytorch")
-    )
+    # Assume capx/serving -> go up to capx -> go to third_party. A separate
+    # worktree may not contain large checkpoint files, so allow reusing the
+    # original local vendor/cache checkout.
+    vendor_root = os.environ.get("CAPX_CONTACT_GRASPNET_ROOT")
+    if not vendor_root:
+        vendor_root = os.path.join(here, "..", "third_party", "contact_graspnet_pytorch")
+    vendor_root = os.path.normpath(vendor_root)
 
     pointnet_root = os.path.join(vendor_root, "Pointnet_Pointnet2_pytorch")
     if pointnet_root not in sys.path:

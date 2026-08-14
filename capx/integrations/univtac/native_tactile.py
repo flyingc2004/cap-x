@@ -77,6 +77,12 @@ def summarize_native_tactile(
     depth_far_plane_mm: float | None = None,
     force_full_scale_mm: float = 2.0,
     depth_contact_margin_mm: float = 0.5,
+    slip_warning_threshold: float = 0.35,
+    slip_high_threshold: float = 0.55,
+    slip_hard_threshold: float = 0.60,
+    centroid_warning_delta: float = 0.5,
+    centroid_high_delta: float = 1.0,
+    shear_warning_delta: float = 0.05,
 ) -> dict[str, Any]:
     """Summarize recent native UniVTAC tactile frames."""
     if not frames:
@@ -130,17 +136,68 @@ def summarize_native_tactile(
     marker_growth = _marker_growth(frames, hand, metric_kwargs)
     area_change = _contact_area_change(frames, hand, metric_kwargs)
     balance = _contact_balance(left_metrics, right_metrics)
-    slip_score = float(np.clip(0.65 * marker_growth + 0.25 * area_change + 0.10 * abs(balance), 0.0, 1.0))
+    centroid_score = float(np.clip(marker_centroid_displacement / 2.0, 0.0, 1.0))
+    slip_score = float(
+        np.clip(
+            0.35 * marker_growth
+            + 0.15 * area_change
+            + 0.10 * abs(balance)
+            + 0.65 * centroid_score,
+            0.0,
+            1.0,
+        )
+    )
     if contact_lost:
         slip_score = max(slip_score, 0.75)
 
+    pressure_side, pressure_balance = _pressure_side(
+        left_metrics,
+        right_metrics,
+        force_full_scale_mm=force_full_scale_mm,
+    )
+    shear_side, shear_balance = _shear_side(left_metrics, right_metrics)
+    force_delta = _normal_force_delta(frames, hand, metric_kwargs)
+    drift_delta = _centroid_delta(frames, hand, metric_kwargs)
+    force_change = _trend_label(force_delta, threshold=0.05)
+    drift_trend = _trend_label(
+        drift_delta,
+        threshold=max(float(centroid_warning_delta) * 0.5, 1e-6),
+    )
+    slip_risk_score = _slip_risk_score(
+        slip_score=slip_score,
+        marker_centroid_displacement=marker_centroid_displacement,
+        marker_growth=marker_growth,
+        area_change=area_change,
+        pressure_balance=pressure_balance,
+        shear_balance=shear_balance,
+        slip_warning_threshold=slip_warning_threshold,
+        slip_high_threshold=slip_high_threshold,
+        centroid_warning_delta=centroid_warning_delta,
+        centroid_high_delta=centroid_high_delta,
+        shear_warning_delta=shear_warning_delta,
+    )
+    slip_risk = _risk_label(
+        slip_risk_score,
+        warning_threshold=slip_warning_threshold,
+        high_threshold=slip_high_threshold,
+    )
+    incipient_slip = bool(contact and not contact_lost and slip_risk != "low")
+    correction_hint = _correction_hint(
+        contact=bool(contact),
+        contact_lost=bool(contact_lost),
+        slip_risk=slip_risk,
+        pressure_side=pressure_side,
+        shear_side=shear_side,
+        incipient_slip=incipient_slip,
+    )
+
     if contact_lost:
         event = "contact_lost"
-    elif contact and slip_score >= 0.6:
+    elif contact and slip_score >= float(slip_hard_threshold):
         event = "slip_detected"
     elif hand == "both" and one_hand_contact:
         event = "one_hand_contact"
-    elif contact and normal_force >= 0.2 and slip_score < 0.6:
+    elif contact and normal_force >= 0.2 and slip_score < float(slip_hard_threshold):
         event = "stable_grasp" if hand == "both" and left_metrics["contact"] and right_metrics["contact"] else "one_hand_contact"
     elif not contact:
         event = "no_contact"
@@ -157,7 +214,17 @@ def summarize_native_tactile(
         "shear_magnitude": shear_magnitude,
         "marker_centroid_displacement": marker_centroid_displacement,
         "slip_score": slip_score,
+        "slip_risk": slip_risk,
+        "slip_risk_score": slip_risk_score,
+        "incipient_slip": incipient_slip,
         "contact_balance": balance,
+        "pressure_side": pressure_side,
+        "pressure_balance": pressure_balance,
+        "shear_side": shear_side,
+        "shear_balance": shear_balance,
+        "force_change": force_change,
+        "drift_trend": drift_trend,
+        "correction_hint": correction_hint,
         "left": left_metrics,
         "right": right_metrics,
         "event": event,
@@ -171,6 +238,12 @@ def tactile_event_sequence(
     depth_far_plane_mm: float | None = None,
     force_full_scale_mm: float = 2.0,
     depth_contact_margin_mm: float = 0.5,
+    slip_warning_threshold: float = 0.35,
+    slip_high_threshold: float = 0.55,
+    slip_hard_threshold: float = 0.60,
+    centroid_warning_delta: float = 0.5,
+    centroid_high_delta: float = 1.0,
+    shear_warning_delta: float = 0.05,
 ) -> list[str]:
     """Return a deduplicated sequence of tactile events over recent frames."""
     events: list[str] = []
@@ -181,6 +254,12 @@ def tactile_event_sequence(
             depth_far_plane_mm=depth_far_plane_mm,
             force_full_scale_mm=force_full_scale_mm,
             depth_contact_margin_mm=depth_contact_margin_mm,
+            slip_warning_threshold=slip_warning_threshold,
+            slip_high_threshold=slip_high_threshold,
+            slip_hard_threshold=slip_hard_threshold,
+            centroid_warning_delta=centroid_warning_delta,
+            centroid_high_delta=centroid_high_delta,
+            shear_warning_delta=shear_warning_delta,
         )["event"]
         if not events or events[-1] != event:
             events.append(event)
@@ -198,7 +277,17 @@ def _empty_summary() -> dict[str, Any]:
         "shear_magnitude": 0.0,
         "marker_centroid_displacement": 0.0,
         "slip_score": 0.0,
+        "slip_risk": "low",
+        "slip_risk_score": 0.0,
+        "incipient_slip": False,
         "contact_balance": 0.0,
+        "pressure_side": "unknown",
+        "pressure_balance": 0.0,
+        "shear_side": "unknown",
+        "shear_balance": 0.0,
+        "force_change": "unknown",
+        "drift_trend": "unknown",
+        "correction_hint": "hold",
         "left": _empty_hand_metrics(),
         "right": _empty_hand_metrics(),
         "event": "no_contact",
@@ -408,11 +497,204 @@ def _contact_area_change(
     return float(np.clip(max(areas) - areas[-1], 0.0, 1.0))
 
 
+def _normal_force_delta(
+    frames: list[UniVTACTactileFrame],
+    hand: str,
+    metric_kwargs: dict[str, Any],
+) -> float:
+    if len(frames) < 2:
+        return 0.0
+    baseline = frames[0]
+    first_metrics = _select_metrics(
+        hand,
+        _hand_metrics(
+            frames[0].left_depth,
+            frames[0].left_marker,
+            baseline_marker=baseline.left_marker,
+            **metric_kwargs,
+        ),
+        _hand_metrics(
+            frames[0].right_depth,
+            frames[0].right_marker,
+            baseline_marker=baseline.right_marker,
+            **metric_kwargs,
+        ),
+    )
+    last_metrics = _select_metrics(
+        hand,
+        _hand_metrics(
+            frames[-1].left_depth,
+            frames[-1].left_marker,
+            baseline_marker=baseline.left_marker,
+            **metric_kwargs,
+        ),
+        _hand_metrics(
+            frames[-1].right_depth,
+            frames[-1].right_marker,
+            baseline_marker=baseline.right_marker,
+            **metric_kwargs,
+        ),
+    )
+    first_force = float(np.mean([m["normal_force"] for m in first_metrics])) if first_metrics else 0.0
+    last_force = float(np.mean([m["normal_force"] for m in last_metrics])) if last_metrics else 0.0
+    return last_force - first_force
+
+
+def _centroid_delta(
+    frames: list[UniVTACTactileFrame],
+    hand: str,
+    metric_kwargs: dict[str, Any],
+) -> float:
+    if len(frames) < 2:
+        return 0.0
+    baseline = frames[0]
+    previous_metrics = _select_metrics(
+        hand,
+        _hand_metrics(
+            frames[-2].left_depth,
+            frames[-2].left_marker,
+            baseline_marker=baseline.left_marker,
+            **metric_kwargs,
+        ),
+        _hand_metrics(
+            frames[-2].right_depth,
+            frames[-2].right_marker,
+            baseline_marker=baseline.right_marker,
+            **metric_kwargs,
+        ),
+    )
+    current_metrics = _select_metrics(
+        hand,
+        _hand_metrics(
+            frames[-1].left_depth,
+            frames[-1].left_marker,
+            baseline_marker=baseline.left_marker,
+            **metric_kwargs,
+        ),
+        _hand_metrics(
+            frames[-1].right_depth,
+            frames[-1].right_marker,
+            baseline_marker=baseline.right_marker,
+            **metric_kwargs,
+        ),
+    )
+    previous = (
+        float(np.mean([m["marker_centroid_displacement"] for m in previous_metrics]))
+        if previous_metrics
+        else 0.0
+    )
+    current = (
+        float(np.mean([m["marker_centroid_displacement"] for m in current_metrics]))
+        if current_metrics
+        else 0.0
+    )
+    return current - previous
+
+
 def _contact_balance(left: dict[str, Any], right: dict[str, Any]) -> float:
     total = float(left["normal_force"] + right["normal_force"])
     if total <= 1e-9:
         return 0.0
     return float((left["normal_force"] - right["normal_force"]) / total)
+
+
+def _pressure_side(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    force_full_scale_mm: float,
+) -> tuple[str, float]:
+    force_scale = max(float(force_full_scale_mm), 1e-6)
+    left_pressure = float(left["normal_force"]) + float(left["depth_delta_mm"]) / force_scale
+    right_pressure = float(right["normal_force"]) + float(right["depth_delta_mm"]) / force_scale
+    return _side_label(left_pressure, right_pressure, threshold=0.08)
+
+
+def _shear_side(left: dict[str, Any], right: dict[str, Any]) -> tuple[str, float]:
+    left_shear = float(left["shear_magnitude"]) + 0.25 * float(left["marker_centroid_displacement"])
+    right_shear = float(right["shear_magnitude"]) + 0.25 * float(right["marker_centroid_displacement"])
+    return _side_label(left_shear, right_shear, threshold=0.08)
+
+
+def _side_label(left_value: float, right_value: float, *, threshold: float) -> tuple[str, float]:
+    total = abs(float(left_value)) + abs(float(right_value))
+    if total <= 1e-9:
+        return "unknown", 0.0
+    balance = float((float(left_value) - float(right_value)) / total)
+    if balance > float(threshold):
+        return "left", balance
+    if balance < -float(threshold):
+        return "right", balance
+    return "balanced", balance
+
+
+def _trend_label(delta: float, *, threshold: float) -> str:
+    if float(delta) > float(threshold):
+        return "increased" if threshold == 0.05 else "increasing"
+    if float(delta) < -float(threshold):
+        return "decreased" if threshold == 0.05 else "decreasing"
+    return "stable"
+
+
+def _slip_risk_score(
+    *,
+    slip_score: float,
+    marker_centroid_displacement: float,
+    marker_growth: float,
+    area_change: float,
+    pressure_balance: float,
+    shear_balance: float,
+    slip_warning_threshold: float,
+    slip_high_threshold: float,
+    centroid_warning_delta: float,
+    centroid_high_delta: float,
+    shear_warning_delta: float,
+) -> float:
+    score = float(slip_score)
+    if marker_centroid_displacement >= float(centroid_high_delta):
+        score = max(score, float(slip_high_threshold))
+    elif marker_centroid_displacement >= float(centroid_warning_delta):
+        score = max(score, float(slip_warning_threshold))
+    if marker_growth >= float(shear_warning_delta):
+        score = max(score, min(1.0, float(slip_warning_threshold) + 0.05))
+    if area_change >= 0.20:
+        score = max(score, min(1.0, float(slip_warning_threshold) + 0.05))
+    if abs(float(pressure_balance)) >= 0.35 or abs(float(shear_balance)) >= 0.35:
+        score = max(score, min(1.0, float(slip_warning_threshold) + 0.10))
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _risk_label(
+    score: float,
+    *,
+    warning_threshold: float,
+    high_threshold: float,
+) -> str:
+    if float(score) >= float(high_threshold):
+        return "high"
+    if float(score) >= float(warning_threshold):
+        return "medium"
+    return "low"
+
+
+def _correction_hint(
+    *,
+    contact: bool,
+    contact_lost: bool,
+    slip_risk: str,
+    pressure_side: str,
+    shear_side: str,
+    incipient_slip: bool,
+) -> str:
+    if contact_lost or not contact:
+        return "hold"
+    if slip_risk == "high":
+        if pressure_side not in {"balanced", "unknown"} or shear_side not in {"balanced", "unknown"}:
+            return "try_lateral_probe"
+        return "try_pitch_probe"
+    if slip_risk == "medium" or incipient_slip:
+        return "reduce_down_step"
+    return "continue"
 
 
 def _select_metrics(hand: str, left: dict[str, Any], right: dict[str, Any]) -> list[dict[str, Any]]:

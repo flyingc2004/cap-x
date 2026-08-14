@@ -49,8 +49,11 @@ class UniVTACTactileApi(ApiBase):
         Returns:
             Dictionary with contact, left_contact, right_contact, normal_force,
             contact_area, depth_delta_mm, shear_magnitude, slip_score,
-            contact_balance, per-hand metrics, and event. The summary is based
-            only on UniVTAC tactile depth and marker outputs.
+            contact_balance, per-hand metrics, and event. It also includes
+            compact tactile servo labels: slip_risk ("low", "medium", "high"),
+            incipient_slip, pressure_side, shear_side, force_change,
+            drift_trend, and correction_hint. The summary is based only on
+            UniVTAC tactile depth and marker outputs.
         """
         _refresh_native_tactile(self._env, data_types=["rgb", "rgb_marker", "marker", "depth", "pose"])
         frames = self._env.tactile_buffer.recent(window)
@@ -66,7 +69,9 @@ class UniVTACTactileApi(ApiBase):
             f"force={summary['normal_force']:.3f} depth={summary['depth_delta_mm']:.3f}mm "
             f"shear={summary['shear_magnitude']:.3f} "
             f"centroid={summary['marker_centroid_displacement']:.3f} "
-            f"slip={summary['slip_score']:.3f} event={summary['event']}"
+            f"slip={summary['slip_score']:.3f} "
+            f"risk={summary['slip_risk']} "
+            f"hint={summary['correction_hint']} event={summary['event']}"
         )
         return summary
 
@@ -264,9 +269,26 @@ class UniVTACTactileApi(ApiBase):
 
 def _native_tactile_calibration(env: BaseEnv) -> dict[str, float]:
     calibration_fn = getattr(env, "get_native_tactile_calibration", None)
-    if not callable(calibration_fn):
-        return {}
-    return dict(calibration_fn())
+    calibration = dict(calibration_fn()) if callable(calibration_fn) else {}
+    api_configs = getattr(env, "api_configs", {})
+    franka_cfg = (
+        api_configs.get("franka_control_api", {})
+        if isinstance(api_configs, dict)
+        else {}
+    )
+    guard_cfg = franka_cfg.get("tactile_guard", {}) if isinstance(franka_cfg, dict) else {}
+    if isinstance(guard_cfg, dict):
+        for key in (
+            "slip_warning_threshold",
+            "slip_high_threshold",
+            "slip_hard_threshold",
+            "centroid_warning_delta",
+            "centroid_high_delta",
+            "shear_warning_delta",
+        ):
+            if key in guard_cfg:
+                calibration[key] = guard_cfg[key]
+    return calibration
 
 
 def _hand_key(hand: str) -> str:

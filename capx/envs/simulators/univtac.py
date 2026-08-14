@@ -16,6 +16,7 @@ import yaml
 from PIL import Image
 
 from capx.envs.base import BaseEnv
+from capx.envs.tasks.exceptions import HardStopTrial
 from capx.integrations.univtac.native_tactile import (
     UniVTACTactileBuffer,
     frame_from_observation,
@@ -92,6 +93,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._official_task_protocol = False
         self._protocol_stopped = False
         self._protocol_stop_reason: str | None = None
+        self._protocol_success_latched = False
+        self._trial_deadline_time: float | None = None
+        self._trial_deadline_seconds: float | None = None
         self._reset_serial = 0
 
         self._prepare_import_path()
@@ -130,6 +134,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._perception_artifacts.clear()
         self._protocol_stopped = False
         self._protocol_stop_reason = None
+        self._protocol_success_latched = False
+        self.clear_trial_deadline()
         self._reset_serial += 1
 
         print(
@@ -198,7 +204,12 @@ class UniVTACLowLevelEnv(BaseEnv):
         return 1.0 if self.task_completed() else 0.0
 
     def task_completed(self) -> bool:
-        return bool(self._task.check_success())
+        if bool(getattr(self, "_protocol_success_latched", False)):
+            return True
+        completed = bool(self._task.check_success())
+        if completed and bool(getattr(self, "_official_task_protocol", False)):
+            self._stop_protocol("native_success")
+        return completed
 
     def _active_object_height(self, object_name: str) -> float | None:
         actor = getattr(self._task, str(object_name), None)
@@ -214,10 +225,17 @@ class UniVTACLowLevelEnv(BaseEnv):
             return self._protocol_blocked_result()
         tensor = self._to_tensor(action)
         exec_success, eval_success = self._task.take_action(tensor, action_type=action_type)
+        if bool(eval_success) and bool(getattr(self, "_official_task_protocol", False)):
+            self._stop_protocol("native_success")
         self._update_after_action()
         self._append_debug_record(f"after_take_action_{action_type}")
+        status = self.get_protocol_status()
         result = {
             "ok": bool(exec_success),
+            "reason": status.get("reason")
+            or ("action_executed" if exec_success else "action_failed"),
+            "episode_stopped": bool(status.get("episode_stopped", False)),
+            "success_latched": bool(status.get("success_latched", False)),
             "step": self.get_step_count(),
             "action_count": self.get_action_count(),
             "message": "action executed" if exec_success else "UniVTAC action execution failed",
@@ -293,11 +311,50 @@ class UniVTACLowLevelEnv(BaseEnv):
         )
         return self.take_action(action, action_type="ee")
 
+    def set_trial_deadline(self, timeout_seconds: float) -> None:
+        """Install a wall-clock hard stop checked inside the simulation loop."""
+        timeout = max(1.0, float(timeout_seconds))
+        self._trial_deadline_seconds = timeout
+        self._trial_deadline_time = time.monotonic() + timeout
+        print(
+            "[capx-univtac] trial deadline set "
+            f"timeout_s={timeout:g}",
+            flush=True,
+        )
+
+    def clear_trial_deadline(self) -> None:
+        """Clear the active wall-clock hard stop."""
+        self._trial_deadline_time = None
+        self._trial_deadline_seconds = None
+
+    def _raise_if_hard_stopped(self, where: str) -> None:
+        deadline = getattr(self, "_trial_deadline_time", None)
+        if deadline is None or time.monotonic() < deadline:
+            return
+
+        self._stop_protocol("trial_timeout")
+        try:
+            self._task.plan_success = False
+        except Exception:
+            pass
+        timeout = float(getattr(self, "_trial_deadline_seconds", None) or 0.0)
+        raise HardStopTrial(
+            "trial_timeout",
+            f"UniVTAC trial exceeded {timeout:g} seconds at {where}",
+            details={
+                "where": where,
+                "timeout_seconds": timeout,
+                "step": self.get_step_count(),
+                "action_count": self.get_action_count(),
+            },
+        )
+
     def protocol_action_allowed(self) -> bool:
         """Return whether another official-protocol physical action may run."""
-        if not self._official_task_protocol:
+        self._raise_if_hard_stopped("protocol_action_allowed")
+        if not bool(getattr(self, "_official_task_protocol", False)):
             return True
-        if self._protocol_stopped:
+        if bool(getattr(self, "_protocol_stopped", False)):
             return False
         if self.get_action_count() >= self.max_steps:
             self._stop_protocol("action_budget")
@@ -321,17 +378,16 @@ class UniVTACLowLevelEnv(BaseEnv):
         """Apply native success/early-stop rules after one CaP physical action."""
         if not self._official_task_protocol:
             return self.get_protocol_status()
-        if self.get_action_count() >= self.max_steps:
-            self._stop_protocol("action_budget")
-        elif not self._protocol_stopped:
+        if not self._protocol_stopped:
             try:
                 if bool(self._task.check_success()):
-                    self._task.eval_success = True
                     self._stop_protocol("native_success")
                 elif bool(self._task.check_early_stop()):
                     self._stop_protocol("early_stop")
             except Exception as exc:
                 self._stop_protocol(f"protocol_check_error:{type(exc).__name__}")
+        if not self._protocol_stopped and self.get_action_count() >= self.max_steps:
+            self._stop_protocol("action_budget")
         return self.get_protocol_status()
 
     def get_protocol_status(self) -> dict[str, Any]:
@@ -339,6 +395,8 @@ class UniVTACLowLevelEnv(BaseEnv):
             "enabled": bool(self._official_task_protocol),
             "stopped": bool(self._protocol_stopped),
             "reason": self._protocol_stop_reason,
+            "episode_stopped": bool(self._protocol_stopped),
+            "success_latched": bool(getattr(self, "_protocol_success_latched", False)),
             "action_count": self.get_action_count(),
             "max_steps": self.max_steps,
         }
@@ -351,6 +409,12 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._perception_artifacts.append(dict(record))
 
     def _stop_protocol(self, reason: str) -> None:
+        if str(reason) == "native_success":
+            self._protocol_success_latched = True
+            try:
+                self._task.eval_success = True
+            except Exception:
+                pass
         if self._protocol_stopped:
             return
         self._protocol_stopped = True
@@ -362,11 +426,21 @@ class UniVTACLowLevelEnv(BaseEnv):
         )
 
     def _protocol_blocked_result(self) -> dict[str, Any]:
+        status = self.get_protocol_status()
+        success_latched = bool(status.get("success_latched", False))
+        reason = str(status.get("reason") or "official_protocol_stopped")
         result = {
-            "ok": False,
+            "ok": success_latched,
+            "reason": reason,
+            "episode_stopped": bool(status.get("episode_stopped", False)),
+            "success_latched": success_latched,
             "step": self.get_step_count(),
             "action_count": self.get_action_count(),
-            "message": f"official protocol stopped: {self._protocol_stop_reason}",
+            "message": (
+                "official success already latched; no physical command was sent"
+                if success_latched
+                else f"official protocol stopped: {reason}"
+            ),
         }
         self._last_action_result = result
         return result
@@ -388,6 +462,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         a public target landmark, and this function only translates that
         placement intent into UniVTAC's task-native motion primitive.
         """
+        if not self.protocol_action_allowed():
+            return self._protocol_blocked_result()
         try:
             from envs.utils.transforms import Pose
         except Exception as exc:
@@ -469,6 +545,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         sees only ``sample_grasp_pose`` and ``goto_pose``; this method translates
         that CaP-style request into UniVTAC's native motion planner.
         """
+        if not self.protocol_action_allowed():
+            return self._protocol_blocked_result()
         actor = self._public_grasp_actor(object_name)
         if actor is None:
             result = {
@@ -556,6 +634,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         settle_steps: int = 0,
     ) -> dict[str, Any]:
         """Move the UniVTAC gripper through its native gripper planner."""
+        self._raise_if_hard_stopped("move_gripper_native")
         try:
             if opening:
                 actions = self._task.atom.open_gripper(float(qpos))
@@ -639,6 +718,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         to qpos, sends a non-teleporting target, advances simulation, and
         refreshes the native tactile buffer.
         """
+        self._raise_if_hard_stopped("command_gripper_width_step")
         calibration = self.get_gripper_calibration()
         max_qpos = calibration["gripper_max_qpos"]
         current_qpos = calibration["current_qpos"]
@@ -657,6 +737,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         action_count_before = self.get_action_count()
         robot_manager.set_gripper(position, velocity, force=False)
         for _ in range(max(1, int(settle_steps))):
+            self._raise_if_hard_stopped("command_gripper_width_step_settle")
             self._task._step(is_save=True)
 
         self.refresh_native_observation(
@@ -691,8 +772,11 @@ class UniVTACLowLevelEnv(BaseEnv):
             self._tactile_gripper_trace.append(_jsonable(record))
 
     def wait_steps(self, n: int = 1) -> dict[str, Any]:
+        if not self.protocol_action_allowed():
+            return self._protocol_blocked_result()
         steps = max(0, int(n))
         for _ in range(steps):
+            self._raise_if_hard_stopped("wait_steps")
             self._task.delay(1, is_save=True, force=True)
             self._update_after_action()
         result = {
@@ -727,6 +811,12 @@ class UniVTACLowLevelEnv(BaseEnv):
             return (
                 "Grasp and lift the cylindrical can using UniVTAC native tactile feedback, "
                 "then release it upright on the table."
+            )
+        if self.task_name == "insert_hole":
+            return (
+                "Insert the already grasped test tube into the hole using small "
+                "bounded motions and UniVTAC native tactile feedback. Keep the "
+                "gripper closed during insertion."
             )
         return f"Solve the UniVTAC task: {self.task_name}."
 
@@ -1050,9 +1140,11 @@ class UniVTACLowLevelEnv(BaseEnv):
         original_step = self._task._step
 
         def _capx_step(*args, **kwargs):
+            self._raise_if_hard_stopped("before_task_step")
             result = original_step(*args, **kwargs)
             self._record_pre_move_tactile_step()
             self._record_frame_after_task_step()
+            self._raise_if_hard_stopped("after_task_step")
             return result
 
         self._task._step = _capx_step

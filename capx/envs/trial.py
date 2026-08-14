@@ -761,6 +761,11 @@ def _run_single_trial(
     if remaining > 0:
         timeout_seconds = int(config.get("trial_timeout_seconds", remaining))
         signal.alarm(max(1, timeout_seconds))
+        set_deadline = getattr(env, "set_trial_deadline", None)
+        if callable(set_deadline):
+            # Let low-level simulators stop themselves just before SIGALRM can
+            # interrupt native Isaac/CUDA callbacks in hard-to-recover places.
+            set_deadline(max(1, timeout_seconds - 2))
     obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
     _patch_libero_goal(env, obs)
 
@@ -851,12 +856,17 @@ def _run_single_trial(
             "num_code_blocks": 0,
             "ensemble_data": ensemble_data,
             "multiturn_ensemble_data": multiturn_ensemble_data,
+            "turn_frame_ranges": turn_frame_ranges,
         })
 
     # Parse initial code into blocks
     initial_blocks = _extract_code(raw_code)
     code_blocks.extend(initial_blocks)
     code_block_metadata.extend([{"generation": 0, "regenerated": False}] * len(initial_blocks))
+    if partial_artifacts is not None:
+        partial_artifacts["code_blocks"] = code_blocks
+        partial_artifacts["code_block_metadata"] = code_block_metadata
+        partial_artifacts["num_code_blocks"] = len(code_blocks)
     all_responses.append({
         "block_idx": [0],
         "code_blocks": initial_blocks,
@@ -896,6 +906,8 @@ def _run_single_trial(
                 "reward": reward,
                 "terminated": terminated,
                 "truncated": truncated,
+                "turn_frame_ranges": turn_frame_ranges,
+                "num_code_blocks": len(code_blocks),
             })
 
         obs = obs_next
