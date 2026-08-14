@@ -90,6 +90,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         close_gripper_qpos: float = 0.007,
         open_gripper_width: float = 1.0,
         tactile_adaptive_gripper_enabled: bool = True,
+        min_adaptive_close_force: float = 0.0,
         object_pose_names: dict[str, str] | None = None,
         rgbd_perception_enabled: bool = False,
         perception_camera: str = "head",
@@ -168,6 +169,9 @@ class UniVTACFrankaCompatApi(ApiBase):
         self.open_gripper_width = float(cfg.get("open_gripper_width", open_gripper_width))
         self.tactile_adaptive_gripper_enabled = bool(
             cfg.get("tactile_adaptive_gripper_enabled", tactile_adaptive_gripper_enabled)
+        )
+        self.min_adaptive_close_force = float(
+            np.clip(cfg.get("min_adaptive_close_force", min_adaptive_close_force), 0.0, 1.0)
         )
         adaptive_cfg = cfg.get("adaptive_gripper", {})
         self.adaptive_gripper_config = dict(adaptive_cfg) if isinstance(adaptive_cfg, dict) else {}
@@ -567,12 +571,17 @@ class UniVTACFrankaCompatApi(ApiBase):
         self._record_rgbd_diagnostic_if_needed()
         if adaptive and self.tactile_adaptive_gripper_enabled:
             controller = self._adaptive_gripper_controller()
-            result = controller.close(target_force=target_force, max_steps=max_steps)
+            requested_target_force = float(np.clip(target_force, 0.0, 1.0))
+            effective_target_force = max(requested_target_force, self.min_adaptive_close_force)
+            result = controller.close(target_force=effective_target_force, max_steps=max_steps)
+            result["requested_target_force"] = requested_target_force
+            result["target_force"] = effective_target_force
             self._annotate_servo_limit(result, requested_max_steps, max_steps)
             self._save_adaptive_trace(controller.trace)
             print(
                 "[univtac-franka] adaptive_close "
                 f"stable={result['stable']} reason={result['reason']} "
+                f"target_force={effective_target_force:.3f} "
                 f"force={result['normal_force']:.3f} width={result['width']:.4f} "
                 f"steps={result['steps']}",
                 flush=True,

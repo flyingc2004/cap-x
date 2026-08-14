@@ -319,7 +319,12 @@ def test_goto_pose_api_action_limit_blocks_before_physical_action() -> None:
 
 def test_adaptive_gripper_max_steps_are_clamped() -> None:
     class Env:
-        api_configs = {"franka_control_api": {"max_gripper_servo_steps": 5}}
+        api_configs = {
+            "franka_control_api": {
+                "max_gripper_servo_steps": 5,
+                "min_adaptive_close_force": 0.8,
+            }
+        }
         task = None
 
         def begin_high_level_action(self):
@@ -330,8 +335,10 @@ def test_adaptive_gripper_max_steps_are_clamped() -> None:
 
     class Controller:
         trace = []
+        target_force = None
 
         def close(self, *, target_force, max_steps):
+            self.target_force = target_force
             return {
                 "ok": True,
                 "stable": False,
@@ -342,15 +349,19 @@ def test_adaptive_gripper_max_steps_are_clamped() -> None:
                 "steps": max_steps,
             }
 
+    controller = Controller()
     api = UniVTACFrankaCompatApi(Env())
-    api._adaptive_gripper_controller = lambda: Controller()
+    api._adaptive_gripper_controller = lambda: controller
     api._save_adaptive_trace = lambda trace: None
 
-    result = api.close_gripper(adaptive=True, max_steps=999)
+    result = api.close_gripper(adaptive=True, target_force=0.35, max_steps=999)
 
     assert result["steps"] == 5
     assert result["requested_max_steps"] == 999
     assert result["max_steps_limit"] == 5
+    assert controller.target_force == pytest.approx(0.8)
+    assert result["requested_target_force"] == pytest.approx(0.35)
+    assert result["target_force"] == pytest.approx(0.8)
 
 
 def test_official_compat_uses_rgbd_and_never_reads_task_can() -> None:
@@ -616,6 +627,7 @@ def test_insert_hole_official_yaml_uses_pre_move_and_move_relative() -> None:
     assert franka["move_relative_rotation_budget"] == pytest.approx(1.20)
     assert franka["tactile_guard"]["slip_warning_threshold"] == pytest.approx(0.35)
     assert franka["tactile_guard"]["guard_micro_down_step"] == pytest.approx(0.001)
+    assert franka["min_adaptive_close_force"] == pytest.approx(0.8)
     assert config["trial_timeout_seconds"] == 600
     assert "move_relative" in prompt
     assert "slip_risk" in prompt
@@ -626,6 +638,9 @@ def test_insert_hole_official_yaml_uses_pre_move_and_move_relative() -> None:
     assert "success_latched" in prompt
     assert "episode_stopped" in prompt
     assert "recoverable tactile guard signals" in prompt
+    assert "always make one adaptive preload close_gripper call" in prompt
+    assert "target_force around 0.8" in prompt
+    assert "one additional adaptive close_gripper call" in prompt
     assert "normal guarded downward insertion steps should be 0.001 m" in prompt
     assert "fallback/test downward steps can be 0.0003-0.0005 m" in prompt
     assert "once a useful direction is found" in prompt
@@ -641,6 +656,15 @@ def test_insert_hole_official_yaml_uses_pre_move_and_move_relative() -> None:
     assert 'reason="completed_with_slip" can still be a useful correction' in prompt
     assert "reduces high risk to medium" in prompt
     assert "Never repeat the same pitch or lateral direction twice" in prompt
+    assert "small state machine" in prompt
+    assert "search_direction" in prompt
+    assert "insert_segment" in prompt
+    assert "reassess" in prompt
+    assert "segment_depth" in prompt
+    assert "0.006-0.010 m" in prompt
+    assert 'result["executed_distance"] is zero' in prompt
+    assert 'result["clipped"] is true with a correction-budget reason' in prompt
+    assert 'reason starts with "official_protocol"' in prompt
     assert 'result["executed_depth"] > 0' in prompt
     assert "protected insertion progress" in prompt
     assert "correction-budget exhaustion" in prompt
