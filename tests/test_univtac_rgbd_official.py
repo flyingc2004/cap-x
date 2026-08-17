@@ -622,54 +622,44 @@ def test_insert_hole_official_yaml_uses_pre_move_and_move_relative() -> None:
     assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
     assert franka["rgbd_perception_enabled"] is False
     assert franka["use_task_grasp_actor_for_objects"] is False
-    assert franka["max_insert_actions"] == 20
+    assert franka["max_insert_actions"] == 80
     assert franka["move_relative_lateral_budget"] == pytest.approx(0.006)
     assert franka["move_relative_rotation_budget"] == pytest.approx(1.20)
+    assert franka["move_relative_max_rotation"] == pytest.approx(0.15)
     assert franka["tactile_guard"]["slip_warning_threshold"] == pytest.approx(0.35)
     assert franka["tactile_guard"]["guard_micro_down_step"] == pytest.approx(0.001)
+    assert franka["tactile_guard"]["guard_micro_rpy_step"] == pytest.approx(0.003)
+    assert franka["tactile_guard"]["pitch_couple_threshold"] == pytest.approx(0.15)
+    assert franka["tactile_guard"]["pitch_confidence_threshold"] == pytest.approx(0.25)
+    assert franka["tactile_guard"]["max_guarded_pitch_request"] == pytest.approx(0.15)
+    assert franka["tactile_guard"]["max_guarded_down_request"] == pytest.approx(0.008)
     assert franka["min_adaptive_close_force"] == pytest.approx(0.8)
     assert config["trial_timeout_seconds"] == 600
     assert "move_relative" in prompt
     assert "slip_risk" in prompt
+    assert "pitch_cue" in prompt
+    assert "pitch_couple" in prompt
+    assert "pitch_confidence" in prompt
+    assert "quadrant_pressure" in prompt
+    assert "quadrant_shear" in prompt
     assert "preempted_by_slip_risk" in prompt
     assert "interrupted_by_slip_warning" in prompt
+    assert "direction_not_improving" in prompt
     assert "correction_hint" in prompt
     assert "remaining_actions" in prompt
     assert "success_latched" in prompt
     assert "episode_stopped" in prompt
-    assert "recoverable tactile guard signals" in prompt
-    assert "always make one adaptive preload close_gripper call" in prompt
+    assert "recoverable physical feedback" in prompt
+    assert "adaptive preload close_gripper call" in prompt
     assert "target_force around 0.8" in prompt
-    assert "one additional adaptive close_gripper call" in prompt
-    assert "normal guarded downward insertion steps should be 0.001 m" in prompt
-    assert "fallback/test downward steps can be 0.0003-0.0005 m" in prompt
-    assert "once a useful direction is found" in prompt
-    assert "no larger than 0.0005 m" in prompt
-    assert "no larger than 0.006 rad" in prompt
-    assert 'result["limits"]' in prompt
-    assert 'result["risk_before"]' in prompt
-    assert 'result["risk_after"]' in prompt
-    assert 'result["reason"]' in prompt
-    assert 'result["tactile"]' in prompt
+    assert "0.05 to 0.15 rad" in prompt
+    assert "0.008 m" in prompt
+    assert "guard_stop_phase" in prompt
+    assert "direction_improved" in prompt
+    assert "executed_rpy" in prompt
     assert "finds succeed" in prompt
-    assert "Do not call get_tactile_summary again to override" in prompt
-    assert 'reason="completed_with_slip" can still be a useful correction' in prompt
-    assert "reduces high risk to medium" in prompt
-    assert "Never repeat the same pitch or lateral direction twice" in prompt
-    assert "small state machine" in prompt
-    assert "search_direction" in prompt
-    assert "insert_segment" in prompt
-    assert "reassess" in prompt
-    assert "segment_depth" in prompt
-    assert "0.006-0.010 m" in prompt
-    assert 'result["executed_distance"] is zero' in prompt
-    assert 'result["clipped"] is true with a correction-budget reason' in prompt
-    assert 'reason starts with "official_protocol"' in prompt
-    assert 'result["executed_depth"] > 0' in prompt
-    assert "protected insertion progress" in prompt
-    assert "correction-budget exhaustion" in prompt
-    assert 'never to "budget_exhausted"' in prompt
-    assert "remaining_actions <= 0" in prompt
+    assert "preload grip, read tactile" in prompt
+    assert "pitch correction over lateral motion" in prompt
     assert "no_progress" in prompt
     assert "SystemExit" in prompt
     assert "insert_along_axis" not in prompt
@@ -713,6 +703,11 @@ def _move_tactile_summary(
     incipient_slip: bool = False,
     pressure_side: str | None = None,
     shear_side: str = "balanced",
+    pitch_cue: str = "ambiguous",
+    pitch_couple: float = 0.0,
+    pitch_confidence: float = 0.0,
+    quadrant_pressure: dict[str, float] | None = None,
+    quadrant_shear: dict[str, float] | None = None,
     drift_trend: str = "stable",
     correction_hint: str = "continue",
 ) -> dict[str, object]:
@@ -723,6 +718,12 @@ def _move_tactile_summary(
             pressure_side = "right"
         else:
             pressure_side = "balanced"
+    empty_quadrants = {
+        "left_upper": 0.0,
+        "left_lower": 0.0,
+        "right_upper": 0.0,
+        "right_lower": 0.0,
+    }
     return {
         "contact": contact,
         "left_contact": contact,
@@ -735,6 +736,11 @@ def _move_tactile_summary(
         "incipient_slip": incipient_slip,
         "pressure_side": pressure_side,
         "shear_side": shear_side,
+        "pitch_cue": pitch_cue,
+        "pitch_couple": pitch_couple,
+        "pitch_confidence": pitch_confidence,
+        "quadrant_pressure": quadrant_pressure or empty_quadrants,
+        "quadrant_shear": quadrant_shear or empty_quadrants,
         "force_change": "stable",
         "drift_trend": drift_trend,
         "correction_hint": correction_hint,
@@ -833,6 +839,21 @@ def test_move_relative_returns_depth_and_simple_tactile_feedback() -> None:
         "pressure_side": "left",
         "shear_side": "balanced",
         "heavier_side": "left",
+        "pitch_cue": "ambiguous",
+        "pitch_couple": 0.0,
+        "pitch_confidence": 0.0,
+        "quadrant_pressure": {
+            "left_upper": 0.0,
+            "left_lower": 0.0,
+            "right_upper": 0.0,
+            "right_lower": 0.0,
+        },
+        "quadrant_shear": {
+            "left_upper": 0.0,
+            "left_lower": 0.0,
+            "right_upper": 0.0,
+            "right_lower": 0.0,
+        },
         "force_change": "increased",
         "drift_trend": "stable",
         "drift": "low",
@@ -840,6 +861,8 @@ def test_move_relative_returns_depth_and_simple_tactile_feedback() -> None:
     }
     assert result["preempted"] is False
     assert result["interrupted"] is False
+    assert result["guard_stop_phase"] == "none"
+    assert result["direction_improved"] is False
     assert result["remaining_actions"] == 294
     assert result["tactile"]["pressure_side"] > 0.3
     assert result["tactile"]["force_change"] > 0.3
@@ -859,6 +882,8 @@ def test_move_relative_returns_depth_and_simple_tactile_feedback() -> None:
     assert result["ok"] is True
     assert result["executed_distance"] == pytest.approx(0.0004, abs=1e-6)
     assert result["executed_depth"] == pytest.approx(0.0, abs=1e-6)
+    assert result["executed_rotation"] == pytest.approx(0.004, abs=1e-6)
+    np.testing.assert_allclose(result["executed_rpy"], [0.0, 0.004, 0.0], atol=1e-7)
     action, action_type = env.actions[0]
     assert action_type == "delta_ee"
     np.testing.assert_allclose(action[:3], [0.0004, 0.0, 0.0], atol=1e-7)
@@ -1161,4 +1186,112 @@ def test_move_relative_limits_corrections_and_allows_slip_recovery() -> None:
     result = api.move_relative([0.0, 0.0, -0.002], tactile_guard=True)
     assert result["ok"] is False
     assert result["reason"] == "contact_lost"
+    assert len(env.actions) == 1
+
+
+def test_insert_hole_move_relative_splits_guarded_pitch_and_reports_stop_phase() -> None:
+    class Env:
+        task_name = "insert_hole"
+        api_configs = {
+            "franka_control_api": {
+                "max_delta_xyz": 0.01,
+                "max_insert_actions": 80,
+                "move_relative_max_lateral": 0.0005,
+                "move_relative_max_rotation": 0.15,
+                "move_relative_lateral_budget": 0.006,
+                "move_relative_rotation_budget": 1.20,
+                "tactile_guard": {
+                    "guard_micro_rpy_step": 0.003,
+                    "guard_micro_down_step": 0.001,
+                    "max_guarded_pitch_request": 0.15,
+                    "max_guarded_down_request": 0.008,
+                },
+            }
+        }
+        task = None
+
+        def __init__(self) -> None:
+            self.actions = []
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.0, 0.0, 0.2],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+            }
+
+        def take_action(self, action, *, action_type):
+            self.actions.append((np.asarray(action, dtype=np.float32), action_type))
+            return {"ok": True, "message": "action executed"}
+
+        def finalize_high_level_action(self):
+            return {
+                "enabled": True,
+                "stopped": False,
+                "reason": None,
+                "episode_stopped": False,
+                "success_latched": False,
+                "action_count": len(self.actions),
+                "max_steps": 600,
+            }
+
+        def get_protocol_status(self):
+            return {
+                "enabled": True,
+                "stopped": False,
+                "reason": None,
+                "episode_stopped": False,
+                "success_latched": False,
+                "action_count": len(self.actions),
+                "max_steps": 600,
+            }
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    api._read_adaptive_tactile_summary = lambda: _move_tactile_summary(
+        pitch_cue="pitch_positive",
+        pitch_couple=0.5,
+        pitch_confidence=0.8,
+    )
+
+    result = api.move_relative([0.0, 0.0, 0.0], delta_rpy=[0.0, 0.012, 0.0])
+
+    assert result["ok"] is True
+    assert result["reason"] == "completed"
+    assert len(env.actions) == 4
+    assert result["executed_rotation"] == pytest.approx(0.012, abs=1e-6)
+    np.testing.assert_allclose(result["executed_rpy"], [0.0, 0.012, 0.0], atol=1e-7)
+    assert result["guard_stop_phase"] == "none"
+    assert result["tactile"]["pitch_cue"] == "pitch_positive"
+    assert result["tactile"]["pitch_couple"] == pytest.approx(0.5)
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    api._read_adaptive_tactile_summary = _summary_reader(
+        _move_tactile_summary(
+            pitch_cue="pitch_positive",
+            pitch_couple=0.5,
+            pitch_confidence=0.8,
+            slip_risk="medium",
+            incipient_slip=True,
+            drift=0.6,
+        ),
+        _move_tactile_summary(
+            event="slip_detected",
+            slip_score=0.9,
+            slip_risk="high",
+            incipient_slip=True,
+            drift=2.0,
+            drift_trend="increasing",
+            correction_hint="try_lateral_probe",
+        ),
+    )
+
+    result = api.move_relative([0.0, 0.0, 0.0], delta_rpy=[0.0, -0.012, 0.0])
+
+    assert result["ok"] is True
+    assert result["reason"] == "interrupted_by_slip_warning"
+    assert result["interrupted"] is True
+    assert result["guard_stop_phase"] == "rotation"
+    assert result["direction_improved"] is False
+    assert result["executed_rotation"] == pytest.approx(0.003, abs=1e-6)
     assert len(env.actions) == 1

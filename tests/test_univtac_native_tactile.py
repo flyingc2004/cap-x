@@ -29,6 +29,15 @@ def _depth(indented: bool) -> np.ndarray:
     return arr
 
 
+def _depth_halves(*, upper: bool = False, lower: bool = False) -> np.ndarray:
+    arr = np.full((16, 16), 34.0, dtype=np.float32)
+    if upper:
+        arr[2:7, 4:12] = 30.0
+    if lower:
+        arr[9:14, 4:12] = 30.0
+    return arr
+
+
 def _marker(displacement: float = 0.0) -> np.ndarray:
     start = np.zeros((8, 8, 2), dtype=np.float32)
     end = start.copy()
@@ -256,6 +265,92 @@ def test_calibrated_depth_uses_robot_far_plane_for_force() -> None:
     assert summary["left"]["depth_delta_mm"] == pytest.approx(4.0)
     assert summary["normal_force"] == pytest.approx(4.0 / 6.5)
     assert summary["event"] == "stable_grasp"
+
+
+def test_native_tactile_pitch_force_couple_from_quadrants() -> None:
+    positive = summarize_native_tactile(
+        [
+            UniVTACTactileFrame(
+                step=0,
+                timestamp=0.0,
+                left_depth=_depth_halves(upper=True),
+                right_depth=_depth_halves(lower=True),
+                left_marker=_marker(0.0),
+                right_marker=_marker(0.0),
+                left_pose=None,
+                right_pose=None,
+            )
+        ],
+        depth_far_plane_mm=34.0,
+        pitch_couple_threshold=0.15,
+        pitch_confidence_threshold=0.25,
+    )
+    assert positive["pitch_cue"] == "pitch_positive"
+    assert positive["pitch_couple"] == pytest.approx(1.0)
+    assert positive["pitch_confidence"] >= 0.25
+    assert positive["quadrant_pressure"]["left_upper"] > 0.0
+    assert positive["quadrant_pressure"]["right_lower"] > 0.0
+
+    flipped = summarize_native_tactile(
+        [
+            UniVTACTactileFrame(
+                step=0,
+                timestamp=0.0,
+                left_depth=_depth_halves(upper=True),
+                right_depth=_depth_halves(lower=True),
+                left_marker=_marker(0.0),
+                right_marker=_marker(0.0),
+                left_pose=None,
+                right_pose=None,
+            )
+        ],
+        depth_far_plane_mm=34.0,
+        pitch_couple_sign=-1,
+        pitch_couple_threshold=0.15,
+        pitch_confidence_threshold=0.25,
+    )
+    assert flipped["pitch_cue"] == "pitch_negative"
+    assert flipped["pitch_couple"] == pytest.approx(-1.0)
+
+    negative = summarize_native_tactile(
+        [
+            UniVTACTactileFrame(
+                step=0,
+                timestamp=0.0,
+                left_depth=_depth_halves(lower=True),
+                right_depth=_depth_halves(upper=True),
+                left_marker=_marker(0.0),
+                right_marker=_marker(0.0),
+                left_pose=None,
+                right_pose=None,
+            )
+        ],
+        depth_far_plane_mm=34.0,
+        pitch_couple_threshold=0.15,
+        pitch_confidence_threshold=0.25,
+    )
+    assert negative["pitch_cue"] == "pitch_negative"
+    assert negative["pitch_couple"] == pytest.approx(-1.0)
+
+    balanced = summarize_native_tactile(
+        [
+            UniVTACTactileFrame(
+                step=0,
+                timestamp=0.0,
+                left_depth=_depth_halves(upper=True, lower=True),
+                right_depth=_depth_halves(upper=True, lower=True),
+                left_marker=_marker(0.0),
+                right_marker=_marker(0.0),
+                left_pose=None,
+                right_pose=None,
+            )
+        ],
+        depth_far_plane_mm=34.0,
+        pitch_couple_threshold=0.15,
+        pitch_confidence_threshold=0.25,
+    )
+    assert balanced["pitch_cue"] == "ambiguous"
+    assert balanced["pitch_couple"] == pytest.approx(0.0)
 
 
 def test_native_tactile_event_sequence_deduplicates() -> None:

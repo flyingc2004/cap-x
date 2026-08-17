@@ -1,0 +1,108 @@
+# Explore-retract-insert variant of insert_hole_tactile_official.yaml.
+#
+# Two-phase strategy: (1) EXPLORATION tolerates brief wall contact -- slip /
+# high shear is treated as direction information, not immediate failure; the
+# agent records which pitch/lateral direction reduces slip, improves the
+# pitch_cue, or changes guard_stop_phase; (2) RETRACT back to the pre-explore
+# relative pose using move_relative(-accumulated_xyz, -accumulated_rpy,
+# tactile_guard=False), then perform a clean guarded insertion along the
+# learned direction.
+#
+# Differences from the base config (all other keys identical):
+#   - prompt: strategy paragraphs replaced with the explore/retract protocol
+#   - output_dir: *_explore_retract suffix
+#   - trial_timeout_seconds: 600 (unchanged from base)
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/UniVTAC
+      task_name: insert_hole
+      task_config: smoke_capx_insert_hole_official
+      seed_base: 0
+      device: cuda:0
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.05
+          max_delta_xyz: 0.01
+          max_delta_rpy: 0.25
+          default_z_approach: 0.0
+          home_pose_relative_lift: false
+          preserve_landmark_orientation: false
+          use_task_place_actor_for_landmarks: false
+          use_task_grasp_actor_for_objects: false
+          use_native_pose_planner: false
+          rgbd_perception_enabled: false
+          tactile_adaptive_gripper_enabled: true
+          min_adaptive_close_force: 0.8
+          max_insert_actions: 80
+          move_relative_max_lateral: 0.0005
+          move_relative_max_rotation: 0.15
+          move_relative_lateral_budget: 0.006
+          move_relative_rotation_budget: 1.20
+          move_relative_lock_on_guard_failure: true
+          insert_depth_log_interval: 50
+          tactile_guard:
+            slip_warning_threshold: 0.35
+            slip_high_threshold: 0.55
+            slip_hard_threshold: 0.60
+            centroid_warning_delta: 0.5
+            centroid_high_delta: 1.0
+            shear_warning_delta: 0.05
+            pitch_couple_sign: 1
+            pitch_couple_threshold: 0.15
+            pitch_confidence_threshold: 0.25
+            guard_micro_down_step: 0.001
+            guard_micro_lateral_step: 0.0002
+            guard_micro_rpy_step: 0.003
+            max_guarded_pitch_request: 0.15
+            max_guarded_down_request: 0.008
+          max_gripper_servo_steps: 120
+          max_gripper_settle_steps: 20
+          gripper_settle_steps: 10
+          adaptive_gripper:
+            coarse_qpos_step: 0.0005
+            fine_qpos_step: 0.00005
+            contact_debounce_frames: 2
+            stable_debounce_frames: 3
+            release_debounce_frames: 2
+            settle_steps_per_command: 1
+            contact_force_threshold: 0.08
+            depth_contact_margin_mm: 0.5
+            slip_threshold: 0.6
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis:
+      - FrankaControlApi
+      - UniVTACTactileApi
+    prompt: |
+      You are controlling a Franka robot in the official UniVTAC insert_hole evaluation protocol.
+      Goal: insert the already grasped test tube into the hole while maintaining a stable grasp.
+      The official reset and pre-move have already grasped the tube and brought it near the hole entrance. Start from the current state; do not re-grasp from the table, do not open the gripper, and do not use RGB-D relocation in this version.
+      Use UniVTAC native tactile feedback as the main feedback signal. First make one adaptive preload close_gripper call with target_force around 0.8 and max_steps around 120. If the preload reports contact loss or unstable contact, finish normally. Otherwise keep the gripper closed throughout insertion.
+      Strategy: two-phase explore-then-insert. The tactile cue alone may not predict the correct direction, but slip and high shear ARE strong feedback: they mean you touched the hole wall. Do not avoid contact -- use brief, small, guarded wall contact as a direction search.
+      PHASE 1 - EXPLORE (bounded, keep it cheap): try at most 2-3 candidate directions, one at a time, from the current pose. Prefer pitch probes around the world y axis of 0.02 to 0.05 rad (never more than 0.06; do not chase a fixed target angle). You may also try one small lateral probe of at most 0.0015 m in world x or y. Between probes, read get_tactile_summary(window=20). For each probe call move_relative(delta, tactile_guard=True) and treat the result as the probe observation:
+      - interrupted_by_slip_warning, direction_not_improving, preempted_by_slip_risk, completed_with_slip, and completed_unstable are all VALID probe outcomes, not program failures -- the touch itself is the signal.
+      - A probe direction is GOOD if it returns direction_improved=True, or slip_risk drops to low/medium, or slip clears, or pitch_cue becomes clearer (higher pitch_confidence), or guard_stop_phase moves from "rotation" toward "translation" or "none".
+      - A probe direction is BAD if slip_risk stays high or rises, or the result stops in guard_stop_phase="rotation" without improvement.
+      Accumulate what was actually executed: probe_xyz += np.array(res["executed_xyz"]); probe_rpy += np.array(res["executed_rpy"]) for every move_relative call. These fields are exact -- the adapter records every executed micro-step even when the guard interrupts. If a probe reports executed_distance == 0 and executed_depth == 0, no motion happened; do not count it.
+      Stop exploring as soon as one direction is clearly good, and print a stage line containing exactly "finds succeed" plus the direction name and current tactile risk. If no direction improves within 3 probes, pick the least-bad one (lowest slip_risk, strongest pitch_cue) or stop and finish normally.
+      PHASE 2 - RETRACT (use guard=False, it is safe here): undo the exploration displacement before inserting. Call move_relative((-probe_xyz).tolist(), (-probe_rpy).tolist(), tactile_guard=False). The unguarded retract does not stop on slip and takes few steps because the step size is larger, but the official action budget still bounds it. If the retract returns a lock or contact_lost reason (for example reason "contact_lost" or the adapter reports the guard is locked), finish normally -- do not attempt guarded motion after a contact-lost lock.
+      PHASE 3 - CLEAN INSERT: after the retract, optionally re-close with one adaptive close_gripper(target_force=0.8, max_steps=120) to re-stabilize the grasp. Then insert along the learned direction with guarded segmented downward motion: read tactile, apply the found pitch/lateral direction with a guarded move_relative request, then a guarded downward step of about 0.001 m, then reassess. If the correction weakens pitch_cue, lowers slip_risk, clears slip, or returns direction_improved=True, print a stage line containing exactly "finds succeed" plus the direction name and current tactile risk, then continue with cautious segmented insertion in that direction. If the result stops in guard_stop_phase="rotation", try the opposite pitch direction or a smaller correction. If the result stops in guard_stop_phase="translation", do not keep pushing downward; reassess pitch_cue or try a tiny lateral probe.
+      Probe budget rules: the lateral and rotation budgets are consumed one-way and never refill -- even the retract counts against them. The lateral budget is only 0.006 m total, so at most one or two 0.0015 m lateral probes, and prefer pitch over lateral. The rotation budget is 1.2 rad, enough for 2-3 pitch probes of 0.05 rad plus retract; do not overspend. If result["clip_reason"] is "move_relative_lateral_budget" or "move_relative_rotation_budget", the command was clipped to zero or partial: do not count it as a successful probe and do not keep trying in that axis.
+      Do not assume tactile left/right labels directly map to world x; choose directions by measured improvement. A probe is valid only when executed_distance > 0 and clipped is false, except for guarded downward insertion where executed_depth > 0 can still count as progress.
+      Continue while contact remains present, episode_stopped is false, success_latched is false, and remaining_actions is positive (print remaining_actions after each phase). Rely on success_latched or episode_stopped as the official completion signal. Print a compact final stop reason such as success_latched, episode_stopped, contact_lost, hard_failure, stuck_high_slip, no_progress, or safety_loop_done before the code ends.
+      Do not raise, assert, SystemExit, exit, quit, sleep in a no-action loop, or open the gripper for expected physical failure. Keep the gripper closed at the end. Do not call open_gripper() or home_pose().
+      Write executable top-level Python code. If you define helper functions, call them before the code block ends; do not only define a function.
+      Use only the exposed high-level FrankaControlApi functions and UniVTAC native tactile functions. Do not call low-level movement functions.
+      Never inspect private simulator internals, hidden labels, evaluator state, or episode identifiers. Do not load or call ACT or ViTAL policies.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/univtac_insert_hole_tactile_official_explore_retract
+trial_timeout_seconds: 600
+max_trial_retries: 1

@@ -188,6 +188,12 @@ class UniVTACFrankaCompatApi(ApiBase):
         self.guard_micro_rpy_step = float(
             self.tactile_guard_config.get("guard_micro_rpy_step", 0.002)
         )
+        self.max_guarded_pitch_request = float(
+            self.tactile_guard_config.get("max_guarded_pitch_request", 0.15)
+        )
+        self.max_guarded_down_request = float(
+            self.tactile_guard_config.get("max_guarded_down_request", 0.008)
+        )
         self.object_pose_names = dict(cfg.get("object_pose_names", object_pose_names or {})) or {
             "prism": "prism",
             "object": "prism",
@@ -665,13 +671,16 @@ class UniVTACFrankaCompatApi(ApiBase):
 
         Returns:
             Dictionary with ok, reason, executed_distance, executed_depth,
-            remaining_actions, success_latched, episode_stopped, preempted,
-            interrupted, clipped, limits, and tactile. Recoverable tactile reasons include
-            preempted_by_slip_risk, interrupted_by_slip_warning, and
+            executed_xyz, executed_rpy, executed_rotation, remaining_actions,
+            success_latched, episode_stopped, preempted, interrupted,
+            guard_stop_phase, direction_improved, clipped, limits, and tactile.
+            Recoverable tactile reasons include preempted_by_slip_risk,
+            interrupted_by_slip_warning, direction_not_improving, and
             completed_with_slip. Correction budget reasons are safe no-ops, not
             code failures. The tactile field contains compact labels such as
             contact, stable, slip, slip_risk, incipient_slip, pressure_side,
-            shear_side, force_change, drift_trend, and correction_hint.
+            shear_side, pitch_cue, pitch_couple, force_change, drift_trend,
+            and correction_hint.
         """
         self._ensure_insert_depth_reference()
         before_summary = self._read_move_tactile_summary()
@@ -744,8 +753,8 @@ class UniVTACFrankaCompatApi(ApiBase):
                 clip_reason=clip_reason,
             )
 
-        downward_guarded = bool(tactile_guard) and self._is_downward_insertion(xyz)
         before_tactile = self._simple_tactile_feedback({}, before_summary)
+        downward_guarded = bool(tactile_guard) and self._is_downward_insertion(xyz)
         if downward_guarded and str(before_tactile.get("slip_risk")) == "high":
             return self._finish_move_relative_result(
                 ok=True,
@@ -763,7 +772,12 @@ class UniVTACFrankaCompatApi(ApiBase):
 
         xyz_norm = float(np.linalg.norm(xyz))
         rpy_norm = float(np.linalg.norm(rpy))
-        if downward_guarded:
+        guarded_motion = bool(tactile_guard) and (
+            downward_guarded or self.task_name == "insert_hole"
+        ) and (
+            xyz_norm > 1e-9 or rpy_norm > 1e-9
+        )
+        if guarded_motion:
             down_steps = (
                 self._ceil_step_count(abs(float(xyz[2])), self.guard_micro_down_step)
                 if abs(float(xyz[2])) > 0.0
@@ -827,6 +841,13 @@ class UniVTACFrankaCompatApi(ApiBase):
         after_summary = before_summary
         ok = True
         reason = "completed"
+        guard_stop_phase = "none"
+        direction_improved = False
+        correction_only = bool(
+            guarded_motion
+            and not downward_guarded
+            and (float(np.linalg.norm(xyz[:2])) > 1e-9 or rpy_norm > 1e-9)
+        )
 
         for _step_index in range(run_steps):
             action = np.concatenate(
@@ -859,15 +880,26 @@ class UniVTACFrankaCompatApi(ApiBase):
                     ok = False
                     reason = "contact_lost"
                     self._lock_move_relative_guard(reason)
+                    guard_stop_phase = self._guard_stop_phase(step_xyz, step_rpy)
                     break
-                if downward_guarded:
-                    after_tactile = self._simple_tactile_feedback(
-                        before_summary,
-                        after_summary,
+                if guarded_motion:
+                    after_tactile = self._simple_tactile_feedback(before_summary, after_summary)
+                    direction_improved = direction_improved or self._direction_improved(
+                        before_tactile,
+                        after_tactile,
                     )
                     if self._should_interrupt_for_slip_risk(before_tactile, after_tactile):
                         ok = True
                         reason = "interrupted_by_slip_warning"
+                        guard_stop_phase = self._guard_stop_phase(step_xyz, step_rpy)
+                        break
+                    if correction_only and self._direction_not_improving(
+                        before_tactile,
+                        after_tactile,
+                    ):
+                        ok = True
+                        reason = "direction_not_improving"
+                        guard_stop_phase = self._guard_stop_phase(step_xyz, step_rpy)
                         break
             if isinstance(status, dict) and bool(status.get("stopped", False)):
                 protocol_reason = str(status.get("reason") or "official_protocol_stopped")
@@ -878,7 +910,11 @@ class UniVTACFrankaCompatApi(ApiBase):
         if (
             ok
             and run_steps < planned_steps
-            and reason not in {"interrupted_by_slip_warning", "native_success"}
+            and reason not in {
+                "interrupted_by_slip_warning",
+                "direction_not_improving",
+                "native_success",
+            }
         ):
             if downward_guarded and str(before_tactile.get("slip_risk")) == "medium":
                 reason = "guarded_micro_step"
@@ -895,7 +931,9 @@ class UniVTACFrankaCompatApi(ApiBase):
             executed_delta_rpy=executed_rpy,
             before_summary=before_summary,
             after_summary=after_summary,
-            interrupted=reason == "interrupted_by_slip_warning",
+            interrupted=reason in {"interrupted_by_slip_warning", "direction_not_improving"},
+            guard_stop_phase=guard_stop_phase,
+            direction_improved=direction_improved,
             clipped=clip_reason is not None,
             clip_reason=clip_reason,
         )
@@ -913,6 +951,8 @@ class UniVTACFrankaCompatApi(ApiBase):
         after_summary: dict[str, Any] | None,
         preempted: bool = False,
         interrupted: bool = False,
+        guard_stop_phase: str = "none",
+        direction_improved: bool = False,
         clipped: bool = False,
         clip_reason: str | None = None,
     ) -> dict[str, Any]:
@@ -925,6 +965,8 @@ class UniVTACFrankaCompatApi(ApiBase):
             after_summary=after_summary,
             preempted=preempted,
             interrupted=interrupted,
+            guard_stop_phase=guard_stop_phase,
+            direction_improved=direction_improved,
             clipped=clipped,
             clip_reason=clip_reason,
         )
@@ -954,6 +996,9 @@ class UniVTACFrankaCompatApi(ApiBase):
             f"executed_xyz={self._format_vec3(executed_xyz)} "
             f"requested_rpy={self._format_vec3(requested_rpy)} "
             f"executed_rpy={self._format_vec3(executed_rpy)} "
+            f"rotation={float(result.get('executed_rotation', 0.0)):.4f} "
+            f"guard_stop_phase={result.get('guard_stop_phase')} "
+            f"direction_improved={result.get('direction_improved')} "
             f"clipped={result.get('clipped')} "
             f"clip_reason={result.get('clip_reason')} "
             f"preempted={result.get('preempted')} "
@@ -978,13 +1023,68 @@ class UniVTACFrankaCompatApi(ApiBase):
         before_tactile: dict[str, Any],
         after_tactile: dict[str, Any],
     ) -> bool:
-        if bool(after_tactile.get("slip", False)):
-            return True
-        if bool(after_tactile.get("incipient_slip", False)):
-            return True
         before_score = self._risk_label_score(str(before_tactile.get("slip_risk", "low")))
         after_score = self._risk_label_score(str(after_tactile.get("slip_risk", "low")))
-        return bool(after_score > before_score and after_score >= 0.5)
+        after_drift = self._drift_label_score(str(after_tactile.get("drift", "unknown")))
+        drift_trend = str(after_tactile.get("drift_trend", "unknown"))
+        if bool(after_tactile.get("slip", False)) and not bool(before_tactile.get("slip", False)):
+            return True
+        if after_score > before_score and after_score >= 0.5:
+            return True
+        if after_score >= 1.0 and after_drift >= 1.0:
+            return True
+        return bool(after_score >= 1.0 and drift_trend == "increasing")
+
+    def _direction_improved(
+        self,
+        before_tactile: dict[str, Any],
+        after_tactile: dict[str, Any],
+    ) -> bool:
+        before_score = self._tactile_guard_score(before_tactile)
+        after_score = self._tactile_guard_score(after_tactile)
+        if after_score < before_score - 0.05:
+            return True
+        if bool(before_tactile.get("slip", False)) and not bool(after_tactile.get("slip", False)):
+            return True
+        before_risk = self._risk_label_score(str(before_tactile.get("slip_risk", "low")))
+        after_risk = self._risk_label_score(str(after_tactile.get("slip_risk", "low")))
+        if after_risk > before_risk or bool(after_tactile.get("slip", False)):
+            return False
+        before_couple = abs(self._label_float(before_tactile.get("pitch_couple", 0.0)))
+        after_couple = abs(self._label_float(after_tactile.get("pitch_couple", 0.0)))
+        return bool(before_couple > 0.0 and after_couple < before_couple - 0.05)
+
+    def _direction_not_improving(
+        self,
+        before_tactile: dict[str, Any],
+        after_tactile: dict[str, Any],
+    ) -> bool:
+        if self._direction_improved(before_tactile, after_tactile):
+            return False
+        before_score = self._tactile_guard_score(before_tactile)
+        after_score = self._tactile_guard_score(after_tactile)
+        if after_score > before_score + 0.05:
+            return True
+        before_risk = self._risk_label_score(str(before_tactile.get("slip_risk", "low")))
+        after_risk = self._risk_label_score(str(after_tactile.get("slip_risk", "low")))
+        if before_risk >= 0.5 and after_risk >= before_risk:
+            return True
+        return False
+
+    def _tactile_guard_score(self, tactile: dict[str, Any]) -> float:
+        risk_score = self._risk_label_score(str(tactile.get("slip_risk", "low")))
+        drift_score = self._drift_label_score(str(tactile.get("drift", "unknown")))
+        hint_score = self._hint_label_score(str(tactile.get("correction_hint", "continue")))
+        slip_score = 1.0 if bool(tactile.get("slip", False)) else 0.0
+        return float(max(risk_score, 0.5 * drift_score, 0.4 * hint_score, slip_score))
+
+    @staticmethod
+    def _guard_stop_phase(xyz: np.ndarray, rpy: np.ndarray) -> str:
+        if float(np.linalg.norm(np.asarray(rpy, dtype=np.float32).reshape(3))) > 1e-9:
+            return "rotation"
+        if float(np.linalg.norm(np.asarray(xyz, dtype=np.float32).reshape(3))) > 1e-9:
+            return "translation"
+        return "none"
 
     @staticmethod
     def _risk_label_score(label: str) -> float:
@@ -994,6 +1094,33 @@ class UniVTACFrankaCompatApi(ApiBase):
         if value == "medium":
             return 0.5
         return 0.0
+
+    @staticmethod
+    def _drift_label_score(label: str) -> float:
+        value = str(label)
+        if value == "high":
+            return 1.0
+        if value == "medium":
+            return 0.5
+        return 0.0
+
+    @staticmethod
+    def _hint_label_score(label: str) -> float:
+        scores = {
+            "continue": 0.0,
+            "reduce_down_step": 0.4,
+            "try_pitch_probe": 0.6,
+            "try_lateral_probe": 0.6,
+            "hold": 1.0,
+        }
+        return float(scores.get(str(label), 0.0))
+
+    @staticmethod
+    def _label_float(value: Any) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
 
     @staticmethod
     def _ceil_step_count(distance: float, step: float) -> int:
@@ -1294,9 +1421,14 @@ class UniVTACFrankaCompatApi(ApiBase):
             "centroid_warning_delta": 0.5,
             "centroid_high_delta": 1.0,
             "shear_warning_delta": 0.05,
+            "pitch_couple_sign": 1.0,
+            "pitch_couple_threshold": 0.15,
+            "pitch_confidence_threshold": 0.25,
             "guard_micro_down_step": 0.0005,
             "guard_micro_lateral_step": 0.0002,
             "guard_micro_rpy_step": 0.002,
+            "max_guarded_pitch_request": 0.15,
+            "max_guarded_down_request": 0.008,
         }
 
     def _tactile_summary_thresholds(self) -> dict[str, float]:
@@ -1309,6 +1441,9 @@ class UniVTACFrankaCompatApi(ApiBase):
                 "centroid_warning_delta",
                 "centroid_high_delta",
                 "shear_warning_delta",
+                "pitch_couple_sign",
+                "pitch_couple_threshold",
+                "pitch_confidence_threshold",
             )
             if key in self.tactile_guard_config
         }
@@ -1907,6 +2042,8 @@ class UniVTACFrankaCompatApi(ApiBase):
             "recommended_down_step": float(self.guard_micro_down_step),
             "max_lateral_step": float(self.move_relative_max_lateral),
             "max_rotation_step": float(self.move_relative_max_rotation),
+            "max_guarded_pitch_request": float(self.max_guarded_pitch_request),
+            "max_guarded_down_request": float(self.max_guarded_down_request),
             "remaining_lateral_budget": remaining_lateral,
             "remaining_rotation_budget": remaining_rotation,
         }
@@ -1929,8 +2066,16 @@ class UniVTACFrankaCompatApi(ApiBase):
                 clipped_xyz[:2] *= max_lateral / max(lateral, 1e-9)
             reasons.append("move_relative_lateral_step_limit")
 
+        if self.task_name == "insert_hole" and float(clipped_xyz[2]) < 0.0:
+            max_down = max(0.0, float(self.max_guarded_down_request))
+            if abs(float(clipped_xyz[2])) > max_down + 1e-9:
+                clipped_xyz[2] = -max_down
+                reasons.append("move_relative_down_step_limit")
+
         rotation = float(np.linalg.norm(clipped_rpy))
         max_rotation = max(0.0, float(self.move_relative_max_rotation))
+        if self.task_name == "insert_hole":
+            max_rotation = min(max_rotation, max(0.0, float(self.max_guarded_pitch_request)))
         if rotation > max_rotation + 1e-9:
             if max_rotation <= 0.0:
                 clipped_rpy[:] = 0.0
@@ -1994,10 +2139,13 @@ class UniVTACFrankaCompatApi(ApiBase):
         after_summary: dict[str, Any] | None,
         preempted: bool = False,
         interrupted: bool = False,
+        guard_stop_phase: str = "none",
+        direction_improved: bool = False,
         clipped: bool = False,
         clip_reason: str | None = None,
     ) -> dict[str, Any]:
         executed_xyz = np.asarray(executed_delta_xyz, dtype=np.float32).reshape(3)
+        executed_rpy = np.asarray(executed_delta_rpy, dtype=np.float32).reshape(3)
         before_tactile = self._simple_tactile_feedback({}, before_summary or {})
         tactile = self._simple_tactile_feedback(before_summary or {}, after_summary or {})
         result_reason = str(reason)
@@ -2018,8 +2166,13 @@ class UniVTACFrankaCompatApi(ApiBase):
             "reason": result_reason,
             "executed_distance": float(np.linalg.norm(executed_xyz)),
             "executed_depth": float(max(0.0, -float(executed_xyz[2]))),
+            "executed_xyz": [float(value) for value in executed_xyz],
+            "executed_rpy": [float(value) for value in executed_rpy],
+            "executed_rotation": float(np.linalg.norm(executed_rpy)),
             "preempted": bool(preempted),
             "interrupted": bool(interrupted),
+            "guard_stop_phase": str(guard_stop_phase),
+            "direction_improved": bool(direction_improved),
             "clipped": bool(clipped),
             "clip_reason": clip_reason,
             "risk_before": str(before_tactile.get("slip_risk", "unknown")),
@@ -2073,6 +2226,9 @@ class UniVTACFrankaCompatApi(ApiBase):
         slip_risk = str(after.get("slip_risk", self._risk_from_score(after_slip)))
         pressure_side = str(after.get("pressure_side", self._heavier_side(after)))
         shear_side = str(after.get("shear_side", "unknown"))
+        pitch_cue = str(after.get("pitch_cue", "ambiguous"))
+        pitch_couple = self._summary_float(after, "pitch_couple")
+        pitch_confidence = self._summary_float(after, "pitch_confidence")
         drift_trend = str(after.get("drift_trend", "unknown"))
         correction_hint = str(after.get("correction_hint", "continue"))
         return {
@@ -2084,11 +2240,29 @@ class UniVTACFrankaCompatApi(ApiBase):
             "pressure_side": self._side_label(pressure_side),
             "shear_side": self._side_label(shear_side),
             "heavier_side": self._side_label(pressure_side),
+            "pitch_cue": pitch_cue,
+            "pitch_couple": float(pitch_couple),
+            "pitch_confidence": float(pitch_confidence),
+            "quadrant_pressure": self._quadrant_dict(after.get("quadrant_pressure")),
+            "quadrant_shear": self._quadrant_dict(after.get("quadrant_shear")),
             "force_change": self._force_change(before, after),
             "drift_trend": self._trend_label(drift_trend),
             "drift": self._drift_level(after),
             "correction_hint": self._hint_label(correction_hint),
         }
+
+    @staticmethod
+    def _quadrant_dict(value: Any) -> dict[str, float]:
+        keys = ("left_upper", "left_lower", "right_upper", "right_lower")
+        if not isinstance(value, dict):
+            return {key: 0.0 for key in keys}
+        out: dict[str, float] = {}
+        for key in keys:
+            try:
+                out[key] = float(value.get(key, 0.0))
+            except Exception:
+                out[key] = 0.0
+        return out
 
     def _risk_from_score(self, score: float) -> str:
         if float(score) >= float(self.tactile_guard_config.get("slip_high_threshold", 0.55)):

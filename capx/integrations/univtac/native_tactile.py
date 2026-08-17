@@ -83,6 +83,9 @@ def summarize_native_tactile(
     centroid_warning_delta: float = 0.5,
     centroid_high_delta: float = 1.0,
     shear_warning_delta: float = 0.05,
+    pitch_couple_sign: float = 1.0,
+    pitch_couple_threshold: float = 0.15,
+    pitch_confidence_threshold: float = 0.25,
 ) -> dict[str, Any]:
     """Summarize recent native UniVTAC tactile frames."""
     if not frames:
@@ -156,6 +159,13 @@ def summarize_native_tactile(
         force_full_scale_mm=force_full_scale_mm,
     )
     shear_side, shear_balance = _shear_side(left_metrics, right_metrics)
+    pitch_features = _pitch_couple_features(
+        left_metrics,
+        right_metrics,
+        pitch_couple_sign=pitch_couple_sign,
+        pitch_couple_threshold=pitch_couple_threshold,
+        pitch_confidence_threshold=pitch_confidence_threshold,
+    )
     force_delta = _normal_force_delta(frames, hand, metric_kwargs)
     drift_delta = _centroid_delta(frames, hand, metric_kwargs)
     force_change = _trend_label(force_delta, threshold=0.05)
@@ -222,6 +232,11 @@ def summarize_native_tactile(
         "pressure_balance": pressure_balance,
         "shear_side": shear_side,
         "shear_balance": shear_balance,
+        "pitch_cue": pitch_features["pitch_cue"],
+        "pitch_couple": pitch_features["pitch_couple"],
+        "pitch_confidence": pitch_features["pitch_confidence"],
+        "quadrant_pressure": pitch_features["quadrant_pressure"],
+        "quadrant_shear": pitch_features["quadrant_shear"],
         "force_change": force_change,
         "drift_trend": drift_trend,
         "correction_hint": correction_hint,
@@ -285,6 +300,11 @@ def _empty_summary() -> dict[str, Any]:
         "pressure_balance": 0.0,
         "shear_side": "unknown",
         "shear_balance": 0.0,
+        "pitch_cue": "ambiguous",
+        "pitch_couple": 0.0,
+        "pitch_confidence": 0.0,
+        "quadrant_pressure": _empty_quadrants(),
+        "quadrant_shear": _empty_quadrants(),
         "force_change": "unknown",
         "drift_trend": "unknown",
         "correction_hint": "hold",
@@ -306,6 +326,14 @@ def _empty_hand_metrics() -> dict[str, Any]:
         "marker_mean_displacement": 0.0,
         "marker_max_displacement": 0.0,
         "marker_centroid_displacement": 0.0,
+        "upper_pressure_raw": 0.0,
+        "lower_pressure_raw": 0.0,
+        "upper_shear_raw": 0.0,
+        "lower_shear_raw": 0.0,
+        "upper_pressure": 0.0,
+        "lower_pressure": 0.0,
+        "upper_shear": 0.0,
+        "lower_shear": 0.0,
     }
 
 
@@ -325,7 +353,15 @@ def _hand_metrics(
         contact_margin_mm=depth_contact_margin_mm,
     )
     depth_delta = depth_stats["depth_delta_mm"]
+    upper_pressure_raw, lower_pressure_raw = _depth_upper_lower_pressure(
+        depth,
+        far_plane_mm=depth_stats["depth_far_plane_mm"],
+        contact_margin_mm=depth_contact_margin_mm,
+    )
+    pressure_total = upper_pressure_raw + lower_pressure_raw
     marker_mean, marker_max = _marker_displacement(marker)
+    upper_shear_raw, lower_shear_raw = _marker_upper_lower_shear(marker)
+    shear_total = upper_shear_raw + lower_shear_raw
     marker_centroid_displacement = _marker_centroid_displacement(marker, baseline_marker)
     contact_area = depth_stats["contact_area"]
     force_scale = max(float(force_full_scale_mm), 1e-6)
@@ -358,9 +394,169 @@ def _hand_metrics(
             "marker_mean_displacement": float(marker_mean),
             "marker_max_displacement": float(marker_max),
             "marker_centroid_displacement": float(marker_centroid_displacement),
+            "upper_pressure_raw": float(upper_pressure_raw),
+            "lower_pressure_raw": float(lower_pressure_raw),
+            "upper_shear_raw": float(upper_shear_raw),
+            "lower_shear_raw": float(lower_shear_raw),
+            "upper_pressure": float(upper_pressure_raw / pressure_total) if pressure_total > 1e-9 else 0.0,
+            "lower_pressure": float(lower_pressure_raw / pressure_total) if pressure_total > 1e-9 else 0.0,
+            "upper_shear": float(upper_shear_raw / shear_total) if shear_total > 1e-9 else 0.0,
+            "lower_shear": float(lower_shear_raw / shear_total) if shear_total > 1e-9 else 0.0,
         }
     )
     return metrics
+
+
+def _empty_quadrants() -> dict[str, float]:
+    return {
+        "left_upper": 0.0,
+        "left_lower": 0.0,
+        "right_upper": 0.0,
+        "right_lower": 0.0,
+    }
+
+
+def _pitch_couple_features(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    pitch_couple_sign: float,
+    pitch_couple_threshold: float,
+    pitch_confidence_threshold: float,
+) -> dict[str, Any]:
+    pressure = _normalized_quadrants(
+        left_upper=float(left["upper_pressure_raw"]),
+        left_lower=float(left["lower_pressure_raw"]),
+        right_upper=float(right["upper_pressure_raw"]),
+        right_lower=float(right["lower_pressure_raw"]),
+    )
+    shear = _normalized_quadrants(
+        left_upper=float(left["upper_shear_raw"]),
+        left_lower=float(left["lower_shear_raw"]),
+        right_upper=float(right["upper_shear_raw"]),
+        right_lower=float(right["lower_shear_raw"]),
+    )
+    raw_pressure = _diagonal_couple(pressure)
+    raw_shear = _diagonal_couple(shear)
+    signed = float(np.sign(float(pitch_couple_sign) or 1.0) * raw_pressure)
+    confidence = float(np.clip(abs(signed) + 0.25 * abs(raw_shear), 0.0, 1.0))
+    if (
+        abs(signed) < float(pitch_couple_threshold)
+        or confidence < float(pitch_confidence_threshold)
+    ):
+        cue = "ambiguous"
+    elif signed > 0.0:
+        cue = "pitch_positive"
+    else:
+        cue = "pitch_negative"
+    return {
+        "pitch_cue": cue,
+        "pitch_couple": signed,
+        "pitch_confidence": confidence,
+        "quadrant_pressure": pressure,
+        "quadrant_shear": shear,
+    }
+
+
+def _normalized_quadrants(
+    *,
+    left_upper: float,
+    left_lower: float,
+    right_upper: float,
+    right_lower: float,
+) -> dict[str, float]:
+    values = {
+        "left_upper": max(0.0, float(left_upper)),
+        "left_lower": max(0.0, float(left_lower)),
+        "right_upper": max(0.0, float(right_upper)),
+        "right_lower": max(0.0, float(right_lower)),
+    }
+    total = sum(values.values())
+    if total <= 1e-9:
+        return _empty_quadrants()
+    return {key: float(value / total) for key, value in values.items()}
+
+
+def _diagonal_couple(quadrants: dict[str, float]) -> float:
+    diag_a = float(quadrants["left_upper"]) + float(quadrants["right_lower"])
+    diag_b = float(quadrants["left_lower"]) + float(quadrants["right_upper"])
+    total = diag_a + diag_b
+    if total <= 1e-9:
+        return 0.0
+    return float((diag_a - diag_b) / total)
+
+
+def _depth_upper_lower_pressure(
+    depth: np.ndarray | None,
+    *,
+    far_plane_mm: float | None,
+    contact_margin_mm: float,
+) -> tuple[float, float]:
+    arr = _as_2d_array(depth)
+    if arr is None:
+        return 0.0, 0.0
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 0.0, 0.0
+    far_plane = (
+        float(far_plane_mm)
+        if far_plane_mm is not None
+        else float(np.nanpercentile(finite, 95))
+    )
+    indent = np.clip(far_plane - arr.astype(np.float64), 0.0, None)
+    indent[~np.isfinite(indent)] = 0.0
+    indent = np.where(indent > max(0.0, float(contact_margin_mm)), indent, 0.0)
+    if indent.size == 0:
+        return 0.0, 0.0
+    split = max(1, int(indent.shape[0] // 2))
+    upper = float(np.sum(indent[:split, :]))
+    lower = float(np.sum(indent[split:, :]))
+    return upper, lower
+
+
+def _marker_upper_lower_shear(marker: np.ndarray | None) -> tuple[float, float]:
+    if marker is None or marker.size == 0:
+        return 0.0, 0.0
+    arr = np.asarray(marker, dtype=np.float64)
+    if arr.shape[-1] < 2:
+        return 0.0, 0.0
+    if arr.ndim >= 4 and arr.shape[0] >= 2:
+        disp = arr[-1, ..., :2] - arr[0, ..., :2]
+        mag = np.linalg.norm(disp, axis=-1)
+        mag = np.where(np.isfinite(mag), mag, 0.0)
+        split = max(1, int(mag.shape[0] // 2))
+        return float(np.sum(mag[:split, ...])), float(np.sum(mag[split:, ...]))
+    if arr.ndim >= 3 and arr.shape[0] >= 2:
+        current = arr[-1, ..., :2].reshape(-1, 2)
+        disp = (arr[-1, ..., :2] - arr[0, ..., :2]).reshape(-1, 2)
+    else:
+        current = arr[..., :2].reshape(-1, 2)
+        disp = arr[..., :2].reshape(-1, 2)
+    valid = np.all(np.isfinite(current), axis=1) & np.all(np.isfinite(disp), axis=1)
+    if not np.any(valid):
+        return 0.0, 0.0
+    current = current[valid]
+    mag = np.linalg.norm(disp[valid], axis=1)
+    if current.shape[0] < 2:
+        return float(np.sum(mag)), 0.0
+    median_y = float(np.median(current[:, 1]))
+    upper_mask = current[:, 1] <= median_y
+    if np.all(upper_mask) or not np.any(upper_mask):
+        order = np.arange(current.shape[0])
+        upper_mask = order < current.shape[0] / 2
+    return float(np.sum(mag[upper_mask])), float(np.sum(mag[~upper_mask]))
+
+
+def _as_2d_array(value: np.ndarray | None) -> np.ndarray | None:
+    if value is None or value.size == 0:
+        return None
+    arr = np.asarray(value, dtype=np.float64)
+    arr = np.squeeze(arr)
+    if arr.ndim < 2:
+        return None
+    if arr.ndim > 2:
+        arr = arr.reshape((-1,) + arr.shape[-2:])[-1]
+    return arr
 
 
 def _depth_metrics(

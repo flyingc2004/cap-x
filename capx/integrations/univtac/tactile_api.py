@@ -52,8 +52,10 @@ class UniVTACTactileApi(ApiBase):
             contact_balance, per-hand metrics, and event. It also includes
             compact tactile servo labels: slip_risk ("low", "medium", "high"),
             incipient_slip, pressure_side, shear_side, force_change,
-            drift_trend, and correction_hint. The summary is based only on
-            UniVTAC tactile depth and marker outputs.
+            drift_trend, correction_hint, and pitch force-couple fields such
+            as pitch_cue, pitch_couple, pitch_confidence, quadrant_pressure,
+            and quadrant_shear. The summary is based only on UniVTAC tactile
+            depth and marker outputs.
         """
         _refresh_native_tactile(self._env, data_types=["rgb", "rgb_marker", "marker", "depth", "pose"])
         frames = self._env.tactile_buffer.recent(window)
@@ -71,6 +73,9 @@ class UniVTACTactileApi(ApiBase):
             f"centroid={summary['marker_centroid_displacement']:.3f} "
             f"slip={summary['slip_score']:.3f} "
             f"risk={summary['slip_risk']} "
+            f"pitch_cue={summary.get('pitch_cue', 'ambiguous')} "
+            f"pitch_couple={float(summary.get('pitch_couple', 0.0)):.3f} "
+            f"pitch_conf={float(summary.get('pitch_confidence', 0.0)):.3f} "
             f"hint={summary['correction_hint']} event={summary['event']}"
         )
         return summary
@@ -285,6 +290,9 @@ def _native_tactile_calibration(env: BaseEnv) -> dict[str, float]:
             "centroid_warning_delta",
             "centroid_high_delta",
             "shear_warning_delta",
+            "pitch_couple_sign",
+            "pitch_couple_threshold",
+            "pitch_confidence_threshold",
         ):
             if key in guard_cfg:
                 calibration[key] = guard_cfg[key]

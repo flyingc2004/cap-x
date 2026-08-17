@@ -1,3 +1,15 @@
+# Multi-turn variant of insert_hole_tactile_official.yaml.
+#
+# Enables CaP-X's core regenerate loop: after each code block executes, the
+# framework feeds {executed_code} + {console_stdout} + {console_stderr} back to
+# the LLM and asks it to REGENERATE (append the next block) or FINISH.
+# Differences from the base config:
+#   - cfg.multi_turn_prompt added (this is the switch that enables the loop)
+#   - prompt instructs the model to write short staged blocks instead of one
+#     giant closed-loop program
+#   - save_multiturn_prompts: true dumps each decision prompt to
+#     <output_dir>/.../prompts_and_responses/multi_turn_prompt_XX.txt
+#   - trial_timeout_seconds bumped 600 -> 900 (each turn adds one LLM call)
 env:
   _target_: capx.envs.tasks.base.CodeExecutionEnvBase
   cfg:
@@ -80,9 +92,32 @@ env:
       Write executable top-level Python code. If you define helper functions, call them before the code block ends; do not only define a function.
       Use only the exposed high-level FrankaControlApi functions and UniVTAC native tactile functions. Do not call low-level movement functions.
       Never inspect private simulator internals, hidden labels, evaluator state, or episode identifiers. Do not load or call ACT or ViTAL policies.
+      Multi-turn protocol: you are running in a multi-turn loop. Write only ONE focused code block in this first response (e.g., preload grip, first tactile read, and one guarded probe). After each code block executes, you will be shown its stdout and stderr and asked to respond with REGENERATE (followed by the next code block) or FINISH. The robot state, grasp, and any variables or functions you defined persist across blocks, so each block should continue from the current state without redoing or redefining earlier work. Prefer several short observation-driven blocks over one giant block.
+    multi_turn_prompt: |
+      The following Python code was just executed in the UniVTAC insert_hole environment:
+      ```python
+      {executed_code}
+      ```
+      Current console stdout:
+      ```
+      {console_stdout}
+      ```
+      Current console stderr:
+      ```
+      {console_stderr}
+      ```
+
+      Analyze the output for the tactile closed-loop insertion policy:
+      - A Python traceback in stderr is a program error. If you see one, write corrected code in your next block; do not repeat the failing call unchanged and never use raise or assert.
+      - Printed lines about pitch_cue, pitch_couple, slip_risk, incipient_slip, direction_improved, guard_stop_phase, remaining_actions, success_latched, episode_stopped, clip_reason, and "finds succeed" are physical feedback, not program failures. Treat preempted_by_slip_risk, interrupted_by_slip_warning, direction_not_improving, completed_with_slip, completed_unstable, and clipped commands as recoverable physical outcomes.
+      - If stdout or stderr shows success_latched=True or episode_stopped=True, the insertion is complete: respond FINISH.
+      - If the preload reported contact loss or unstable contact, or contact was lost during insertion, respond FINISH rather than acting without a stable grasp.
+      - Otherwise respond REGENERATE followed by exactly one new Python code block that continues from the current robot state. Variables and functions defined in the executed code remain available; do not redefine or redo completed actions.
+      - Choose the next block from the servo loop: read get_tactile_summary(window=20), then either apply the pitch_cue with a guarded move_relative pitch correction (about 0.02 to 0.08 rad, no fixed target angle), probe downward about 0.001 m with a guarded move_relative, or continue cautious segmented downward insertion when pitch_cue is ambiguous and tactile is stable. If guard_stop_phase was "rotation", try the opposite pitch direction or a smaller correction; if it was "translation", reassess pitch_cue or try a tiny lateral probe instead of pushing down. Keep the gripper closed at all times. End the block at a natural decision point and print a compact progress line.
 trials: 1
 num_workers: 1
 record_video: true
-output_dir: ./outputs/univtac_insert_hole_tactile_official
-trial_timeout_seconds: 600
+output_dir: ./outputs/univtac_insert_hole_tactile_official_multiturn
+save_multiturn_prompts: true
+trial_timeout_seconds: 900
 max_trial_retries: 1
