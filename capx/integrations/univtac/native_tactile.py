@@ -259,6 +259,9 @@ def tactile_event_sequence(
     centroid_warning_delta: float = 0.5,
     centroid_high_delta: float = 1.0,
     shear_warning_delta: float = 0.05,
+    pitch_couple_sign: float = 1.0,
+    pitch_couple_threshold: float = 0.15,
+    pitch_confidence_threshold: float = 0.25,
 ) -> list[str]:
     """Return a deduplicated sequence of tactile events over recent frames."""
     events: list[str] = []
@@ -275,6 +278,9 @@ def tactile_event_sequence(
             centroid_warning_delta=centroid_warning_delta,
             centroid_high_delta=centroid_high_delta,
             shear_warning_delta=shear_warning_delta,
+            pitch_couple_sign=pitch_couple_sign,
+            pitch_couple_threshold=pitch_couple_threshold,
+            pitch_confidence_threshold=pitch_confidence_threshold,
         )["event"]
         if not events or events[-1] != event:
             events.append(event)
