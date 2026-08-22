@@ -9,6 +9,8 @@ import json
 import logging
 import multiprocessing
 import os
+import re
+import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,6 +132,10 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
     )
     os.environ["CAPX_TACTILE_STRATEGY_TOP_K"] = str(tactile_strategy_top_k)
 
+    tactile_code_memory_config = _normalize_tactile_code_memory_config(
+        configs_dict.get("tactile_code_memory", {})
+    )
+
     # Build merged config dict (CLI args override YAML)
     merged_config = {
         "total_trials": args.total_trials
@@ -177,6 +183,7 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "tactile_strategy_memory_path": tactile_strategy_memory_path,
         "tactile_strategy_memory_read_path": tactile_strategy_memory_read_path,
         "tactile_strategy_top_k": tactile_strategy_top_k,
+        "tactile_code_memory": tactile_code_memory_config,
         "trial_timeout_seconds": float(
             os.getenv(
                 "CAPX_TRIAL_TIMEOUT_SECONDS",
@@ -189,12 +196,61 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
                 configs_dict.get("max_trial_retries", 3),
             )
         ),
+        "max_regenerations": int(
+            os.getenv(
+                "CAPX_MAX_REGENERATIONS",
+                configs_dict.get(
+                    "max_regenerations",
+                    tactile_code_memory_config.get("max_repair_turns", 10)
+                    if tactile_code_memory_config.get("enabled", False)
+                    else 10,
+                ),
+            )
+        ),
     }
 
     if merged_config["tactile_strategy_memory"]:
         _inject_tactile_strategy_memory_prompt(env_factory, merged_config)
+    if tactile_code_memory_config.get("enabled", False):
+        _inject_tactile_code_memory_prompt(env_factory, merged_config)
 
     return env_factory, merged_config, api_servers
+
+
+def _normalize_tactile_code_memory_config(raw: Any) -> dict[str, Any]:
+    """Normalize the generic tactile code memory config block."""
+    cfg = dict(raw or {}) if isinstance(raw, dict) else {}
+    enabled = bool(cfg.get("enabled", False))
+    mode = str(cfg.get("mode", "read"))
+    statuses = cfg.get("statuses")
+    if statuses is None:
+        statuses = ["candidate", "validated"] if mode == "candidate" else ["validated"]
+    elif isinstance(statuses, str):
+        statuses = [statuses]
+    cfg.update(
+        {
+            "enabled": enabled,
+            "mode": mode,
+            "path": cfg.get(
+                "path",
+                ".capx_tactile_code_memory/lift_can_v1/bank.jsonl",
+            ),
+            "top_k_initial": int(cfg.get("top_k_initial", 3)),
+            "top_k_runtime": int(cfg.get("top_k_runtime", 2)),
+            "runtime_retrieval": bool(cfg.get("runtime_retrieval", True)),
+            "max_repair_turns": int(cfg.get("max_repair_turns", 2)),
+            "statuses": [str(status) for status in statuses],
+            "capability": str(cfg.get("capability", "grasp_stabilization")),
+            "window": int(cfg.get("window", 20)),
+            "split_code_blocks_on_breakpoint": bool(
+                cfg.get("split_code_blocks_on_breakpoint", enabled)
+            ),
+            "save_trace": bool(cfg.get("save_trace", True)),
+        }
+    )
+    os.environ["CAPX_TACTILE_CODE_MEMORY_ENABLED"] = "1" if enabled else "0"
+    os.environ["CAPX_TACTILE_CODE_MEMORY_PATH"] = str(cfg["path"])
+    return cfg
 
 
 def _inject_tactile_strategy_memory_prompt(
@@ -222,6 +278,40 @@ def _inject_tactile_strategy_memory_prompt(
         print(f"WARNING: Failed to inject tactile strategy memory into prompt: {exc}")
 
 
+def _inject_tactile_code_memory_prompt(
+    env_factory: dict[str, Any],
+    config: dict[str, Any],
+) -> None:
+    """Append retrieved tactile code memory to the initial task prompt."""
+    memory_cfg = dict(config.get("tactile_code_memory", {}))
+    try:
+        from capx.memory.tactile_code import (
+            TactileCodeMemoryBank,
+            format_memory_for_prompt,
+        )
+
+        cfg = env_factory.get("cfg", {})
+        required_apis = list(cfg.get("apis", []))
+        records = TactileCodeMemoryBank(memory_cfg.get("path")).retrieve(
+            capability=str(memory_cfg.get("capability", "grasp_stabilization")),
+            required_apis=required_apis,
+            top_k=int(memory_cfg.get("top_k_initial", 3)),
+            statuses=list(memory_cfg.get("statuses", ["validated"])),
+            include_scores=True,
+        )
+        if not records:
+            print("[tactile-code-memory] No code memory records retrieved; prompt unchanged")
+            return
+        prompt_addition = format_memory_for_prompt(records)
+        cfg["prompt"] = f"{cfg.get('prompt', '')}\n\n{prompt_addition}"
+        print(
+            "[tactile-code-memory] "
+            f"Injected {len(records)} code memory record(s) into prompt"
+        )
+    except Exception as exc:
+        print(f"WARNING: Failed to inject tactile code memory into prompt: {exc}")
+
+
 def _extract_code(content: str) -> list[str]:
     """Extract Python code from Markdown fenced code block.
 
@@ -231,22 +321,29 @@ def _extract_code(content: str) -> list[str]:
     Returns:
         Extracted Python code list
     """
-    fence_start = "```python\n"
-    fence_end = "```"
-    start_idx = 0
-    end_idx = len(content) + 1
-    if fence_start in content:
-        start_idx = content.find(fence_start) + len(fence_start)
-        content = content[start_idx:]
-    if fence_end in content:
-        end_idx = content.rfind(fence_end)
-        content = content[:end_idx]
+    fenced = re.search(
+        r"```(?:python|py)\s*\n(.*?)```",
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced is not None:
+        content = fenced.group(1)
 
-    content = content.strip()
+    content = _normalize_extracted_code(content)
     # NOTE: might gen empty code block at the end
     # content_list = content.split("breakpoint_code_block()")
 
     return [content]
+
+
+def _normalize_extracted_code(content: str) -> str:
+    """Normalize model-produced Python before sandbox execution."""
+    content = "\n".join(
+        line
+        for line in content.splitlines()
+        if not re.match(r"^\s*#\s*Code block\s+\d+\s*$", line, flags=re.IGNORECASE)
+    )
+    return textwrap.dedent(content).strip()
 
 
 def _build_multi_turn_decision_prompt_legacy(
@@ -301,7 +398,19 @@ def _build_multi_turn_decision_prompt_legacy(
             {"type": "text", "text": f"{feedback_header}\n{visual_differencing_feedback}"}
         )
     multi_turn_decision_prompt[-1]["content"].append(
-        {"type": "text", "text": "Based on the code output, potential error messages, and the observation made above, carefully reason about the following:\nPlease respond with EXACTLY ONE of the following:\n- The word 'REGENERATE' followed immediately by new Python code in a fenced code block (```python...```) if you want to modify the code.\n- The word 'FINISH' if the task appears to be complete"}
+        {
+            "type": "text",
+            "text": (
+                "Based on the code output, potential error messages, and the "
+                "observation made above, carefully reason about the following:\n"
+                "Please respond with EXACTLY ONE of the following:\n"
+                "- The word 'FINISH' if stdout/stderr or the environment status says the task is already complete.\n"
+                "- The word 'CONTINUE' if the next existing code block should run unchanged.\n"
+                "- The word 'REGENERATE' followed immediately by new Python code in a fenced code block "
+                "(```python...```) if you want to replace all remaining code.\n"
+                "- The word 'FINISH' if the task appears to be complete or no further action is needed."
+            ),
+        }
     )
     # collapse the last message
     multi_turn_decision_prompt[-1]["content"] = collapse_text_image_inputs(multi_turn_decision_prompt[-1]["content"])
@@ -360,7 +469,19 @@ def _build_multi_turn_decision_prompt(
             {"type": "text", "text": f"{feedback_header}\n{visual_differencing_feedback}"}
         )
     multi_turn_decision_prompt[-1]["content"].append(
-        {"type": "text", "text": "Based on the code output, potential error messages, and the observation made above, carefully reason about the following:\nPlease respond with EXACTLY ONE of the following:\n- The word 'REGENERATE' followed immediately by new Python code in a fenced code block (```python...```) if you want to modify the code.\n- The word 'FINISH' if the task appears to be complete"}
+        {
+            "type": "text",
+            "text": (
+                "Based on the code output, potential error messages, and the "
+                "observation made above, carefully reason about the following:\n"
+                "Please respond with EXACTLY ONE of the following:\n"
+                "- The word 'FINISH' if stdout/stderr or the environment status says the task is already complete.\n"
+                "- The word 'CONTINUE' if the next existing code block should run unchanged.\n"
+                "- The word 'REGENERATE' followed immediately by new Python code in a fenced code block "
+                "(```python...```) if you want to replace all remaining code.\n"
+                "- The word 'FINISH' if the task appears to be complete or no further action is needed."
+            ),
+        }
     )
     # collapse the last message
     multi_turn_decision_prompt[-1]["content"] = collapse_text_image_inputs(multi_turn_decision_prompt[-1]["content"])
@@ -376,10 +497,18 @@ def _parse_multi_turn_decision(content: str) -> tuple[str, str | None]:
     Returns:
         A tuple containing the decision and the new code (if any)
     """
-    if content is not None and ("REGENERATE" in content):
-        return "regenerate", content.split("REGENERATE")[1].strip()  # new code
-    else:
-        return "finish", content
+    if content is None:
+        return "finish", None
+
+    upper = content.upper()
+    if "REGENERATE" in upper:
+        match = re.search(r"\bREGENERATE\b", content, flags=re.IGNORECASE)
+        payload = content[match.end():] if match is not None else content
+        extracted = _extract_code(payload)[0].strip()
+        return "regenerate", extracted if extracted else None
+    if re.search(r"\bCONTINUE\b", upper):
+        return "continue", content
+    return "finish", content
 
 
 def _get_visual_feedback(

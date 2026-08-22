@@ -12,6 +12,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as SciRotation
 
 from capx.envs.base import BaseEnv
+from capx.envs.tasks.exceptions import RecoverableTaskFailure
 from capx.integrations.base_api import ApiBase
 from capx.integrations.tactile.adaptive_gripper import (
     AdaptiveGripperConfig,
@@ -63,9 +64,19 @@ class UniVTACFrankaCompatApi(ApiBase):
         graspnet_service_url: str = "http://127.0.0.1:8115",
         perception_timeout_seconds: float = 120.0,
         perception_min_depth_points: int = 32,
+        perception_retry_attempts: int = 2,
+        perception_prompt_fallbacks: dict[str, list[str]] | None = None,
         grasp_local_z_offset: float = 0.12,
+        current_tool_pose_grasp_objects: list[str] | tuple[str, ...] | None = None,
         use_native_pose_planner: bool = False,
         record_perception_diagnostic: bool = False,
+        official_anchor_fallback_enabled: bool = False,
+        official_anchor_fallback_objects: list[str] | None = None,
+        max_goto_pose_actions: int | None = None,
+        max_home_pose_actions: int | None = None,
+        max_native_pose_actions: int | None = None,
+        max_gripper_servo_steps: int | None = None,
+        max_gripper_settle_steps: int | None = None,
     ) -> None:
         super().__init__(env)
         cfg = self._runtime_config()
@@ -131,17 +142,63 @@ class UniVTACFrankaCompatApi(ApiBase):
         self.rgbd_perception_enabled = bool(
             cfg.get("rgbd_perception_enabled", rgbd_perception_enabled)
         )
+        current_tool_pose_objects = cfg.get(
+            "current_tool_pose_grasp_objects",
+            current_tool_pose_grasp_objects or (),
+        )
+        if isinstance(current_tool_pose_objects, str):
+            current_tool_pose_objects = [current_tool_pose_objects]
+        self.current_tool_pose_grasp_objects = {
+            self._normalize_name(str(name)) for name in current_tool_pose_objects
+        }
         self.perception_camera = str(cfg.get("perception_camera", perception_camera))
         configured_prompts = cfg.get("perception_prompt_map", perception_prompt_map or {})
-        self.perception_prompt_map = {
-            str(key).strip().lower().replace(" ", "_"): str(value)
-            for key, value in dict(configured_prompts or {"can": "cylindrical can"}).items()
-        }
+        self.perception_prompt_map = self._normalize_prompt_map(
+            configured_prompts or {"can": "cylindrical can"}
+        )
+        fallback_cfg = cfg.get("perception_prompt_fallbacks", perception_prompt_fallbacks or {})
+        self.perception_prompt_fallbacks = self._normalize_prompt_map(fallback_cfg)
+        if "can" not in self.perception_prompt_fallbacks:
+            self.perception_prompt_fallbacks["can"] = [
+                "can",
+                "cylindrical object",
+                "small cylinder",
+            ]
+        self.perception_retry_attempts = max(
+            1,
+            int(cfg.get("perception_retry_attempts", perception_retry_attempts)),
+        )
         self.use_native_pose_planner = bool(
             cfg.get("use_native_pose_planner", use_native_pose_planner)
         )
         self.record_perception_diagnostic = bool(
             cfg.get("record_perception_diagnostic", record_perception_diagnostic)
+        )
+        self.official_anchor_fallback_enabled = bool(
+            cfg.get("official_anchor_fallback_enabled", official_anchor_fallback_enabled)
+        )
+        fallback_objects = cfg.get(
+            "official_anchor_fallback_objects",
+            official_anchor_fallback_objects or ["can"],
+        )
+        self.official_anchor_fallback_objects = self._normalize_object_set(
+            fallback_objects,
+            object_pose_names=self.object_pose_names,
+        )
+        self.max_goto_pose_actions = self._optional_positive_int(
+            cfg.get("max_goto_pose_actions", max_goto_pose_actions),
+        )
+        self.max_home_pose_actions = self._optional_positive_int(
+            cfg.get("max_home_pose_actions", max_home_pose_actions),
+        )
+        self.max_native_pose_actions = self._optional_positive_int(
+            cfg.get("max_native_pose_actions", max_native_pose_actions),
+        )
+        self.max_gripper_servo_steps = self._optional_positive_int(
+            cfg.get("max_gripper_servo_steps", max_gripper_servo_steps),
+        )
+        self.max_gripper_settle_steps = self._optional_positive_int(
+            cfg.get("max_gripper_settle_steps", max_gripper_settle_steps),
         )
         self._perception_diagnostic_reset_serial: int | None = None
         self._rgbd_perception = UniVTACRgbdPerception(
@@ -187,15 +244,17 @@ class UniVTACFrankaCompatApi(ApiBase):
         """
         key = self._resolve_pose_key(object_name)
         if self.rgbd_perception_enabled:
-            frame = self._rgbd_frame()
-            prompt = self._perception_prompt(key)
-            estimate = self._rgbd_perception.estimate_object(frame, prompt)
+            estimate, frame, prompt, attempt = self._estimate_rgbd_with_retry(
+                key,
+                kind="object_pose",
+            )
             self._append_perception_artifact(
                 {
                     "kind": "object_pose",
                     "source": "rgbd",
                     "object_name": key,
                     "prompt": prompt,
+                    "attempt": attempt,
                     "frame": frame,
                     "mask": estimate.mask,
                     "points_world": estimate.points_world,
@@ -233,16 +292,32 @@ class UniVTACFrankaCompatApi(ApiBase):
         adapter so sampling and native execution use the same geometry.
         """
         key = self._resolve_pose_key(object_name)
+        if self._normalize_name(key) in self.current_tool_pose_grasp_objects:
+            tool_pos, tool_quat = self._current_tool_pose()
+            print(
+                "[univtac-franka] grasp_source=current_tool_pose "
+                f"object={key} pos={np.round(tool_pos, 4)}",
+                flush=True,
+            )
+            return tool_pos, tool_quat
         if self.rgbd_perception_enabled:
-            frame = self._rgbd_frame()
-            prompt = self._perception_prompt(key)
-            estimate = self._rgbd_perception.estimate_grasp(frame, prompt)
+            try:
+                estimate, frame, prompt, attempt = self._estimate_rgbd_with_retry(
+                    key,
+                    kind="grasp_pose",
+                )
+            except RecoverableTaskFailure as exc:
+                fallback = self._official_anchor_fallback(key, fallback_from=exc)
+                if fallback is not None:
+                    return fallback
+                raise
             self._append_perception_artifact(
                 {
                     "kind": "grasp_pose",
                     "source": "rgbd_contact_graspnet",
                     "object_name": key,
                     "prompt": prompt,
+                    "attempt": attempt,
                     "frame": frame,
                     "mask": estimate.mask,
                     "points_world": estimate.points_world,
@@ -278,22 +353,21 @@ class UniVTACFrankaCompatApi(ApiBase):
         position: np.ndarray,
         quaternion_wxyz: np.ndarray,
         z_approach: float = 0.0,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Move to a target pose using bounded UniVTAC delta actions."""
         pos = np.asarray(position, dtype=np.float32).reshape(3)
         quat = np.asarray(quaternion_wxyz, dtype=np.float32).reshape(4)
 
         if self.use_native_pose_planner:
-            self._goto_pose_native(pos, quat, z_approach=float(z_approach))
-            return
+            return self._goto_pose_native(pos, quat, z_approach=float(z_approach))
 
         grasp_result = self._try_approach_public_grasp(pos)
         if grasp_result is not None:
-            return
+            return grasp_result
 
         place_result = self._try_place_on_public_landmark(pos, quat)
         if place_result is not None:
-            return
+            return place_result
 
         cur_pos, cur_quat = self._current_tool_pose()
         if self._nearest_public_landmark(pos) is not None and self.preserve_landmark_orientation:
@@ -301,16 +375,32 @@ class UniVTACFrankaCompatApi(ApiBase):
 
         # Preserve the original CaP contract: zero means a direct bounded move.
         # Callers request a staged approach explicitly with a positive value.
+        remaining_api_actions = self.max_goto_pose_actions
         approach = max(0.0, float(z_approach))
         if approach > 0.0:
             approach_target = pos.copy()
             approach_target[2] = max(approach_target[2] + approach, self.min_safe_z)
-            self._move_to_pose_bounded(approach_target, quat, cur_pos, cur_quat)
+            result = self._call_move_to_pose_bounded(
+                approach_target,
+                quat,
+                cur_pos,
+                cur_quat,
+                max_actions=remaining_api_actions,
+            )
+            if isinstance(result, dict) and not bool(result.get("ok", False)):
+                return result
+            remaining_api_actions = self._consume_api_actions(remaining_api_actions, result)
             cur_pos, cur_quat = self._current_tool_pose()
 
         final_target = pos.copy()
         final_target[2] = max(final_target[2], self.min_safe_z)
-        self._move_to_pose_bounded(final_target, quat, cur_pos, cur_quat)
+        return self._call_move_to_pose_bounded(
+            final_target,
+            quat,
+            cur_pos,
+            cur_quat,
+            max_actions=remaining_api_actions,
+        )
 
     def open_gripper(
         self,
@@ -328,11 +418,14 @@ class UniVTACFrankaCompatApi(ApiBase):
         Returns:
             Result containing ``released``, final width, and stop reason.
         """
+        requested_max_steps = int(max_steps)
+        max_steps = self._limit_gripper_servo_steps(requested_max_steps)
         if not self._begin_gripper_action():
             return self._blocked_gripper_result(opening=True)
         if adaptive and self.tactile_adaptive_gripper_enabled:
             controller = self._adaptive_gripper_controller()
             result = controller.open(target_width=target_width, max_steps=max_steps)
+            self._annotate_servo_limit(result, requested_max_steps, max_steps)
             self._save_adaptive_trace(controller.trace)
             print(
                 "[univtac-franka] adaptive_open "
@@ -348,7 +441,7 @@ class UniVTACFrankaCompatApi(ApiBase):
             result = native_gripper(
                 qpos=self._width_to_qpos(target_width),
                 opening=True,
-                settle_steps=self.gripper_settle_steps,
+                settle_steps=self._limited_gripper_settle_steps(),
             )
             print(
                 "[univtac-franka] open_gripper_native "
@@ -390,12 +483,15 @@ class UniVTACFrankaCompatApi(ApiBase):
             Result containing ``stable``, contact state, and stop reason. The
             caller remains responsible for pose adjustment, retry, and lift.
         """
+        requested_max_steps = int(max_steps)
+        max_steps = self._limit_gripper_servo_steps(requested_max_steps)
         if not self._begin_gripper_action():
             return self._blocked_gripper_result(opening=False)
         self._record_rgbd_diagnostic_if_needed()
         if adaptive and self.tactile_adaptive_gripper_enabled:
             controller = self._adaptive_gripper_controller()
             result = controller.close(target_force=target_force, max_steps=max_steps)
+            self._annotate_servo_limit(result, requested_max_steps, max_steps)
             self._save_adaptive_trace(controller.trace)
             print(
                 "[univtac-franka] adaptive_close "
@@ -414,7 +510,7 @@ class UniVTACFrankaCompatApi(ApiBase):
                 opening=False,
                 lift_after_close=self.lift_after_close,
                 lift_z=self.lift_after_close_z,
-                settle_steps=self.gripper_settle_steps,
+                settle_steps=self._limited_gripper_settle_steps(),
             )
             print(
                 "[univtac-franka] close_gripper_native "
@@ -451,7 +547,13 @@ class UniVTACFrankaCompatApi(ApiBase):
         if self.use_native_pose_planner:
             self._goto_pose_native(target, tool_quat, z_approach=0.0)
             return
-        self._move_to_pose_bounded(target, tool_quat, tool_pos, tool_quat)
+        self._call_move_to_pose_bounded(
+            target,
+            tool_quat,
+            tool_pos,
+            tool_quat,
+            max_actions=self.max_home_pose_actions,
+        )
 
     def get_robot_state(self) -> dict[str, Any]:
         """Expose the UniVTAC robot state with stable CaP keys."""
@@ -475,7 +577,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         target = self._width_to_qpos(width)
         self._env.take_action(np.concatenate([arm, [target]]), action_type="qpos")
         if self.gripper_settle_steps > 0:
-            self._env.wait_steps(self.gripper_settle_steps)
+            self._env.wait_steps(self._limited_gripper_settle_steps())
 
     def _adaptive_gripper_controller(self) -> TactileAdaptiveGripperController:
         calibration_fn = getattr(self._env, "get_gripper_calibration", None)
@@ -546,14 +648,210 @@ class UniVTACFrankaCompatApi(ApiBase):
             raise RuntimeError("UniVTAC environment does not provide calibrated RGB-D")
         return frame_fn(self.perception_camera)
 
-    def _perception_prompt(self, key: str) -> str:
+    def _estimate_rgbd_with_retry(self, key: str, *, kind: str) -> tuple[Any, Any, str, int]:
+        prompts = self._perception_prompts(key)
+        source = "rgbd_contact_graspnet" if kind == "grasp_pose" else "rgbd"
+        errors: list[dict[str, Any]] = []
+        for attempt in range(1, self.perception_retry_attempts + 1):
+            try:
+                frame = self._rgbd_frame()
+            except Exception as exc:
+                error = self._record_rgbd_failure(
+                    key=key,
+                    kind=kind,
+                    source=source,
+                    attempt=attempt,
+                    prompt=None,
+                    frame=None,
+                    exc=exc,
+                )
+                errors.append(error)
+                continue
+
+            for prompt in prompts:
+                try:
+                    if kind == "grasp_pose":
+                        estimate = self._rgbd_perception.estimate_grasp(frame, prompt)
+                        extra = f"candidates={len(estimate.scores)}"
+                    elif kind == "object_pose":
+                        estimate = self._rgbd_perception.estimate_object(frame, prompt)
+                        extra = f"points={len(estimate.points_world)}"
+                    else:
+                        raise ValueError(f"unknown RGB-D estimate kind {kind!r}")
+                except Exception as exc:
+                    error = self._record_rgbd_failure(
+                        key=key,
+                        kind=kind,
+                        source=source,
+                        attempt=attempt,
+                        prompt=prompt,
+                        frame=frame,
+                        exc=exc,
+                    )
+                    errors.append(error)
+                    continue
+
+                print(
+                    "[univtac-franka] rgbd_retry "
+                    f"kind={kind} object={key} attempt={attempt} "
+                    f"prompt={prompt!r} ok=True {extra}",
+                    flush=True,
+                )
+                return estimate, frame, prompt, attempt
+
+        reason = "rgbd_regrasp_unavailable" if kind == "grasp_pose" else "rgbd_pose_unavailable"
+        last = errors[-1] if errors else {"reason": "unknown", "message": "no attempts"}
+        raise RecoverableTaskFailure(
+            reason,
+            (
+                f"RGB-D {kind} for {key!r} failed after "
+                f"{self.perception_retry_attempts} attempt(s): "
+                f"{last.get('reason')}: {last.get('message')}"
+            ),
+            details={
+                "object_name": key,
+                "kind": kind,
+                "attempts": self.perception_retry_attempts,
+                "errors": errors,
+            },
+        )
+
+    def _record_rgbd_failure(
+        self,
+        *,
+        key: str,
+        kind: str,
+        source: str,
+        attempt: int,
+        prompt: str | None,
+        frame: Any | None,
+        exc: Exception,
+    ) -> dict[str, Any]:
+        diagnostics = dict(getattr(exc, "diagnostics", {}) or {})
+        reason = str(getattr(exc, "reason", type(exc).__name__))
+        message = str(exc)
+        mask = getattr(exc, "mask", None)
+        error = {
+            "kind": kind,
+            "source": source,
+            "object_name": key,
+            "attempt": int(attempt),
+            "prompt": prompt,
+            "reason": reason,
+            "message": message,
+            "diagnostics": diagnostics,
+        }
+        record: dict[str, Any] = {
+            **error,
+            "kind": f"{kind}_error",
+            "error": repr(exc),
+        }
+        if frame is not None:
+            record["frame"] = frame
+        if mask is not None:
+            record["mask"] = mask
+        self._append_perception_artifact(record)
+        print(
+            "[univtac-franka] rgbd_retry "
+            f"kind={kind} object={key} attempt={attempt} "
+            f"prompt={prompt!r} ok=False reason={reason} "
+            f"valid_depth_points={diagnostics.get('valid_depth_points', 'n/a')}",
+            flush=True,
+        )
+        return error
+
+    def _official_anchor_fallback(
+        self,
+        key: str,
+        *,
+        fallback_from: Exception,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        if not self.official_anchor_fallback_enabled:
+            return None
         normalized = str(key).strip().lower().replace(" ", "_")
-        prompt = self.perception_prompt_map.get(normalized)
-        if not prompt:
+        if normalized not in self.official_anchor_fallback_objects:
+            return None
+        grasp_pose = self._public_grasp_pose(normalized)
+        if grasp_pose is None:
+            return None
+        pos, quat = grasp_pose
+        reason = str(getattr(fallback_from, "reason", type(fallback_from).__name__))
+        self._append_perception_artifact(
+            {
+                "kind": "grasp_pose",
+                "source": "official_anchor_fallback",
+                "object_name": normalized,
+                "position": pos,
+                "quaternion_wxyz": quat,
+                "fallback_from": reason,
+                "used_for_control": True,
+            }
+        )
+        print(
+            "[univtac-franka] grasp_source=official_anchor_fallback "
+            f"object={normalized} fallback_from={reason}",
+            flush=True,
+        )
+        return pos, quat
+
+    @staticmethod
+    def _normalize_prompt_map(raw: Any) -> dict[str, list[str]]:
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, list[str]] = {}
+        for key, value in raw.items():
+            normalized = str(key).strip().lower().replace(" ", "_")
+            if isinstance(value, (list, tuple)):
+                prompts = [str(item).strip() for item in value if str(item).strip()]
+            else:
+                prompt = str(value).strip()
+                prompts = [prompt] if prompt else []
+            if prompts:
+                out[normalized] = prompts
+        return out
+
+    @staticmethod
+    def _optional_positive_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+            return None
+        out = int(value)
+        return out if out > 0 else None
+
+    @staticmethod
+    def _normalize_object_set(raw: Any, *, object_pose_names: dict[str, str]) -> set[str]:
+        if raw is None:
+            return set()
+        if isinstance(raw, str):
+            values = [raw]
+        elif isinstance(raw, (list, tuple, set)):
+            values = list(raw)
+        else:
+            values = [raw]
+        normalized: set[str] = set()
+        for value in values:
+            key = str(value).strip().lower()
+            if not key:
+                continue
+            mapped = object_pose_names.get(key, key.replace(" ", "_"))
+            normalized.add(str(mapped).strip().lower().replace(" ", "_"))
+        return normalized
+
+    def _perception_prompts(self, key: str) -> list[str]:
+        normalized = str(key).strip().lower().replace(" ", "_")
+        prompts: list[str] = []
+        prompts.extend(self.perception_prompt_map.get(normalized, []))
+        prompts.extend(self.perception_prompt_fallbacks.get(normalized, []))
+        unique = list(dict.fromkeys(prompt for prompt in prompts if prompt))
+        if not unique:
             raise KeyError(
                 f"object '{key}' has no non-privileged RGB-D perception prompt"
             )
-        return prompt
+        return unique
+
+    def _perception_prompt(self, key: str) -> str:
+        return self._perception_prompts(key)[0]
 
     def _append_perception_artifact(self, record: dict[str, Any]) -> None:
         append_fn = getattr(self._env, "append_perception_artifact", None)
@@ -630,6 +928,14 @@ class UniVTACFrankaCompatApi(ApiBase):
         quat = self._normalize_quat(quaternion_wxyz)
         result: dict[str, Any] = {"ok": True, "message": "no movement requested"}
         approach = max(0.0, float(z_approach))
+        required_actions = 2 if approach > 0.0 else 1
+        limit_failure = self._api_action_limit_failure(
+            "goto_pose_native",
+            required_actions,
+            self.max_native_pose_actions,
+        )
+        if limit_failure is not None:
+            return limit_failure
         if approach > 0.0:
             approach_target = target.copy()
             approach_target[2] = max(target[2] + approach, self.min_safe_z)
@@ -678,7 +984,9 @@ class UniVTACFrankaCompatApi(ApiBase):
         target_quat: np.ndarray,
         current_pos: np.ndarray,
         current_quat: np.ndarray,
-    ) -> None:
+        *,
+        max_actions: int | None = None,
+    ) -> dict[str, Any]:
         target_pos = np.asarray(target_pos, dtype=np.float32).reshape(3)
         target_quat = np.asarray(target_quat, dtype=np.float32).reshape(4)
         current_pos = np.asarray(current_pos, dtype=np.float32).reshape(3)
@@ -692,9 +1000,21 @@ class UniVTACFrankaCompatApi(ApiBase):
             int(np.ceil(dist / max(self.max_delta_xyz, 1e-6))),
             int(np.ceil(rot_angle / max(self.max_delta_rpy, 1e-6))),
         )
+        limit_failure = self._api_action_limit_failure(
+            "goto_pose",
+            steps,
+            max_actions,
+        )
+        if limit_failure is not None:
+            return limit_failure
         pos_points = [current_pos + (delta_pos * (i / steps)) for i in range(1, steps + 1)]
 
         quat_points = self._slerp_quaternion_path(current_quat, target_quat, steps)
+        last_result: dict[str, Any] = {
+            "ok": True,
+            "message": "bounded pose movement completed",
+            "steps": steps,
+        }
         for idx, pos in enumerate(pos_points):
             prev = current_pos if idx == 0 else pos_points[idx - 1]
             delta_xyz = np.clip(pos - prev, -self.max_delta_xyz, self.max_delta_xyz)
@@ -710,8 +1030,130 @@ class UniVTACFrankaCompatApi(ApiBase):
                 np.concatenate([delta_xyz, delta_euler, [0.0]]),
                 action_type="delta_ee",
             )
+            last_result = {
+                **result,
+                "steps": steps,
+                "completed_steps": idx + 1,
+            }
             if not result.get("ok", False):
-                break
+                last_result.setdefault("reason", "bounded_pose_action_failed")
+                print(
+                    "[univtac-franka] goto_pose_bounded_stopped "
+                    f"step={idx + 1}/{steps} message={result.get('message', '')}",
+                    flush=True,
+                )
+                return last_result
+        return last_result
+
+    def _call_move_to_pose_bounded(
+        self,
+        target_pos: np.ndarray,
+        target_quat: np.ndarray,
+        current_pos: np.ndarray,
+        current_quat: np.ndarray,
+        *,
+        max_actions: int | None,
+    ) -> dict[str, Any]:
+        if max_actions is None:
+            result = self._move_to_pose_bounded(
+                target_pos,
+                target_quat,
+                current_pos,
+                current_quat,
+            )
+        else:
+            result = self._move_to_pose_bounded(
+                target_pos,
+                target_quat,
+                current_pos,
+                current_quat,
+                max_actions=max_actions,
+            )
+        return result if isinstance(result, dict) else {"ok": True, "message": "movement completed"}
+
+    def _api_action_limit_failure(
+        self,
+        api_name: str,
+        requested_actions: int,
+        configured_limit: int | None,
+    ) -> dict[str, Any] | None:
+        effective_limit = self._effective_action_limit(configured_limit)
+        if effective_limit is None or requested_actions <= effective_limit:
+            return None
+        status_fn = getattr(self._env, "get_protocol_status", None)
+        status = status_fn() if callable(status_fn) else {}
+        print(
+            "[univtac-franka] api_action_limit "
+            f"api={api_name} requested={requested_actions} limit={effective_limit}",
+            flush=True,
+        )
+        return {
+            "ok": False,
+            "reason": "api_action_limit",
+            "message": (
+                f"{api_name} would require {requested_actions} physical action(s), "
+                f"but this API call is limited to {effective_limit}"
+            ),
+            "requested_actions": int(requested_actions),
+            "max_api_actions": int(effective_limit),
+            "completed_steps": 0,
+            "action_count": status.get("action_count") if isinstance(status, dict) else None,
+            "max_steps": status.get("max_steps") if isinstance(status, dict) else None,
+        }
+
+    def _effective_action_limit(self, configured_limit: int | None) -> int | None:
+        limits: list[int] = []
+        if configured_limit is not None:
+            limits.append(max(0, int(configured_limit)))
+        remaining = self._remaining_protocol_actions()
+        if remaining is not None:
+            limits.append(max(0, remaining))
+        return min(limits) if limits else None
+
+    def _remaining_protocol_actions(self) -> int | None:
+        status_fn = getattr(self._env, "get_protocol_status", None)
+        if not callable(status_fn):
+            return None
+        status = status_fn()
+        if not isinstance(status, dict) or not bool(status.get("enabled", False)):
+            return None
+        if bool(status.get("stopped", False)):
+            return 0
+        max_steps = status.get("max_steps")
+        action_count = status.get("action_count")
+        if max_steps is None or action_count is None:
+            return None
+        return max(0, int(max_steps) - int(action_count))
+
+    @staticmethod
+    def _consume_api_actions(limit: int | None, result: dict[str, Any]) -> int | None:
+        if limit is None:
+            return None
+        used = int(result.get("completed_steps", result.get("steps", 0)) or 0)
+        return max(0, int(limit) - used)
+
+    def _limit_gripper_servo_steps(self, requested_max_steps: int) -> int:
+        requested = max(1, int(requested_max_steps))
+        if self.max_gripper_servo_steps is None:
+            return requested
+        return min(requested, self.max_gripper_servo_steps)
+
+    @staticmethod
+    def _annotate_servo_limit(
+        result: dict[str, Any],
+        requested_max_steps: int,
+        actual_max_steps: int,
+    ) -> None:
+        if int(requested_max_steps) == int(actual_max_steps):
+            return
+        result["requested_max_steps"] = int(requested_max_steps)
+        result["max_steps_limit"] = int(actual_max_steps)
+
+    def _limited_gripper_settle_steps(self) -> int:
+        requested = max(0, int(self.gripper_settle_steps))
+        if self.max_gripper_settle_steps is None:
+            return requested
+        return min(requested, self.max_gripper_settle_steps)
 
     def _slerp_quaternion_path(self, q0: np.ndarray, q1: np.ndarray, steps: int) -> list[np.ndarray]:
         q0 = self._normalize_quat(q0)
@@ -750,6 +1192,10 @@ class UniVTACFrankaCompatApi(ApiBase):
     def _resolve_pose_key(self, object_name: str) -> str:
         key = str(object_name).strip().lower()
         return self.object_pose_names.get(key, key.replace(" ", "_"))
+
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        return str(name).strip().lower().replace(" ", "_")
 
     def _estimate_extent_from_pose_name(self, key: str) -> np.ndarray:
         if "pad" in key:
@@ -938,21 +1384,16 @@ class UniVTACFrankaCompatApi(ApiBase):
             return None
 
     def _public_grasp_pose(self, key: str) -> tuple[np.ndarray, np.ndarray] | None:
+        if key != "prism":
+            sampled = self._sample_public_grasp_from_env(key)
+            if sampled is not None:
+                return sampled
+
         if self._public_actor_pose(key) is None:
             return None
-        sample_fn = getattr(self._env, "get_public_grasp_pose", None)
-        if callable(sample_fn):
-            try:
-                sampled = sample_fn(key, grasp_height=self.grasp_height)
-            except (KeyError, RuntimeError, ValueError):
-                sampled = None
-            if sampled is not None:
-                pos, quat = sampled
-                return (
-                    np.asarray(pos, dtype=np.float32).reshape(3),
-                    self._normalize_quat(np.asarray(quat, dtype=np.float32).reshape(4)),
-                )
-
+        sampled = self._sample_public_grasp_from_env(key)
+        if sampled is not None:
+            return sampled
         if key == "prism":
             pos = self._public_prism_pose()
             if pos is not None:
@@ -960,6 +1401,22 @@ class UniVTACFrankaCompatApi(ApiBase):
                 grasp_pos[2] += self.grasp_height
                 return grasp_pos.astype(np.float32), self._native_grasp_quat_wxyz()
         return None
+
+    def _sample_public_grasp_from_env(self, key: str) -> tuple[np.ndarray, np.ndarray] | None:
+        sample_fn = getattr(self._env, "get_public_grasp_pose", None)
+        if not callable(sample_fn):
+            return None
+        try:
+            sampled = sample_fn(key, grasp_height=self.grasp_height)
+        except (KeyError, RuntimeError, ValueError):
+            return None
+        if sampled is None:
+            return None
+        pos, quat = sampled
+        return (
+            np.asarray(pos, dtype=np.float32).reshape(3),
+            self._normalize_quat(np.asarray(quat, dtype=np.float32).reshape(4)),
+        )
 
     def _native_grasp_quat_wxyz(self) -> np.ndarray:
         try:

@@ -391,6 +391,20 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
     assert "two 0.05 meter increments" in lift_cfg["prompt"]
     assert "call open_gripper(adaptive=True) to release the can" in lift_cfg["prompt"]
 
+    for minimal_name in [
+        "lift_can_tactile_minimal.yaml",
+        "lift_can_tactile_minimal_memory_candidate.yaml",
+        "lift_can_tactile_minimal_memory_initial.yaml",
+        "lift_can_tactile_minimal_memory_closed_loop.yaml",
+    ]:
+        minimal_config = yaml.safe_load(config_path.with_name(minimal_name).read_text(encoding="utf-8"))
+        minimal_franka = minimal_config["env"]["cfg"]["low_level"]["api_configs"][
+            "franka_control_api"
+        ]
+        assert minimal_franka["rgbd_perception_enabled"] is False
+        assert minimal_franka["use_task_grasp_actor_for_objects"] is True
+        assert "current_tool_pose_grasp_objects" not in minimal_franka
+
 
 def test_lift_can_completion_uses_native_task_check() -> None:
     native_result = {"value": True}
@@ -731,6 +745,34 @@ def test_univtac_franka_compat_can_missing_is_explicit() -> None:
         api.get_object_pose("can")
     with pytest.raises(KeyError, match="can"):
         api.sample_grasp_pose("can")
+
+
+def test_univtac_franka_compat_can_pregrasp_anchor_uses_current_tool_pose() -> None:
+    class Env:
+        task = object()
+        api_configs = {
+            "franka_control_api": {
+                "object_pose_names": {"can": "can"},
+                "rgbd_perception_enabled": False,
+                "current_tool_pose_grasp_objects": ["can"],
+            }
+        }
+
+        def get_public_grasp_pose(self, object_name, *, grasp_height):
+            raise AssertionError("pregrasp anchor should not query task grasp pose")
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.31, -0.02, 0.16],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+                "joint": [0.0] * 8,
+            }
+
+    api = UniVTACFrankaCompatApi(Env())
+    grasp_pos, grasp_quat = api.sample_grasp_pose("can")
+
+    np.testing.assert_allclose(grasp_pos, [0.31, -0.02, 0.16])
+    np.testing.assert_allclose(grasp_quat, [1.0, 0.0, 0.0, 0.0])
 
 
 def test_univtac_low_level_can_grasp_matches_native_task_geometry(monkeypatch) -> None:

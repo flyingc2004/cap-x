@@ -16,6 +16,7 @@ import yaml
 from PIL import Image
 
 from capx.envs.base import BaseEnv
+from capx.envs.tasks.exceptions import HardStopTrial
 from capx.integrations.univtac.native_tactile import (
     UniVTACTactileBuffer,
     frame_from_observation,
@@ -92,6 +93,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._official_task_protocol = False
         self._protocol_stopped = False
         self._protocol_stop_reason: str | None = None
+        self._trial_deadline_time: float | None = None
+        self._trial_deadline_seconds: float | None = None
         self._reset_serial = 0
 
         self._prepare_import_path()
@@ -130,6 +133,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._perception_artifacts.clear()
         self._protocol_stopped = False
         self._protocol_stop_reason = None
+        self.clear_trial_deadline()
         self._reset_serial += 1
 
         print(
@@ -295,6 +299,7 @@ class UniVTACLowLevelEnv(BaseEnv):
 
     def protocol_action_allowed(self) -> bool:
         """Return whether another official-protocol physical action may run."""
+        self._raise_if_hard_stopped("protocol_action_allowed")
         if not self._official_task_protocol:
             return True
         if self._protocol_stopped:
@@ -349,6 +354,38 @@ class UniVTACLowLevelEnv(BaseEnv):
     def append_perception_artifact(self, record: dict[str, Any]) -> None:
         """Keep non-privileged perception inputs and outputs for trial audit."""
         self._perception_artifacts.append(dict(record))
+
+    def set_trial_deadline(self, timeout_seconds: float) -> None:
+        """Set a soft wall-clock deadline checked before physical actions."""
+        timeout = max(1.0, float(timeout_seconds))
+        self._trial_deadline_seconds = timeout
+        self._trial_deadline_time = time.monotonic() + timeout
+
+    def clear_trial_deadline(self) -> None:
+        """Clear the current soft wall-clock deadline."""
+        self._trial_deadline_time = None
+        self._trial_deadline_seconds = None
+
+    def _raise_if_hard_stopped(self, where: str) -> None:
+        deadline = getattr(self, "_trial_deadline_time", None)
+        if deadline is None or time.monotonic() < float(deadline):
+            return
+        if not self._protocol_stopped:
+            self._stop_protocol("trial_timeout")
+        try:
+            self._task.plan_success = False
+        except Exception:
+            pass
+        timeout = float(getattr(self, "_trial_deadline_seconds", None) or 0.0)
+        raise HardStopTrial(
+            "trial_timeout",
+            f"trial deadline reached before {where} after {timeout:.1f}s",
+            details={
+                "where": where,
+                "action_count": self.get_action_count(),
+                "max_steps": self.max_steps,
+            },
+        )
 
     def _stop_protocol(self, reason: str) -> None:
         if self._protocol_stopped:

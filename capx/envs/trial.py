@@ -18,6 +18,7 @@ import gc
 import io
 import json
 import os
+import re
 import signal
 import time
 from typing import Any
@@ -41,6 +42,7 @@ from capx.utils.launch_utils import (
     _build_multi_turn_decision_prompt_legacy,
     _extract_code,
     _get_visual_feedback,
+    _normalize_extracted_code,
     _parse_multi_turn_decision,
     _save_trial_artifacts,
 )
@@ -68,6 +70,27 @@ def _annotate_code_blocks(
     for i, (block, metadata) in enumerate(zip(code_blocks, code_block_metadata, strict=False)):
         annotated.append(f"# Code block {i}\n{block}")
     return "\n\n".join(annotated)
+
+
+def _extract_configured_code_blocks(content: str, config: dict[str, Any]) -> list[str]:
+    """Extract Python code and optionally split explicit stage breakpoints."""
+    blocks = _extract_code(content)
+    memory_cfg = dict(config.get("tactile_code_memory", {}))
+    should_split = bool(
+        config.get("split_code_blocks_on_breakpoint", False)
+        or memory_cfg.get("split_code_blocks_on_breakpoint", False)
+    )
+    if not should_split:
+        return blocks
+
+    split_blocks: list[str] = []
+    for block in blocks:
+        parts = re.split(
+            r"(?m)^breakpoint_code_block\(\)\s*(?:#.*)?$",
+            block,
+        )
+        split_blocks.extend(_normalize_extracted_code(part) for part in parts if part.strip())
+    return split_blocks or blocks
 
 
 def _build_log_lines(
@@ -286,6 +309,97 @@ def _save_env_debug_artifacts(
         export_fn(trial_dir)
     except Exception as exc:
         print(f"WARNING: Failed to save environment debug artifacts: {exc}")
+
+
+def _save_tactile_code_memory_trace(
+    config: dict[str, Any],
+    trial: int,
+    info_step: dict[str, Any],
+    reward: float,
+    trace: list[dict[str, Any]],
+) -> None:
+    """Save per-trial tactile code-memory retrieval/debug trace."""
+    memory_cfg = dict(config.get("tactile_code_memory", {}))
+    if not memory_cfg.get("enabled", False) or not memory_cfg.get("save_trace", True):
+        return
+    if not config.get("output_dir"):
+        return
+    trial_dir = _trial_video_dir(config, trial, info_step, reward)
+    try:
+        os.makedirs(trial_dir, exist_ok=True)
+        path = os.path.join(trial_dir, "tactile_code_memory_trace.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(trace, f, indent=2, sort_keys=True)
+    except Exception as exc:
+        print(f"WARNING: Failed to save tactile code memory trace: {exc}")
+
+
+def _build_tactile_code_memory_runtime_context(
+    env: CodeExecutionEnvBase,
+    config: dict[str, Any],
+    *,
+    repair_turn_count: int,
+    trace: list[dict[str, Any]],
+) -> str | None:
+    """Retrieve runtime tactile code memories for multi-turn repair."""
+    memory_cfg = dict(config.get("tactile_code_memory", {}))
+    if not memory_cfg.get("enabled", False):
+        return None
+    if not memory_cfg.get("runtime_retrieval", True):
+        return None
+    if repair_turn_count >= int(memory_cfg.get("max_repair_turns", 2)):
+        return None
+
+    try:
+        from capx.memory.tactile_code import (
+            TactileCodeMemoryBank,
+            build_current_signature_from_env,
+            format_runtime_memory_for_prompt,
+        )
+
+        signature = build_current_signature_from_env(
+            env,
+            window=int(memory_cfg.get("window", 20)),
+        )
+        if signature is None:
+            return None
+        required_apis = list(getattr(getattr(env, "cfg", None), "apis", []))
+        records = TactileCodeMemoryBank(memory_cfg.get("path")).retrieve(
+            capability=str(memory_cfg.get("capability", "grasp_stabilization")),
+            current_signature=signature,
+            required_apis=required_apis,
+            top_k=int(memory_cfg.get("top_k_runtime", 2)),
+            statuses=list(memory_cfg.get("statuses", ["validated"])),
+            include_scores=True,
+        )
+        entry = {
+            "kind": "runtime_retrieval",
+            "repair_turn_count": repair_turn_count,
+            "signature": signature,
+            "matches": [
+                {
+                    "id": record.get("id"),
+                    "score": record.get("_score"),
+                    "diagnosis": record.get("diagnosis"),
+                    "status": record.get("status"),
+                }
+                for record in records
+            ],
+            "prompt_injected": bool(records),
+        }
+        trace.append(entry)
+        print(
+            "[tactile-code-memory] runtime retrieval "
+            f"matches={len(records)} repair_turn={repair_turn_count}",
+            flush=True,
+        )
+        if not records:
+            return None
+        return format_runtime_memory_for_prompt(signature, records)
+    except Exception as exc:
+        trace.append({"kind": "runtime_retrieval_error", "error": repr(exc)})
+        print(f"WARNING: tactile code memory runtime retrieval failed: {exc}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +724,8 @@ def _handle_multi_turn_step(
     turn_frames: list[np.ndarray] | None = None,
     wrist_turn_frames: list[np.ndarray] | None = None,
     wrist_base64_history: list[str] | None = None,
+    tactile_code_memory_trace: list[dict[str, Any]] | None = None,
+    repair_turn_count: int = 0,
 ) -> tuple[str, str | None, str | None, dict | None, list | None]:
     """Execute one multi-turn decision step.
 
@@ -629,11 +745,28 @@ def _handle_multi_turn_step(
     use_wrist = config.get("use_wrist_camera", False)
 
     executed_code = "\n".join(code_blocks[:code_block_idx])
+    remaining_code = "\n\n".join(code_blocks[code_block_idx:])
     complete_multi_turn_prompt = multi_turn_prompt.format(
         executed_code=executed_code,
         console_stdout=info_step["stdout"],
         console_stderr=info_step["stderr"],
     )
+    if remaining_code.strip():
+        complete_multi_turn_prompt = (
+            f"{complete_multi_turn_prompt}\n\n"
+            "Remaining existing code blocks. Answer CONTINUE to run the next "
+            "one unchanged, or REGENERATE to replace all remaining code:\n"
+            f"```python\n{remaining_code}\n```"
+        )
+    if tactile_code_memory_trace is not None:
+        memory_context = _build_tactile_code_memory_runtime_context(
+            env,
+            config,
+            repair_turn_count=repair_turn_count,
+            trace=tactile_code_memory_trace,
+        )
+        if memory_context:
+            complete_multi_turn_prompt = f"{complete_multi_turn_prompt}\n\n{memory_context}"
 
     if info_step["stderr"] != "":
         stderr_history.append(info_step["stderr"])
@@ -692,6 +825,10 @@ def _handle_multi_turn_step(
         )
 
     # Query model
+    print(
+        f"[capx-trial] multi-turn decision query begin after_block={code_block_idx}",
+        flush=True,
+    )
     multiturn_ensemble_entry = None
     if config["use_parallel_ensemble"]:
         if config.get("use_multimodel", False):
@@ -709,6 +846,16 @@ def _handle_multi_turn_step(
 
     reasoning = content["reasoning"]
     decision, new_code = _parse_multi_turn_decision(content["content"])
+    print(
+        f"[capx-trial] multi-turn decision query end decision={decision}",
+        flush=True,
+    )
+    if tactile_code_memory_trace:
+        latest = tactile_code_memory_trace[-1]
+        if latest.get("kind") == "runtime_retrieval":
+            latest["decision"] = decision
+            if new_code and decision == "regenerate":
+                latest["generated_repair_code"] = new_code
 
     return decision, new_code, reasoning, multiturn_ensemble_entry, decision_prompt
 
@@ -781,6 +928,7 @@ def _run_single_trial(
     sandbox_rc_override = None
     ensemble_data = None
     multiturn_ensemble_data: list[dict[str, Any]] = []
+    tactile_code_memory_trace: list[dict[str, Any]] = []
 
     # Per-turn frame tracking (for video differencing and per-turn video saving)
     turn_frame_ranges: list[tuple[int, int]] = []
@@ -851,10 +999,11 @@ def _run_single_trial(
             "num_code_blocks": 0,
             "ensemble_data": ensemble_data,
             "multiturn_ensemble_data": multiturn_ensemble_data,
+            "tactile_code_memory_trace": tactile_code_memory_trace,
         })
 
     # Parse initial code into blocks
-    initial_blocks = _extract_code(raw_code)
+    initial_blocks = _extract_configured_code_blocks(raw_code, config)
     code_blocks.extend(initial_blocks)
     code_block_metadata.extend([{"generation": 0, "regenerated": False}] * len(initial_blocks))
     all_responses.append({
@@ -900,6 +1049,13 @@ def _run_single_trial(
 
         obs = obs_next
 
+        if terminated or bool(info_step.get("task_completed", False)):
+            print(
+                "[capx-trial] task completed after code block; stopping further blocks",
+                flush=True,
+            )
+            break
+
         # Multi-turn decision
         if multi_turn_prompt:
             if "terminated episode" in info_step["stderr"]:
@@ -924,6 +1080,8 @@ def _run_single_trial(
                 turn_frames=turn_frames,
                 wrist_turn_frames=wrist_turn_frames,
                 wrist_base64_history=wrist_base64_history,
+                tactile_code_memory_trace=tactile_code_memory_trace,
+                repair_turn_count=num_regenerations,
             )
 
             if mt_ensemble is not None:
@@ -931,8 +1089,22 @@ def _run_single_trial(
                 multiturn_ensemble_data.append(mt_ensemble)
 
             if decision == "regenerate":
+                max_regenerations = int(config.get("max_regenerations", MULTITURN_LIMIT))
+                if num_regenerations >= max_regenerations:
+                    all_responses.append({
+                        "multi_turn_prompt": decision_prompt if config.get("save_multiturn_prompts", False) else None,
+                        "block_idx": [code_block_idx],
+                        "code_blocks": [],
+                        "decision": "regenerate_skipped_max",
+                        "reasoning": mt_reasoning if mt_reasoning is not None else "",
+                    })
+                    print(
+                        "Model chose to regenerate code, but max_regenerations "
+                        f"({max_regenerations}) was reached"
+                    )
+                    break
                 print("Model chose to regenerate code")
-                new_blocks = _extract_code(new_code)
+                new_blocks = _extract_configured_code_blocks(new_code, config)
                 all_responses.append({
                     "multi_turn_prompt": decision_prompt if config.get("save_multiturn_prompts", False) else None,
                     "block_idx": [code_block_idx],
@@ -962,6 +1134,15 @@ def _run_single_trial(
                 if partial_artifacts is not None:
                     partial_artifacts["num_finishes"] = num_finishes
                 break
+            elif decision == "continue":
+                all_responses.append({
+                    "multi_turn_prompt": decision_prompt if config.get("save_multiturn_prompts", False) else None,
+                    "block_idx": [code_block_idx],
+                    "code_blocks": [],
+                    "decision": "continue",
+                    "reasoning": mt_reasoning if mt_reasoning is not None else "",
+                })
+                print("Model chose to continue")
 
         print(f"Code block {code_block_idx} done")
         print(f"Number of code blocks: {len(code_blocks)}")
@@ -1023,6 +1204,18 @@ def _run_single_trial(
         _save_trial_video(env, config, trial, info_step, reward, num_code_blocks)
     _save_tactile_artifacts(env, config, trial, info_step, reward)
     _save_env_debug_artifacts(env, config, trial, info_step, reward)
+    for entry in tactile_code_memory_trace:
+        if entry.get("kind") == "runtime_retrieval":
+            entry["final_reward"] = reward
+            entry["task_completed"] = bool(info_step.get("task_completed", False))
+            entry["sandbox_rc"] = int(info_step.get("sandbox_rc", 1))
+    _save_tactile_code_memory_trace(
+        config,
+        trial,
+        info_step,
+        reward,
+        tactile_code_memory_trace,
+    )
 
     success = info_step["sandbox_rc"] == 0
 

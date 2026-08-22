@@ -13,6 +13,7 @@ env/
 .capx_skills.json
 .capx_tactile_strategies.jsonl
 .capx_tactile_strategies.jsonl.lock
+.capx_tactile_code_memory/
 .pytest_cache/
 .ruff_cache/
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import os
 import signal
+import subprocess
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -23,6 +24,7 @@ from capx.envs.trial import (
     _annotate_code_blocks,
     _build_log_lines,
     _run_single_trial,
+    _save_tactile_code_memory_trace,
 )
 from capx.utils.launch_utils import (
     TrialSummary,
@@ -66,7 +68,7 @@ def _start_api_servers(
                     if s.connect_ex((host, int(port))) == 0:
                         print(f"API server on {host}:{port} already running, skipping")
                         continue
-            proc = run_server_proc(api_server)
+            proc = _run_api_server(api_server)
             procs.append(proc)
             print(f"API server {api_server} started")
             if port is not None:
@@ -88,11 +90,56 @@ def _start_api_servers(
     return procs
 
 
+def _run_api_server(api_server: dict[str, Any]):
+    """Start an API server, optionally in a dedicated Python environment."""
+    server_python = os.getenv("CAPX_API_SERVER_PYTHON")
+    if not server_python:
+        return run_server_proc(api_server)
+
+    target = str(api_server.get("_target_", ""))
+    if target.endswith(".main"):
+        module = target[: -len(".main")]
+    else:
+        module = target
+    if not module:
+        raise ValueError(f"API server config missing _target_: {api_server}")
+
+    cmd = [server_python, "-m", module]
+    for key, value in api_server.items():
+        if key == "_target_" or value is None:
+            continue
+        flag = "--" + key.replace("_", "-")
+        if isinstance(value, bool):
+            if value:
+                cmd.append(flag)
+        else:
+            cmd.extend([flag, str(value)])
+
+    env = os.environ.copy()
+    capx_root = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = (
+        f"{capx_root}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else capx_root
+    )
+    print(
+        "[capx-runner] starting API server with "
+        f"python={server_python} module={module}",
+        flush=True,
+    )
+    return subprocess.Popen(cmd, env=env)
+
+
 def _stop_api_servers(server_procs: list) -> None:
     """Terminate API server sub-processes."""
     for proc in server_procs:
         proc.terminate()
-        proc.join(timeout=5.0)
+        if hasattr(proc, "join"):
+            proc.join(timeout=5.0)
+        else:
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +353,9 @@ def _run_single_trial_with_timeout(
 
     previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(timeout_seconds)
+    set_deadline = getattr(env, "set_trial_deadline", None)
+    if callable(set_deadline):
+        set_deadline(max(1, timeout_seconds - 2))
     partial_artifacts: dict[str, Any] = {}
     try:
         return _run_single_trial(
@@ -329,6 +379,9 @@ def _run_single_trial_with_timeout(
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)
+        clear_deadline = getattr(env, "clear_trial_deadline", None)
+        if callable(clear_deadline):
+            clear_deadline()
 
 
 def _build_timeout_summary(
@@ -376,6 +429,9 @@ def _build_timeout_summary(
         ensemble_data=pa.get("ensemble_data"),
         multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
     )
+    trace = pa.get("tactile_code_memory_trace", [])
+    if isinstance(trace, list):
+        _save_tactile_code_memory_trace(config, trial, info_step, reward, trace)
 
     return TrialSummary(
         trial=trial,

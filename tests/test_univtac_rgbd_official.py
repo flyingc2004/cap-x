@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import yaml
 
+from capx.envs.tasks.exceptions import RecoverableTaskFailure
 from capx.envs.simulators.univtac import UniVTACLowLevelEnv
 from capx.integrations.univtac.franka_compat_api import UniVTACFrankaCompatApi
 from capx.integrations.univtac.rgbd_perception import (
@@ -89,6 +90,121 @@ def test_rgbd_perception_failures_do_not_fallback(monkeypatch) -> None:
     )
     with pytest.raises(RuntimeError, match="invalid grasps"):
         perception.estimate_grasp(_frame(), "can")
+
+
+def test_rgbd_regrasp_failure_can_use_official_anchor_fallback() -> None:
+    class Env:
+        def __init__(self) -> None:
+            self.api_configs = {
+                "franka_control_api": {
+                    "rgbd_perception_enabled": True,
+                    "official_anchor_fallback_enabled": True,
+                    "official_anchor_fallback_objects": ["can"],
+                    "object_pose_names": {"can": "can"},
+                    "perception_prompt_map": {"can": "cylindrical can"},
+                    "perception_prompt_fallbacks": {"can": ["can"]},
+                    "perception_retry_attempts": 1,
+                }
+            }
+            self.artifacts = []
+
+        def get_rgbd_frame(self, camera_name):
+            return _frame(valid_depth=False)
+
+        def append_perception_artifact(self, record):
+            self.artifacts.append(record)
+
+        def get_public_grasp_pose(self, object_name, *, grasp_height):
+            assert object_name == "can"
+            return (
+                np.array([0.55, 0.0, grasp_height], dtype=np.float32),
+                np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            )
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    pos, quat = api.sample_grasp_pose("can")
+
+    np.testing.assert_allclose(pos, [0.55, 0.0, 0.04], atol=1e-6)
+    np.testing.assert_allclose(quat, [1.0, 0.0, 0.0, 0.0], atol=1e-6)
+    assert env.artifacts[-1]["source"] == "official_anchor_fallback"
+    assert env.artifacts[-1]["used_for_control"] is True
+
+
+def test_rgbd_object_pose_failure_does_not_use_official_anchor_fallback() -> None:
+    class Env:
+        def __init__(self) -> None:
+            self.api_configs = {
+                "franka_control_api": {
+                    "rgbd_perception_enabled": True,
+                    "official_anchor_fallback_enabled": True,
+                    "official_anchor_fallback_objects": ["can"],
+                    "object_pose_names": {"can": "can"},
+                    "perception_prompt_map": {"can": "cylindrical can"},
+                    "perception_retry_attempts": 1,
+                }
+            }
+            self.artifacts = []
+
+        def get_rgbd_frame(self, camera_name):
+            return _frame(valid_depth=False)
+
+        def append_perception_artifact(self, record):
+            self.artifacts.append(record)
+
+        def get_public_grasp_pose(self, object_name, *, grasp_height):
+            return (
+                np.array([0.55, 0.0, grasp_height], dtype=np.float32),
+                np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            )
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    with pytest.raises(RecoverableTaskFailure) as exc_info:
+        api.get_object_pose("can")
+
+    assert exc_info.value.reason == "rgbd_pose_unavailable"
+    assert env.artifacts
+    assert all(record["source"] != "official_anchor_fallback" for record in env.artifacts)
+
+
+def test_goto_pose_api_action_limit_blocks_before_physical_action() -> None:
+    class Env:
+        api_configs = {
+            "franka_control_api": {
+                "min_safe_z": 0.0,
+                "max_delta_xyz": 0.01,
+                "max_goto_pose_actions": 3,
+                "preserve_landmark_orientation": False,
+            }
+        }
+        task = None
+
+        def __init__(self) -> None:
+            self.actions = []
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.0, 0.0, 0.2],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+            }
+
+        def take_action(self, action, *, action_type):
+            self.actions.append((np.asarray(action), action_type))
+            return {"ok": True}
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    result = api.goto_pose(
+        np.array([0.10, 0.0, 0.2], dtype=np.float32),
+        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "api_action_limit"
+    assert result["requested_actions"] > result["max_api_actions"]
+    assert result["max_api_actions"] == 3
+    assert env.actions == []
 
 
 def test_official_compat_uses_rgbd_and_never_reads_task_can() -> None:
@@ -243,13 +359,22 @@ def test_official_yaml_uses_native_protocol_without_privileged_pose() -> None:
     assert franka["use_native_pose_planner"] is False
     assert franka["use_task_grasp_actor_for_objects"] is False
     assert franka["record_perception_diagnostic"] is True
+    assert franka["official_anchor_fallback_enabled"] is True
+    assert franka["official_anchor_fallback_objects"] == ["can"]
+    assert franka["max_goto_pose_actions"] == 40
+    assert franka["max_home_pose_actions"] == 15
+    assert franka["max_native_pose_actions"] == 2
+    assert franka["max_gripper_servo_steps"] == 200
+    assert franka["max_gripper_settle_steps"] == 20
     assert franka["home_pose_relative_lift"] is True
     assert franka["home_lift_delta_z"] == pytest.approx(0.10)
     assert franka["max_delta_xyz"] == pytest.approx(0.01)
-    assert "api_servers" not in config
+    assert "api_servers" in config
     assert "home_pose()" in cfg["prompt"]
     assert "bounded 0.01 meter steps" in cfg["prompt"]
     assert "Do not command a wrist rotation" in cfg["prompt"]
+    assert "official public pre-grasp anchor" in cfg["prompt"]
+    assert "Each high-level motion API is bounded" in cfg["prompt"]
     assert "relative=True" not in cfg["prompt"]
 
     task_config = yaml.safe_load(

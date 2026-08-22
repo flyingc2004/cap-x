@@ -1,0 +1,105 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/UniVTAC
+      task_name: lift_can
+      task_config: smoke_capx_lift_can_official
+      seed_base: 0
+      device: cuda:0
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.10
+          max_delta_xyz: 0.01
+          default_z_approach: 0.08
+          home_pose_relative_lift: true
+          home_lift_delta_z: 0.10
+          preserve_landmark_orientation: false
+          use_task_grasp_actor_for_landmarks: false
+          use_task_grasp_actor_for_objects: true
+          use_native_pose_planner: false
+          record_perception_diagnostic: true
+          official_anchor_fallback_enabled: true
+          official_anchor_fallback_objects:
+            - can
+          max_goto_pose_actions: 40
+          max_home_pose_actions: 15
+          max_native_pose_actions: 2
+          max_gripper_servo_steps: 200
+          max_gripper_settle_steps: 20
+          lift_after_close: false
+          gripper_settle_steps: 10
+          open_gripper_width: 1.0
+          tactile_adaptive_gripper_enabled: true
+          rgbd_perception_enabled: false
+          perception_camera: head
+          perception_prompt_map:
+            can: cylindrical can
+          perception_prompt_fallbacks:
+            can:
+              - can
+              - cylindrical object
+              - small cylinder
+          perception_retry_attempts: 2
+          sam3_service_url: http://127.0.0.1:8114
+          graspnet_service_url: http://127.0.0.1:8115
+          perception_timeout_seconds: 120
+          perception_min_depth_points: 32
+          grasp_local_z_offset: 0.12
+          adaptive_gripper:
+            coarse_qpos_step: 0.0005
+            fine_qpos_step: 0.00005
+            contact_debounce_frames: 2
+            stable_debounce_frames: 3
+            release_debounce_frames: 2
+            settle_steps_per_command: 1
+            contact_force_threshold: 0.08
+            depth_contact_margin_mm: 0.5
+          object_pose_names:
+            can: can
+            object: can
+            target object: can
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis:
+      - FrankaControlApi
+      - UniVTACTactileApi
+    prompt: |
+      You are controlling a Franka robot in the UniVTAC lift_can benchmark.
+      Goal: make the cylindrical can finish upright on the table using only public robot and UniVTAC native tactile APIs.
+      Public object name: "can". sample_grasp_pose("can") returns UniVTAC's public official can grasp anchor; use it only as an anchor, not as hidden success information.
+      Use only FrankaControlApi and UniVTACTactileApi. Do not call low-level move_delta_ee, move_ee, or move_qpos functions.
+      Keep physical programs short and staged. Use current tactile feedback before and after actions that depend on contact.
+      If staged execution is useful, write breakpoint_code_block() on its own top-level line with zero indentation. Do not put it inside a function, loop, or if block.
+      Never inspect task actors, metadata, private labels, reward, success, task_completed, or trial id. Do not load or call ACT or ViTAL policies.
+      Let expected failures reach program end normally. Do not call exit, quit, assert, or raise an exception.
+    multi_turn_prompt: |
+      Executed code:
+      {executed_code}
+
+      Console stdout:
+      {console_stdout}
+
+      Console stderr:
+      {console_stderr}
+
+      Decide whether to CONTINUE with the next existing code block, REGENERATE a concise corrective Python block using only public APIs, or FINISH if no further action is needed.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/univtac_lift_can_tactile_minimal
+trial_timeout_seconds: 300
+max_trial_retries: 1
+save_multiturn_prompts: true
+tactile_code_memory:
+  enabled: false
+  mode: read
+  path: .capx_tactile_code_memory/lift_can_v1/bank.jsonl
+  top_k_initial: 0
+  top_k_runtime: 0
+  runtime_retrieval: false
+  max_repair_turns: 0

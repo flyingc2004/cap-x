@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import requests
 from PIL import Image
+from scipy.ndimage import binary_dilation
 from scipy.spatial.transform import Rotation as SciRotation
 
 
@@ -78,6 +79,23 @@ class GraspEstimate:
     prompt: str
 
 
+class RgbdPerceptionError(RuntimeError):
+    """Structured RGB-D perception failure for retry and artifact logging."""
+
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        diagnostics: dict[str, Any] | None = None,
+        mask: np.ndarray | None = None,
+    ) -> None:
+        self.reason = str(reason)
+        self.diagnostics = dict(diagnostics or {})
+        self.mask = None if mask is None else np.asarray(mask, dtype=bool)
+        super().__init__(message)
+
+
 class UniVTACRgbdPerception:
     """Original CaP-style SAM3 and Contact-GraspNet RGB-D pipeline."""
 
@@ -89,23 +107,34 @@ class UniVTACRgbdPerception:
         request_timeout_seconds: float = 120.0,
         min_depth_points: int = 32,
         grasp_local_z_offset: float = 0.12,
+        mask_dilation_radii: tuple[int, ...] | list[int] = (0, 2, 4, 8),
     ) -> None:
         self.sam3_url = sam3_url.rstrip("/")
         self.graspnet_url = graspnet_url.rstrip("/")
         self.request_timeout_seconds = float(request_timeout_seconds)
         self.min_depth_points = max(4, int(min_depth_points))
         self.grasp_local_z_offset = float(grasp_local_z_offset)
+        radii = [max(0, int(radius)) for radius in mask_dilation_radii]
+        self.mask_dilation_radii = tuple(dict.fromkeys(radii or [0]))
 
     def estimate_object(self, frame: RgbdFrame, prompt: str) -> ObjectEstimate:
         frame = frame.validated()
         mask, score = self._segment(frame.rgb, prompt)
-        points_world = self.masked_points_world(frame, mask)
-        position, quaternion, extent = _oriented_bounding_box(points_world)
+        points_world, depth_mask, _diagnostics = self.masked_points_world_with_mask(frame, mask)
+        try:
+            position, quaternion, extent = _oriented_bounding_box(points_world)
+        except RuntimeError as exc:
+            raise RgbdPerceptionError(
+                "rgbd_obb_failed",
+                str(exc),
+                diagnostics={"points_world": int(len(points_world))},
+                mask=depth_mask,
+            ) from exc
         return ObjectEstimate(
             position=position.astype(np.float32),
             quaternion_wxyz=quaternion.astype(np.float32),
             extent=extent.astype(np.float32),
-            mask=mask,
+            mask=depth_mask,
             points_world=points_world.astype(np.float32),
             score=float(score),
             prompt=str(prompt),
@@ -115,17 +144,38 @@ class UniVTACRgbdPerception:
         frame = frame.validated()
         mask, _score = self._segment(frame.rgb, prompt)
         # Validate masked depth before invoking the heavier grasp service.
-        points_world = self.masked_points_world(frame, mask)
-        object_position, object_quaternion, object_extent = _oriented_bounding_box(
-            points_world
-        )
-        grasps, scores = self._request_grasps(frame.depth, frame.intrinsics, mask)
+        points_world, depth_mask, _diagnostics = self.masked_points_world_with_mask(frame, mask)
+        try:
+            object_position, object_quaternion, object_extent = _oriented_bounding_box(
+                points_world
+            )
+        except RuntimeError as exc:
+            raise RgbdPerceptionError(
+                "rgbd_obb_failed",
+                str(exc),
+                diagnostics={"points_world": int(len(points_world))},
+                mask=depth_mask,
+            ) from exc
+        grasps, scores = self._request_grasps(frame.depth, frame.intrinsics, depth_mask)
         grasps = np.asarray(grasps, dtype=np.float64)
         scores = np.asarray(scores, dtype=np.float64).reshape(-1)
         if grasps.ndim != 3 or grasps.shape[1:] != (4, 4) or len(grasps) == 0:
-            raise RuntimeError(f"Contact-GraspNet returned invalid grasps shape {grasps.shape}")
+            raise RgbdPerceptionError(
+                "graspnet_invalid_grasps",
+                f"Contact-GraspNet returned invalid grasps shape {grasps.shape}",
+                diagnostics={"grasps_shape": tuple(int(v) for v in grasps.shape)},
+                mask=depth_mask,
+            )
         if scores.size != len(grasps) or not np.any(np.isfinite(scores)):
-            raise RuntimeError("Contact-GraspNet returned invalid grasp scores")
+            raise RgbdPerceptionError(
+                "graspnet_invalid_scores",
+                "Contact-GraspNet returned invalid grasp scores",
+                diagnostics={
+                    "scores_shape": tuple(int(v) for v in scores.shape),
+                    "grasps_count": int(len(grasps)),
+                },
+                mask=depth_mask,
+            )
         selected_index = int(np.nanargmax(scores))
         grasp_camera = grasps[selected_index].copy()
         offset = np.eye(4, dtype=np.float64)
@@ -137,7 +187,7 @@ class UniVTACRgbdPerception:
         return GraspEstimate(
             position=grasp_world[:3, 3].astype(np.float32),
             quaternion_wxyz=quaternion.astype(np.float32),
-            mask=mask,
+            mask=depth_mask,
             points_world=points_world.astype(np.float32),
             object_position=object_position.astype(np.float32),
             object_quaternion_wxyz=object_quaternion.astype(np.float32),
@@ -149,18 +199,61 @@ class UniVTACRgbdPerception:
         )
 
     def masked_points_world(self, frame: RgbdFrame, mask: np.ndarray) -> np.ndarray:
+        points_world, _mask, _diagnostics = self.masked_points_world_with_mask(frame, mask)
+        return points_world
+
+    def masked_points_world_with_mask(
+        self,
+        frame: RgbdFrame,
+        mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
         frame = frame.validated()
         mask = np.asarray(mask, dtype=bool).squeeze()
         if mask.shape != frame.depth.shape:
-            raise RuntimeError(
-                f"SAM3 mask shape {mask.shape} does not match depth shape {frame.depth.shape}"
+            raise RgbdPerceptionError(
+                "mask_depth_shape_mismatch",
+                f"SAM3 mask shape {mask.shape} does not match depth shape {frame.depth.shape}",
+                diagnostics={
+                    "mask_shape": tuple(int(v) for v in mask.shape),
+                    "depth_shape": tuple(int(v) for v in frame.depth.shape),
+                },
+                mask=mask,
             )
-        valid = mask & np.isfinite(frame.depth) & (frame.depth > 0.01) & (frame.depth < 20.0)
+        base_valid_depth = np.isfinite(frame.depth) & (frame.depth > 0.01) & (frame.depth < 20.0)
+        best_mask = mask
+        best_valid_count = 0
+        best_radius = 0
+        for radius in self.mask_dilation_radii:
+            candidate = mask if radius <= 0 else binary_dilation(mask, iterations=radius)
+            valid = candidate & base_valid_depth
+            valid_count = int(np.count_nonzero(valid))
+            if valid_count > best_valid_count:
+                best_mask = np.asarray(candidate, dtype=bool)
+                best_valid_count = valid_count
+                best_radius = int(radius)
+            if valid_count >= self.min_depth_points:
+                best_mask = np.asarray(candidate, dtype=bool)
+                best_valid_count = valid_count
+                best_radius = int(radius)
+                break
+        valid = best_mask & base_valid_depth
         ys, xs = np.nonzero(valid)
         if len(xs) < self.min_depth_points:
-            raise RuntimeError(
+            diagnostics = {
+                "valid_depth_points": int(len(xs)),
+                "min_depth_points": int(self.min_depth_points),
+                "mask_area_px": int(np.count_nonzero(mask)),
+                "dilated_mask_area_px": int(np.count_nonzero(best_mask)),
+                "dilation_radius": int(best_radius),
+                "finite_depth_px": int(np.count_nonzero(np.isfinite(frame.depth))),
+                "positive_depth_px": int(np.count_nonzero(base_valid_depth)),
+            }
+            raise RgbdPerceptionError(
+                "insufficient_depth_points",
                 f"RGB-D detection has only {len(xs)} valid depth points; "
-                f"requires at least {self.min_depth_points}"
+                f"requires at least {self.min_depth_points}",
+                diagnostics=diagnostics,
+                mask=best_mask,
             )
         z = frame.depth[ys, xs].astype(np.float64)
         k = frame.intrinsics
@@ -172,10 +265,20 @@ class UniVTACRgbdPerception:
             )
         )
         world_from_camera = _camera_to_world_matrix(frame)
-        return (
+        points_world = (
             points_camera @ world_from_camera[:3, :3].T
             + world_from_camera[:3, 3]
         )
+        diagnostics = {
+            "valid_depth_points": int(len(xs)),
+            "min_depth_points": int(self.min_depth_points),
+            "mask_area_px": int(np.count_nonzero(mask)),
+            "dilated_mask_area_px": int(np.count_nonzero(best_mask)),
+            "dilation_radius": int(best_radius),
+            "finite_depth_px": int(np.count_nonzero(np.isfinite(frame.depth))),
+            "positive_depth_px": int(np.count_nonzero(base_valid_depth)),
+        }
+        return points_world, best_mask, diagnostics
 
     def _segment(self, rgb: np.ndarray, prompt: str) -> tuple[np.ndarray, float]:
         payload = {
@@ -191,9 +294,15 @@ class UniVTACRgbdPerception:
             response.raise_for_status()
             results = response.json().get("results", [])
         except (requests.RequestException, ValueError) as exc:
-            raise RuntimeError(f"SAM3 request failed: {exc}") from exc
+            raise RgbdPerceptionError(
+                "sam3_request_failed",
+                f"SAM3 request failed: {exc}",
+            ) from exc
         if not results:
-            raise RuntimeError(f"SAM3 returned no detection for {prompt!r}")
+            raise RgbdPerceptionError(
+                "sam3_no_detection",
+                f"SAM3 returned no detection for {prompt!r}",
+            )
         best = max(results, key=lambda item: float(item.get("score", 0.0)))
         try:
             shape = tuple(int(v) for v in best["shape"])
@@ -202,7 +311,10 @@ class UniVTACRgbdPerception:
                 dtype=np.uint8,
             ).reshape(shape)
         except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(f"SAM3 returned an invalid mask: {exc}") from exc
+            raise RgbdPerceptionError(
+                "sam3_invalid_mask",
+                f"SAM3 returned an invalid mask: {exc}",
+            ) from exc
         return np.asarray(mask, dtype=bool).squeeze(), float(best.get("score", 0.0))
 
     def _request_grasps(
@@ -235,7 +347,10 @@ class UniVTACRgbdPerception:
             grasps = _decode_npy(data["grasps_base64"])
             scores = _decode_npy(data["scores_base64"])
         except (requests.RequestException, KeyError, ValueError) as exc:
-            raise RuntimeError(f"Contact-GraspNet request failed: {exc}") from exc
+            raise RgbdPerceptionError(
+                "graspnet_request_failed",
+                f"Contact-GraspNet request failed: {exc}",
+            ) from exc
         return grasps, scores
 
 
