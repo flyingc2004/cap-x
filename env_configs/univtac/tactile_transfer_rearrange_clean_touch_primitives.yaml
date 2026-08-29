@@ -10,10 +10,12 @@ env:
       seed_base: 0
       device: cuda:0
       task_config_overrides:
-        skip_task_pre_move: true
-        record_video_during_reset: false
-        record_pre_move_frames: false
+        skip_task_pre_move: false
+        record_video_during_reset: true
+        record_pre_move_frames: true
         record_action_frames: true
+        record_action_tactile: true
+        video_frame_stride: 2
       api_configs:
         touch_manipulation_api:
           max_delta_xyz: 0.012
@@ -38,14 +40,40 @@ env:
       - UniVTACTactileApi
     prompt: |
       You are controlling a Franka robot in the UniVTAC tactile_transfer_rearrange_clean benchmark.
-      Move object A from pickup_a_region to slot_a_region, then move object B from pickup_b_region to slot_b_region.
+
+      Task goal:
+      Move object A from pickup_a_region to slot_a_region, then move object B from pickup_b_region to slot_b_region. The order matters: finish object A before object B.
+
+      Initialization:
+      The UniVTAC task pre_move has already moved the gripper near object A. This pre_move is only an approach anchor; it does not close the gripper, does not grasp the object, and does not solve the task. Start by using tactile feedback to establish a real grasp.
+
+      Execution rule:
       Your Python code is executed once as a script. Do not only define functions or plans. If you define solve(), call solve() at the end of the code block.
-      Check primitive return values. If a primitive returns ok=False, make one concise tactile recovery attempt before moving to the next phase.
-      Use list_regions() and get_region() to inspect public coarse regions. Regions are not live object poses.
-      For each object, use tactile primitives to move to the pickup region, search for contact, center by tactile feedback, close until stable, guarded lift, transport to the matching slot region, and release when supported.
-      After object A is placed, camera observations may be masked by the environment; continue using public regions, robot state inside the primitives, and UniVTAC native tactile feedback.
-      Do not call legacy object-pose, grasp-pose, direct pose-control, gripper-control, or low-level robot-control APIs.
-      Do not read reward, success, task_completed, metadata, material class, density, friction, live actor pose, or trial id.
+
+      Public information:
+      Use list_regions() and get_region() only to inspect public coarse regions. Regions are not live object poses. They describe pickup/search areas and placement slots, not exact object tracking.
+
+      Object A procedure:
+      1. Use the current pre_move pose as the starting point near object A.
+      2. Use search_contact(region="pickup_a_region") only if tactile contact is not already usable.
+      3. Use center_by_tactile() to improve bilateral contact.
+      4. Use close_until_stable(target_force=0.7, max_steps=180).
+      5. Continue only when the close result reports stable=True or a fresh tactile summary reports stable bilateral contact.
+      6. Use guarded_lift(height=0.06, abort_on_slip=True).
+      7. Use transport_to_region("slot_a_region", monitor_tactile=True).
+      8. Use release_when_supported("slot_a_region"), then wait briefly for settling.
+
+      Object B procedure:
+      After object A is released, move to pickup_b_region and repeat the same tactile closed-loop process for object B, then release it at slot_b_region. Camera observations may be masked during object B, so rely on public regions and UniVTAC native tactile feedback.
+
+      Recovery:
+      Check every primitive return value. If search, close, lift, transport, or release returns ok=False, make at most one concise tactile recovery attempt for the same object. Do not proceed to transport unless a stable grasp was verified. Do not retry by reading private object pose.
+
+      Allowed actions:
+      Use only UniVTACTouchManipulationApi primitives and UniVTAC native tactile functions. Do not call legacy object-pose, grasp-pose, direct pose-control, gripper-control, or low-level robot-control APIs. Do not call env.take_action directly.
+
+      Forbidden information:
+      Do not read reward, success, task_completed, metadata, material class, density, friction, live actor pose, trial id, env.task, env._task, or other private simulator fields. Do not load or call UniVTAC ACT or ViTAL policies.
     multi_turn_prompt: |
       Executed code:
       {executed_code}
@@ -60,10 +88,10 @@ env:
 trials: 1
 num_workers: 1
 record_video: true
-output_dir: ./outputs/univtac_tactile_transfer_rearrange_clean_touch_primitives
-trial_timeout_seconds: 600
+output_dir: ./outputs/univtac_tactile_transfer_rearrange_clean_touch_primitives_premove
+trial_timeout_seconds: 900
 max_trial_retries: 1
-max_regenerations: 1
+max_regenerations: 0
 save_multiturn_prompts: true
 tactile_code_memory:
   enabled: false

@@ -495,3 +495,16 @@ def test_code_execution_does_not_double_call_explicit_solve() -> None:
     assert result["ok"] is True
     assert env._exec_globals["calls"] == ["ran"]
     assert "auto-calling generated solve()" not in result["stdout"]
+
+
+def test_code_execution_propagates_timeout_to_runner() -> None:
+    env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.low_level_env = SimpleNamespace(get_action_count=lambda: 0, get_step_count=lambda: 0)
+    env._apis = {}
+    env._get_observation = lambda: {}
+    env._exec_globals = {"__name__": "__main__"}
+    env._exec_env_binding = lambda: env.low_level_env
+    env._exec_apis_binding = lambda: {}
+
+    with pytest.raises(TimeoutError):
+        env._exec_user_code("raise TimeoutError('trial timeout')")

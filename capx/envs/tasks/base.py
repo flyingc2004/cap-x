@@ -210,6 +210,10 @@ class CodeExecutionEnvBase(Env):
                 f"reason={exc.reason} message={exc}",
                 file=tee_out,
             )
+        except TimeoutError:
+            raise
+        except KeyboardInterrupt:
+            raise
         except SystemExit as exc:
             # Generated programs may use exit()/quit() to stop an expected
             # fallback branch. A zero/None status is normal completion; retain
