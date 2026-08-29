@@ -1,0 +1,75 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/UniVTAC
+      task_name: tactile_transfer_rearrange_clean
+      task_config: tactile_transfer_clean_smoke
+      seed_base: 0
+      device: cuda:0
+      task_config_overrides:
+        skip_task_pre_move: true
+        record_video_during_reset: false
+        record_pre_move_frames: false
+        record_action_frames: true
+      api_configs:
+        touch_manipulation_api:
+          max_delta_xyz: 0.012
+          search_xy_step: 0.012
+          search_z_step: 0.006
+          center_xy_step: 0.006
+          transport_xy_step: 0.018
+          lift_step: 0.010
+          contact_threshold: 0.15
+          target_force: 0.70
+          stable_debounce_frames: 3
+          coarse_qpos_step: 0.0010
+          fine_qpos_step: 0.0002
+          gripper_settle_steps: 2
+          max_open_steps: 120
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis:
+      - UniVTACTouchManipulationApi
+      - UniVTACTactileApi
+    prompt: |
+      You are controlling a Franka robot in the UniVTAC tactile_transfer_rearrange_clean benchmark.
+      Move object A from pickup_a_region to slot_a_region, then move object B from pickup_b_region to slot_b_region.
+      Your Python code is executed once as a script. Do not only define functions or plans. If you define solve(), call solve() at the end of the code block.
+      Check primitive return values. If a primitive returns ok=False, make one concise tactile recovery attempt before moving to the next phase.
+      Use list_regions() and get_region() to inspect public coarse regions. Regions are not live object poses.
+      For each object, use tactile primitives to move to the pickup region, search for contact, center by tactile feedback, close until stable, guarded lift, transport to the matching slot region, and release when supported.
+      After object A is placed, camera observations may be masked by the environment; continue using public regions, robot state inside the primitives, and UniVTAC native tactile feedback.
+      Do not call legacy object-pose, grasp-pose, direct pose-control, gripper-control, or low-level robot-control APIs.
+      Do not read reward, success, task_completed, metadata, material class, density, friction, live actor pose, or trial id.
+    multi_turn_prompt: |
+      Executed code:
+      {executed_code}
+
+      Console stdout:
+      {console_stdout}
+
+      Console stderr:
+      {console_stderr}
+
+      Decide whether to CONTINUE with the next existing code block, REGENERATE a concise corrective Python block using only public tactile primitive APIs, or FINISH if no further action is needed.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/univtac_tactile_transfer_rearrange_clean_touch_primitives
+trial_timeout_seconds: 600
+max_trial_retries: 1
+max_regenerations: 1
+save_multiturn_prompts: true
+tactile_code_memory:
+  enabled: false
+  mode: read
+  path: .capx_tactile_code_memory/lift_can_v1/bank.jsonl
+  top_k_initial: 0
+  top_k_runtime: 0
+  runtime_retrieval: false
+  max_repair_turns: 0

@@ -1,3 +1,4 @@
+import ast
 import contextlib
 import io
 import sys
@@ -130,7 +131,9 @@ class CodeExecutionEnvBase(Env):
         if cfg.oracle_code is not None:
             self.oracle_code = cfg.oracle_code
         self._system_prompt = (
-            "You are a helpful assistant that generates Python code to directly solve the task."
+            "You are a helpful assistant that generates Python code to directly solve the task. "
+            "The submitted code is executed once as a script, so it must perform actions immediately; "
+            "if it defines a solve() helper, it must also call solve()."
         )
         self._full_prompt = [
             {"role": "system", "content": self._system_prompt},
@@ -183,12 +186,17 @@ class CodeExecutionEnvBase(Env):
         stderr_buffer = io.StringIO()
         tee_err = Tee(sys.stderr, stderr_buffer)
         ok = True
+        previous_solve = self._exec_globals.get("solve")
+        progress_before = self._low_level_progress_marker()
+        should_auto_call_solve = not _has_top_level_solve_call(code)
         try:
             with (
                 contextlib.redirect_stdout(tee_out),
                 contextlib.redirect_stderr(tee_err),
             ):
                 exec(code, self._exec_globals, self._exec_globals)
+                if should_auto_call_solve:
+                    self._auto_call_generated_solve(previous_solve, progress_before)
         except HardStopTrial:
             raise
         except RecoverableTaskFailure as exc:
@@ -220,6 +228,38 @@ class CodeExecutionEnvBase(Env):
             "stderr": stderr_buffer.getvalue(),
             "result": self._exec_globals.get("RESULT"),
         }
+
+    def _auto_call_generated_solve(self, previous_solve: Any, progress_before: tuple[Any, ...]) -> None:
+        """Run a newly defined solve() when the model forgot the top-level call."""
+        solve_fn = self._exec_globals.get("solve")
+        if not callable(solve_fn) or solve_fn is previous_solve:
+            return
+        progress_after = self._low_level_progress_marker()
+        if progress_before and progress_after != progress_before:
+            return
+        print(
+            "[capx-task] auto-calling generated solve(); code defined solve() "
+            "without a top-level solve() call",
+            flush=True,
+        )
+        result = solve_fn()
+        if result is not None and self._exec_globals.get("RESULT") is None:
+            self._exec_globals["RESULT"] = result
+
+    def _low_level_progress_marker(self) -> tuple[Any, ...]:
+        env = getattr(self, "low_level_env", None)
+        marker: list[Any] = []
+        for name in ("get_action_count", "get_step_count", "get_video_frame_count"):
+            getter = getattr(env, name, None)
+            if not callable(getter):
+                continue
+            try:
+                marker.append((name, getter()))
+            except Exception:
+                continue
+        if hasattr(env, "_sim_step_count"):
+            marker.append(("_sim_step_count", getattr(env, "_sim_step_count")))
+        return tuple(marker)
 
     def _init_exec_globals(self) -> None:
         """
@@ -453,6 +493,22 @@ def get_config(name: str) -> CodeExecEnvConfig:
 
 def list_configs() -> list[str]:
     return list(_CONFIG_FACTORIES.keys())
+
+
+def _has_top_level_solve_call(code: str) -> bool:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+
+    def contains_solve_call(node: ast.AST) -> bool:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return False
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "solve":
+            return True
+        return any(contains_solve_call(child) for child in ast.iter_child_nodes(node))
+
+    return any(contains_solve_call(stmt) for stmt in tree.body)
 
 
 __all__ = [

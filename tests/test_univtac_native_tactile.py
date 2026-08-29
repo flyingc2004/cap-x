@@ -20,6 +20,7 @@ from capx.integrations.univtac.native_tactile import (
     tactile_event_sequence,
 )
 from capx.integrations.univtac.tactile_api import UniVTACTactileApi
+from capx.integrations.univtac.touch_manipulation_api import UniVTACTouchManipulationApi
 
 
 def _depth(indented: bool) -> np.ndarray:
@@ -193,6 +194,35 @@ def test_calibrated_depth_uses_robot_far_plane_for_force() -> None:
     assert summary["event"] == "stable_grasp"
 
 
+def test_tiny_depth_spike_is_not_stable_grasp() -> None:
+    left = np.full((16, 16), 34.0, dtype=np.float32)
+    right = np.full((16, 16), 34.0, dtype=np.float32)
+    left[0, 0] = 20.0
+    right[-1, -1] = 20.0
+    frame = UniVTACTactileFrame(
+        step=0,
+        timestamp=0.0,
+        left_depth=left,
+        right_depth=right,
+        left_marker=_marker(0.0),
+        right_marker=_marker(0.0),
+        left_pose=None,
+        right_pose=None,
+    )
+
+    summary = summarize_native_tactile(
+        [frame],
+        depth_far_plane_mm=34.0,
+        force_full_scale_mm=6.5,
+        depth_contact_margin_mm=0.5,
+    )
+
+    assert summary["event"] != "stable_grasp"
+    assert summary["left_contact"] is False
+    assert summary["right_contact"] is False
+    assert summary["normal_force"] < 0.2
+
+
 def test_native_tactile_event_sequence_deduplicates() -> None:
     events = tactile_event_sequence(
         [
@@ -311,6 +341,7 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
 
     assert "UniVTACControlApi" in list_apis()
     assert "UniVTACTactileApi" in list_apis()
+    assert "UniVTACTouchManipulationApi" in list_apis()
     assert "FrankaControlApi" in list_apis()
 
     franka_functions = UniVTACFrankaCompatApi.__new__(UniVTACFrankaCompatApi).functions()
@@ -320,12 +351,27 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
         "goto_pose",
         "open_gripper",
         "close_gripper",
+        "get_robot_state",
         "home_pose",
     }
 
     functions = UniVTACTactileApi.__new__(UniVTACTactileApi).functions()
     assert "get_tactile_summary" in functions
     assert "retrieve_tactile_strategies" not in functions
+
+    touch_functions = UniVTACTouchManipulationApi.__new__(UniVTACTouchManipulationApi).functions()
+    assert set(touch_functions) == {
+        "get_region",
+        "list_regions",
+        "move_to_region",
+        "search_contact",
+        "center_by_tactile",
+        "close_until_stable",
+        "guarded_lift",
+        "transport_to_region",
+        "release_when_supported",
+        "wait_steps",
+    }
 
     config_path = (
         Path(__file__).resolve().parents[1]
@@ -382,6 +428,50 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
         "object": "can",
         "target object": "can",
     }
+
+    transfer_config_path = config_path.with_name(
+        "tactile_transfer_rearrange_clean_tactile.yaml"
+    )
+    transfer_config = yaml.safe_load(transfer_config_path.read_text(encoding="utf-8"))
+    transfer_cfg = transfer_config["env"]["cfg"]
+    transfer_low_level = transfer_cfg["low_level"]
+    transfer_franka = transfer_low_level["api_configs"]["franka_control_api"]
+    assert transfer_low_level["task_name"] == "tactile_transfer_rearrange_clean"
+    assert transfer_low_level["task_config"] == "tactile_transfer_clean_smoke"
+    assert transfer_low_level["expose_actor_pose"] is False
+    assert transfer_low_level["privileged"] is False
+    assert transfer_cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
+    assert transfer_config["tactile_code_memory"]["enabled"] is False
+    assert transfer_config["trial_timeout_seconds"] <= 600
+    assert transfer_config["max_trial_retries"] == 1
+    assert transfer_config["max_regenerations"] <= 1
+    assert transfer_franka["rgbd_perception_enabled"] is False
+    assert transfer_franka["use_task_place_actor_for_landmarks"] is False
+    assert transfer_franka["use_task_grasp_actor_for_objects"] is True
+    assert transfer_franka["max_goto_pose_actions"] <= 35
+    assert transfer_franka["max_gripper_servo_steps"] <= 120
+    assert "current_object" in transfer_franka["object_pose_names"].values()
+    assert "get_robot_state" in transfer_cfg["prompt"]
+    assert 'Do not move back to get_object_pose("current_object")' in transfer_cfg["prompt"]
+    assert "TactileMemoryApi" not in transfer_cfg["apis"]
+
+    touch_config_path = config_path.with_name(
+        "tactile_transfer_rearrange_clean_touch_primitives.yaml"
+    )
+    touch_config = yaml.safe_load(touch_config_path.read_text(encoding="utf-8"))
+    touch_cfg = touch_config["env"]["cfg"]
+    touch_low_level = touch_cfg["low_level"]
+    assert touch_low_level["task_name"] == "tactile_transfer_rearrange_clean"
+    assert touch_low_level["task_config"] == "tactile_transfer_clean_smoke"
+    assert touch_low_level["expose_actor_pose"] is False
+    assert touch_low_level["privileged"] is False
+    assert touch_low_level["task_config_overrides"]["skip_task_pre_move"] is True
+    assert touch_low_level["task_config_overrides"]["record_video_during_reset"] is False
+    assert touch_cfg["apis"] == ["UniVTACTouchManipulationApi", "UniVTACTactileApi"]
+    assert "FrankaControlApi" not in touch_cfg["apis"]
+    assert "get_object_pose" not in touch_cfg["prompt"]
+    assert "sample_grasp_pose" not in touch_cfg["prompt"]
+    assert "live actor pose" in touch_cfg["prompt"]
     assert lift_franka["use_task_grasp_actor_for_objects"] is True
     assert lift_franka["grasp_z_tolerance"] == 0.04
     assert lift_franka["max_delta_xyz"] == 0.01
@@ -417,6 +507,115 @@ def test_lift_can_completion_uses_native_task_check() -> None:
     assert env.task_completed() is True
     native_result["value"] = False
     assert env.task_completed() is False
+
+
+def test_univtac_public_regions_are_sanitized() -> None:
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._task = types.SimpleNamespace(
+        get_public_regions=lambda: {
+            "pickup_a_region": {
+                "kind": "pickup",
+                "center_xy": [0.58, -0.26],
+                "half_extents": [0.05, 0.05],
+                "hover_z": 0.16,
+                "search_z_range": [0.02, 0.16],
+                "density": 2500,
+                "friction": 1.3,
+                "seed": 7,
+                "object_pose": [1, 2, 3, 1, 0, 0, 0],
+            }
+        }
+    )
+
+    region = env.get_public_region("pickup_a")
+
+    assert region["ok"] is True
+    assert region["name"] == "pickup_a_region"
+    assert region["center_xy"] == pytest.approx([0.58, -0.26])
+    assert region["search_z_range"] == pytest.approx([0.02, 0.16])
+    assert "density" not in region
+    assert "friction" not in region
+    assert "seed" not in region
+    assert "object_pose" not in region
+
+
+def test_touch_primitive_close_does_not_accept_tiny_depth_spike() -> None:
+    class Buffer:
+        def recent(self, _window):
+            left = np.full((16, 16), 34.0, dtype=np.float32)
+            right = np.full((16, 16), 34.0, dtype=np.float32)
+            left[0, 0] = 20.0
+            right[-1, -1] = 20.0
+            return [
+                UniVTACTactileFrame(
+                    step=0,
+                    timestamp=0.0,
+                    left_depth=left,
+                    right_depth=right,
+                    left_marker=_marker(0.0),
+                    right_marker=_marker(0.0),
+                    left_pose=None,
+                    right_pose=None,
+                )
+            ]
+
+    class Env:
+        api_configs = {
+            "touch_manipulation_api": {
+                "coarse_qpos_step": 0.01,
+                "fine_qpos_step": 0.01,
+                "gripper_settle_steps": 0,
+                "stable_debounce_frames": 2,
+            }
+        }
+        tactile_buffer = Buffer()
+
+        def __init__(self) -> None:
+            self.width = 0.2
+            self.trace = []
+            self.finalized = False
+
+        def refresh_native_observation(self, **_kwargs):
+            return {}
+
+        def get_native_tactile_calibration(self):
+            return {
+                "depth_far_plane_mm": 34.0,
+                "force_full_scale_mm": 6.5,
+                "depth_contact_margin_mm": 0.5,
+            }
+
+        def get_gripper_calibration(self):
+            return {"current_width": self.width, "gripper_max_qpos": 0.04}
+
+        def command_gripper_width_step(self, width, settle_steps=0):
+            self.width = float(width)
+            return {"ok": True, "width": self.width, "settle_steps": settle_steps}
+
+        def begin_high_level_action(self):
+            return True
+
+        def finalize_high_level_action(self):
+            self.finalized = True
+
+        def get_step_count(self):
+            return 0
+
+        def append_primitive_trace(self, record):
+            self.trace.append(record)
+
+    env = Env()
+    api = UniVTACTouchManipulationApi(env)
+
+    result = api.close_until_stable(target_force=0.2, max_steps=3)
+
+    assert result["ok"] is False
+    assert result["stable"] is False
+    assert result["reason"] == "missed_grasp"
+    assert result["left_contact"] is False
+    assert result["right_contact"] is False
+    assert env.finalized is True
+    assert env.trace[-1]["primitive"] == "close_until_stable"
 
 
 def test_univtac_franka_compat_respects_config_and_uses_high_level_api() -> None:
@@ -773,6 +972,77 @@ def test_univtac_franka_compat_can_pregrasp_anchor_uses_current_tool_pose() -> N
 
     np.testing.assert_allclose(grasp_pos, [0.31, -0.02, 0.16])
     np.testing.assert_allclose(grasp_quat, [1.0, 0.0, 0.0, 0.0])
+
+
+def test_univtac_franka_compat_exposes_transfer_public_anchors() -> None:
+    object_a = (
+        np.array([0.58, -0.26, 0.04], dtype=np.float32),
+        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        np.array([0.04, 0.04, 0.08], dtype=np.float32),
+    )
+    object_b = (
+        np.array([0.68, 0.26, 0.04], dtype=np.float32),
+        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        np.array([0.04, 0.04, 0.08], dtype=np.float32),
+    )
+    slot_b = (
+        np.array([0.42, 0.16, 0.025], dtype=np.float32),
+        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        np.array([0.10, 0.10, 0.02], dtype=np.float32),
+    )
+    grasp_b = (
+        np.array([0.615, 0.26, 0.032], dtype=np.float32),
+        np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32),
+    )
+
+    class Env:
+        task = object()
+        api_configs = {
+            "franka_control_api": {
+                "rgbd_perception_enabled": False,
+                "object_pose_names": {
+                    "current object": "current_object",
+                    "current_object": "current_object",
+                    "object_a": "object_a",
+                    "object_b": "object_b",
+                    "slot_b": "slot_b",
+                },
+            }
+        }
+
+        def get_public_pose_map(self):
+            return {
+                "object_a": object_a,
+                "object_b": object_b,
+                "current_object": object_b,
+                "slot_b": slot_b,
+                "current_slot": slot_b,
+            }
+
+        def get_public_grasp_pose(self, object_name, *, grasp_height):
+            assert object_name in {"object_b", "current_object"}
+            return grasp_b
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.40, 0.0, 0.20],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+                "joint": [0.0] * 8,
+            }
+
+    api = UniVTACFrankaCompatApi(Env())
+
+    pos, quat, extent = api.get_object_pose("current object", return_bbox_extent=True)
+    np.testing.assert_allclose(pos, object_b[0])
+    np.testing.assert_allclose(quat, object_b[1])
+    np.testing.assert_allclose(extent, object_b[2])
+
+    slot_pos, _slot_quat = api.get_object_pose("slot_b")
+    np.testing.assert_allclose(slot_pos, slot_b[0])
+
+    grasp_pos, grasp_quat = api.sample_grasp_pose("object_b")
+    np.testing.assert_allclose(grasp_pos, grasp_b[0])
+    np.testing.assert_allclose(grasp_quat, grasp_b[1])
 
 
 def test_univtac_low_level_can_grasp_matches_native_task_geometry(monkeypatch) -> None:

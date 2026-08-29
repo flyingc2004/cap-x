@@ -8,10 +8,16 @@ can use CaP-X without installing unrelated Robosuite/Franka perception stacks.
 import os
 
 from .base_api import list_apis, register_api
-from .univtac import UniVTACControlApi, UniVTACFrankaCompatApi, UniVTACTactileApi
+from .univtac import (
+    UniVTACControlApi,
+    UniVTACFrankaCompatApi,
+    UniVTACTactileApi,
+    UniVTACTouchManipulationApi,
+)
 
 register_api("UniVTACControlApi", UniVTACControlApi)
 register_api("UniVTACTactileApi", UniVTACTactileApi)
+register_api("UniVTACTouchManipulationApi", UniVTACTouchManipulationApi)
 if os.getenv("CAPX_UNIVTAC_MINIMAL_IMPORTS", "0") == "1":
     register_api("FrankaControlApi", UniVTACFrankaCompatApi)
 

@@ -77,6 +77,9 @@ def summarize_native_tactile(
     depth_far_plane_mm: float | None = None,
     force_full_scale_mm: float = 2.0,
     depth_contact_margin_mm: float = 0.5,
+    contact_area_threshold: float = 0.002,
+    stable_contact_area_threshold: float = 0.01,
+    force_depth_percentile: float = 98.0,
 ) -> dict[str, Any]:
     """Summarize recent native UniVTAC tactile frames."""
     if not frames:
@@ -88,6 +91,8 @@ def summarize_native_tactile(
         "depth_far_plane_mm": depth_far_plane_mm,
         "force_full_scale_mm": force_full_scale_mm,
         "depth_contact_margin_mm": depth_contact_margin_mm,
+        "contact_area_threshold": contact_area_threshold,
+        "force_depth_percentile": force_depth_percentile,
     }
     baseline = frames[0]
     left_metrics = _hand_metrics(
@@ -134,6 +139,10 @@ def summarize_native_tactile(
     if contact_lost:
         slip_score = max(slip_score, 0.75)
 
+    stable_area = bool(
+        left_metrics["contact_area"] >= float(stable_contact_area_threshold)
+        and right_metrics["contact_area"] >= float(stable_contact_area_threshold)
+    )
     if contact_lost:
         event = "contact_lost"
     elif contact and slip_score >= 0.6:
@@ -141,7 +150,14 @@ def summarize_native_tactile(
     elif hand == "both" and one_hand_contact:
         event = "one_hand_contact"
     elif contact and normal_force >= 0.2 and slip_score < 0.6:
-        event = "stable_grasp" if hand == "both" and left_metrics["contact"] and right_metrics["contact"] else "one_hand_contact"
+        event = (
+            "stable_grasp"
+            if hand == "both"
+            and left_metrics["contact"]
+            and right_metrics["contact"]
+            and stable_area
+            else "one_hand_contact"
+        )
     elif not contact:
         event = "no_contact"
     else:
@@ -161,6 +177,7 @@ def summarize_native_tactile(
         "left": left_metrics,
         "right": right_metrics,
         "event": event,
+        "stable_contact_area_threshold": float(stable_contact_area_threshold),
     }
 
 
@@ -228,12 +245,15 @@ def _hand_metrics(
     depth_far_plane_mm: float | None = None,
     force_full_scale_mm: float = 2.0,
     depth_contact_margin_mm: float = 0.5,
+    contact_area_threshold: float = 0.002,
+    force_depth_percentile: float = 98.0,
 ) -> dict[str, Any]:
     metrics = _empty_hand_metrics()
     depth_stats = _depth_metrics(
         depth,
         far_plane_mm=depth_far_plane_mm,
         contact_margin_mm=depth_contact_margin_mm,
+        force_depth_percentile=force_depth_percentile,
     )
     depth_delta = depth_stats["depth_delta_mm"]
     marker_mean, marker_max = _marker_displacement(marker)
@@ -248,7 +268,7 @@ def _hand_metrics(
     shear = float(np.clip(marker_mean / 4.0, 0.0, 1.0))
     depth_contact = bool(
         depth_delta >= max(0.0, float(depth_contact_margin_mm))
-        and contact_area > 0.0
+        and contact_area >= max(0.0, float(contact_area_threshold))
     )
     # With a calibrated native depth plane, marker motion is a shear/slip
     # signal only. Treating marker motion alone as contact caused false stops
@@ -279,6 +299,7 @@ def _depth_metrics(
     *,
     far_plane_mm: float | None,
     contact_margin_mm: float,
+    force_depth_percentile: float = 98.0,
 ) -> dict[str, Any]:
     empty = {
         "depth_available": False,
@@ -300,8 +321,12 @@ def _depth_metrics(
         if calibrated
         else float(np.nanpercentile(valid, 95))
     )
-    near = float(np.nanmin(valid) if calibrated else np.nanpercentile(valid, 5))
-    depth_delta = max(0.0, far_plane - near)
+    max_near = float(np.nanmin(valid) if calibrated else np.nanpercentile(valid, 5))
+    indentation = np.clip(far_plane - valid, 0.0, None)
+    percentile = float(np.clip(force_depth_percentile, 50.0, 100.0))
+    # Use a robust high percentile rather than the single deepest pixel. This
+    # keeps small depth spikes from masquerading as load-bearing contact.
+    depth_delta = max(0.0, float(np.nanpercentile(indentation, percentile)))
     if calibrated:
         threshold = far_plane - max(0.0, float(contact_margin_mm))
     else:
@@ -310,7 +335,7 @@ def _depth_metrics(
     return {
         "depth_available": True,
         "depth_delta_mm": depth_delta,
-        "depth_min_mm": near,
+        "depth_min_mm": max_near,
         "depth_far_plane_mm": far_plane,
         "contact_area": contact_area,
     }

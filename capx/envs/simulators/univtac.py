@@ -40,6 +40,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         task_config: str = "smoke_capx",
         seed_base: int = 0,
         device: str | None = None,
+        task_config_overrides: dict[str, Any] | None = None,
         api_configs: dict[str, Any] | None = None,
         expose_actor_pose: bool = True,
         max_steps: int | None = None,
@@ -57,6 +58,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self.task_config_name = task_config
         self.seed_base = int(seed_base)
         self.device_override = device
+        self.task_config_overrides = dict(task_config_overrides or {})
         self.api_configs = api_configs or {}
         self.expose_actor_pose = bool(expose_actor_pose)
         self.max_steps = int(max_steps) if max_steps is not None else 999999
@@ -87,9 +89,11 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._start_time = time.time()
         self._debug_records: list[dict[str, Any]] = []
         self._tactile_gripper_trace: list[dict[str, Any]] = []
+        self._primitive_trace: list[dict[str, Any]] = []
         self._pre_move_tactile_timeline: list[dict[str, Any]] = []
         self._pre_move_tactile_last_error: str | None = None
         self._perception_artifacts: list[dict[str, Any]] = []
+        self._public_pose_cache: dict[str, dict[str, Any]] = {}
         self._official_task_protocol = False
         self._protocol_stopped = False
         self._protocol_stop_reason: str | None = None
@@ -128,9 +132,11 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._start_time = time.time()
         self._debug_records.clear()
         self._tactile_gripper_trace.clear()
+        self._primitive_trace.clear()
         self._pre_move_tactile_timeline.clear()
         self._pre_move_tactile_last_error = None
         self._perception_artifacts.clear()
+        self._public_pose_cache.clear()
         self._protocol_stopped = False
         self._protocol_stop_reason = None
         self.clear_trial_deadline()
@@ -141,6 +147,7 @@ class UniVTACLowLevelEnv(BaseEnv):
             flush=True,
         )
         self._task.reset(seed=actual_seed, instructions=self._instructions())
+        self._refresh_public_pose_cache()
         self._initial_lift_object_z = self._active_object_height("can")
         debug = self._append_debug_record("after_reset")
         print(
@@ -506,6 +513,37 @@ class UniVTACLowLevelEnv(BaseEnv):
         sees only ``sample_grasp_pose`` and ``goto_pose``; this method translates
         that CaP-style request into UniVTAC's native motion planner.
         """
+        task_approach = getattr(self._task, "approach_grasped_actor", None)
+        if callable(task_approach):
+            try:
+                result = task_approach(
+                    object_name=object_name,
+                    position_offset=position_offset,
+                    pre_dis=pre_dis,
+                    dis=dis,
+                    grasp_height=grasp_height,
+                    time_dilation_factor=time_dilation_factor,
+                )
+                if not isinstance(result, dict):
+                    result = {
+                        "ok": bool(result),
+                        "message": "task adapter grasp hook executed",
+                    }
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "message": f"task adapter grasp hook failed: {exc!r}",
+                }
+            self._update_after_action()
+            self._append_debug_record(f"after_approach_grasp_{object_name}")
+            result = {
+                "step": self.get_step_count(),
+                "action_count": self.get_action_count(),
+                **result,
+            }
+            self._last_action_result = result
+            return result
+
         actor = self._public_grasp_actor(object_name)
         if actor is None:
             result = {
@@ -570,6 +608,14 @@ class UniVTACLowLevelEnv(BaseEnv):
         grasp_height: float = 0.04,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return the public pose used by the matching native grasp approach."""
+        task_sampler = getattr(self._task, "get_public_grasp_pose", None)
+        if callable(task_sampler):
+            pos, quat = task_sampler(object_name, grasp_height=float(grasp_height))
+            return (
+                np.asarray(pos, dtype=np.float32).reshape(3),
+                np.asarray(quat, dtype=np.float32).reshape(4),
+            )
+
         actor = self._public_grasp_actor(object_name)
         if actor is None:
             raise KeyError(f"public grasp object '{object_name}' is not available")
@@ -727,6 +773,18 @@ class UniVTACLowLevelEnv(BaseEnv):
                 raise ValueError("tactile gripper trace may only contain close/open operations")
             self._tactile_gripper_trace.append(_jsonable(record))
 
+    def reset_primitive_trace(self) -> None:
+        """Clear public tactile primitive trace for a fresh trial."""
+        if not hasattr(self, "_primitive_trace"):
+            self._primitive_trace = []
+        self._primitive_trace.clear()
+
+    def append_primitive_trace(self, record: dict[str, Any]) -> None:
+        """Store public touch primitive inputs, outputs, and tactile quality."""
+        if not hasattr(self, "_primitive_trace"):
+            self._primitive_trace = []
+        self._primitive_trace.append(_jsonable(dict(record)))
+
     def wait_steps(self, n: int = 1) -> dict[str, Any]:
         steps = max(0, int(n))
         for _ in range(steps):
@@ -764,6 +822,13 @@ class UniVTACLowLevelEnv(BaseEnv):
             return (
                 "Grasp and lift the cylindrical can using UniVTAC native tactile feedback, "
                 "then release it upright on the table."
+            )
+        if self.task_name == "tactile_transfer_rearrange_clean":
+            return (
+                "Move two cylindrical objects in order: object_a to slot_a, then object_b "
+                "to slot_b. The task reset places the gripper near the current object; "
+                "do not assume it is already grasped. Use public anchors and UniVTAC "
+                "native tactile feedback for local grasping, stable transport, and release."
             )
         return f"Solve the UniVTAC task: {self.task_name}."
 
@@ -817,11 +882,101 @@ class UniVTACLowLevelEnv(BaseEnv):
         return _jsonable(actor) if self.expose_actor_pose else {}
 
     def get_object_pose(self, name: str) -> dict[str, Any]:
+        public_pose = self.get_public_pose(name)
+        if public_pose.get("ok"):
+            return public_pose
         poses = self.get_actor_poses()
         if name not in poses:
             return {"ok": False, "name": name, "message": f"object '{name}' not found"}
         pose = poses[name]
         return {"ok": True, "name": name, "pose": pose}
+
+    def get_public_pose(self, name: str) -> dict[str, Any]:
+        """Return an explicitly public coarse task anchor or target slot pose."""
+        if not self._public_pose_cache:
+            self._refresh_public_pose_cache()
+        try:
+            resolved = self._resolve_public_pose_name(name)
+        except KeyError as exc:
+            return {"ok": False, "name": str(name), "message": str(exc)}
+        if resolved in {"object_a", "object_b"}:
+            self._begin_capx_role_if_available(resolved)
+        record = self._public_pose_cache.get(resolved)
+        if record is None:
+            return {
+                "ok": False,
+                "name": str(name),
+                "resolved_name": resolved,
+                "message": f"public pose '{resolved}' is not available",
+            }
+        return {
+            "ok": True,
+            "name": str(name),
+            "resolved_name": resolved,
+            "position": np.asarray(record["position"], dtype=np.float32).reshape(3).tolist(),
+            "quaternion_wxyz": np.asarray(
+                record["quaternion_wxyz"],
+                dtype=np.float32,
+            ).reshape(4).tolist(),
+            "extent": np.asarray(record["extent"], dtype=np.float32).reshape(3).tolist(),
+            "source": str(record.get("source", "public_anchor")),
+        }
+
+    def get_public_pose_map(self) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Return public pose anchors for CaP-style Franka compatibility APIs."""
+        if not self._public_pose_cache:
+            self._refresh_public_pose_cache()
+        pose_map: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for key, record in self._public_pose_cache.items():
+            pose_map[key] = (
+                np.asarray(record["position"], dtype=np.float32).reshape(3),
+                np.asarray(record["quaternion_wxyz"], dtype=np.float32).reshape(4),
+                np.asarray(record["extent"], dtype=np.float32).reshape(3),
+            )
+        for alias in ("current_object", "current_slot"):
+            try:
+                resolved = self._resolve_public_pose_name(alias)
+            except KeyError:
+                continue
+            if resolved in pose_map:
+                pose_map[alias] = tuple(item.copy() for item in pose_map[resolved])  # type: ignore[assignment]
+        return pose_map
+
+    def list_public_regions(self) -> list[str]:
+        """Return task-declared public coarse region names."""
+        return sorted(self.get_public_regions().keys())
+
+    def get_public_region(self, name: str) -> dict[str, Any]:
+        """Return one sanitized public coarse region by name."""
+        regions = self.get_public_regions()
+        try:
+            key = self._resolve_public_region_name(name, regions)
+        except KeyError as exc:
+            return {"ok": False, "name": str(name), "message": str(exc)}
+        if key not in regions:
+            return {"ok": False, "name": str(name), "message": f"region {name!r} is not available"}
+        return {"ok": True, "name": key, **regions[key]}
+
+    def get_public_regions(self) -> dict[str, dict[str, Any]]:
+        """Return task-declared public regions without private task state."""
+        task_regions = getattr(self._task, "get_public_regions", None)
+        if not callable(task_regions):
+            return {}
+        try:
+            raw_regions = task_regions()
+        except Exception as exc:
+            print(f"[capx-univtac] get_public_regions failed: {exc!r}", flush=True)
+            return {}
+        if not isinstance(raw_regions, dict):
+            return {}
+        regions: dict[str, dict[str, Any]] = {}
+        for name, raw in raw_regions.items():
+            if not isinstance(raw, dict):
+                continue
+            cleaned = self._sanitize_public_region(str(name), raw)
+            if cleaned is not None:
+                regions[str(name)] = cleaned
+        return regions
 
     def get_status(self) -> dict[str, Any]:
         return {
@@ -886,9 +1041,11 @@ class UniVTACLowLevelEnv(BaseEnv):
 
     def export_debug_artifacts(self, output_dir: str | os.PathLike[str]) -> str | None:
         """Write private UniVTAC diagnostics for audit, never for LLM prompts."""
+        primitive_trace = getattr(self, "_primitive_trace", [])
         if (
             not self._debug_records
             and not self._tactile_gripper_trace
+            and not primitive_trace
             and not self._perception_artifacts
         ):
             return None
@@ -913,12 +1070,20 @@ class UniVTACLowLevelEnv(BaseEnv):
             with open(trace_path, "w", encoding="utf-8") as f:
                 json.dump(self._tactile_gripper_trace, f, indent=2, sort_keys=True)
             print(f"[capx-univtac] saved tactile gripper trace to {trace_path}", flush=True)
+        primitive_path = None
+        if primitive_trace:
+            primitive_path = output_path / "primitive_trace.json"
+            with open(primitive_path, "w", encoding="utf-8") as f:
+                json.dump(primitive_trace, f, indent=2, sort_keys=True)
+            print(f"[capx-univtac] saved primitive trace to {primitive_path}", flush=True)
         perception_path = self._export_perception_artifacts(output_path)
         self._export_pre_move_tactile_timeline(output_path)
         if self._debug_records:
             return str(debug_path)
         if self._tactile_gripper_trace:
             return str(trace_path)
+        if primitive_path is not None:
+            return str(primitive_path)
         return str(perception_path) if perception_path is not None else None
 
     def _export_perception_artifacts(self, output_path: Path) -> Path | None:
@@ -1019,6 +1184,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         task_config_file = self._task_config_path()
         with open(task_config_file, encoding="utf-8") as f:
             self._task_config = yaml.safe_load(f) or {}
+        self._task_config.update(self.task_config_overrides)
 
         task_module = importlib.import_module(f"envs.{self.task_name}")
         env_cfg = task_module.TaskCfg()
@@ -1049,6 +1215,12 @@ class UniVTACLowLevelEnv(BaseEnv):
         if self.device_override:
             env_cfg.sim.device = self.device_override
         self._task = task_module.Task(env_cfg, mode="eval")
+        self.record_video_during_reset = bool(
+            self._task_config.get(
+                "record_video_during_reset",
+                getattr(self, "record_video_during_reset", True),
+            )
+        )
         self._official_task_protocol = bool(
             self._task_config.get("official_task_protocol", False)
         )
@@ -1495,7 +1667,224 @@ class UniVTACLowLevelEnv(BaseEnv):
             if wrist is not None:
                 self._wrist_frame_buffer.append(_as_uint8_rgb(wrist))
 
+    def _refresh_public_pose_cache(self) -> None:
+        """Cache only task-declared public anchors and slots for LLM APIs."""
+        self._public_pose_cache.clear()
+        task = self._task
+        if task is None:
+            return
+
+        object_extent = np.array([0.04, 0.04, 0.08], dtype=np.float32)
+        slot_extent = np.array([0.10, 0.10, 0.02], dtype=np.float32)
+        start_poses = getattr(task, "start_poses", None)
+        if isinstance(start_poses, dict):
+            for role in ("object_a", "object_b"):
+                pose = start_poses.get(role)
+                parsed = self._pose_to_public_record(
+                    pose,
+                    extent=object_extent,
+                    source="reset_public_anchor",
+                )
+                if parsed is not None:
+                    self._public_pose_cache[role] = parsed
+
+        target_poses = getattr(task, "target_poses", None)
+        if isinstance(target_poses, dict):
+            for role, slot in (("object_a", "slot_a"), ("object_b", "slot_b")):
+                pose = target_poses.get(role)
+                parsed = self._pose_to_public_record(
+                    pose,
+                    extent=slot_extent,
+                    source="public_slot",
+                )
+                if parsed is not None:
+                    self._public_pose_cache[slot] = parsed
+
+        # Keep a conservative fallback for task implementations that expose the
+        # role dictionaries later than reset but still use the same public names.
+        objects = getattr(task, "objects", None)
+        if isinstance(objects, dict):
+            for role in ("object_a", "object_b"):
+                if role in self._public_pose_cache:
+                    continue
+                actor = objects.get(role)
+                get_pose = getattr(actor, "get_pose", None)
+                if not callable(get_pose):
+                    continue
+                try:
+                    pose = get_pose()
+                except Exception:
+                    continue
+                parsed = self._pose_to_public_record(
+                    pose,
+                    extent=object_extent,
+                    source="public_actor_fallback",
+                )
+                if parsed is not None:
+                    self._public_pose_cache[role] = parsed
+
+        if self._public_pose_cache:
+            print(
+                "[capx-univtac] public pose cache "
+                f"keys={sorted(self._public_pose_cache)}",
+                flush=True,
+            )
+
+    @staticmethod
+    def _pose_to_public_record(
+        pose: Any,
+        *,
+        extent: np.ndarray,
+        source: str,
+    ) -> dict[str, Any] | None:
+        if pose is None:
+            return None
+        try:
+            pos = np.asarray(getattr(pose, "p"), dtype=np.float32).reshape(3)
+        except Exception:
+            return None
+        raw_quat = getattr(pose, "q", None)
+        if raw_quat is None:
+            quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        else:
+            quat = np.asarray(raw_quat, dtype=np.float32).reshape(4)
+        if not np.all(np.isfinite(pos)) or not np.all(np.isfinite(quat)):
+            return None
+        return {
+            "position": pos.astype(np.float32),
+            "quaternion_wxyz": quat.astype(np.float32),
+            "extent": np.asarray(extent, dtype=np.float32).reshape(3),
+            "source": source,
+        }
+
+    def _resolve_public_pose_name(self, name: str) -> str:
+        key = str(name).strip().lower().replace(" ", "_")
+        if key in {"current", "current_object", "object", "target_object", "can"}:
+            return self._current_transfer_object_name()
+        if key in {"current_slot", "slot", "target", "target_slot"}:
+            return "slot_b" if self._current_transfer_object_name() == "object_b" else "slot_a"
+        aliases = {
+            "a": "object_a",
+            "first": "object_a",
+            "first_object": "object_a",
+            "object_a": "object_a",
+            "b": "object_b",
+            "second": "object_b",
+            "second_object": "object_b",
+            "object_b": "object_b",
+            "slot_a": "slot_a",
+            "a_slot": "slot_a",
+            "target_a": "slot_a",
+            "slot_b": "slot_b",
+            "b_slot": "slot_b",
+            "target_b": "slot_b",
+        }
+        resolved = aliases.get(key, key)
+        if resolved not in {"object_a", "object_b", "slot_a", "slot_b"}:
+            raise KeyError(f"unknown public pose {name!r}")
+        return resolved
+
+    def _resolve_public_region_name(self, name: str, regions: dict[str, Any]) -> str:
+        key = str(name).strip().lower().replace(" ", "_")
+        aliases = {
+            "pickup_a": "pickup_a_region",
+            "object_a": "pickup_a_region",
+            "a": "pickup_a_region",
+            "pickup_b": "pickup_b_region",
+            "object_b": "pickup_b_region",
+            "b": "pickup_b_region",
+            "slot_a": "slot_a_region",
+            "target_a": "slot_a_region",
+            "slot_b": "slot_b_region",
+            "target_b": "slot_b_region",
+        }
+        resolved = aliases.get(key, key)
+        if resolved in regions:
+            return resolved
+        raise KeyError(f"unknown public region {name!r}")
+
+    @staticmethod
+    def _sanitize_public_region(name: str, raw: dict[str, Any]) -> dict[str, Any] | None:
+        allowed = {
+            "kind",
+            "center_xy",
+            "half_extents",
+            "radius",
+            "hover_z",
+            "search_z_range",
+            "release_z",
+            "description",
+            "source",
+        }
+        cleaned = {key: _jsonable(value) for key, value in raw.items() if key in allowed}
+        if "center_xy" not in cleaned:
+            return None
+        try:
+            center_xy = np.asarray(cleaned["center_xy"], dtype=np.float32).reshape(2)
+        except Exception:
+            return None
+        if not np.all(np.isfinite(center_xy)):
+            return None
+        cleaned["center_xy"] = center_xy.tolist()
+        if "half_extents" in cleaned:
+            try:
+                half_extents = np.asarray(cleaned["half_extents"], dtype=np.float32).reshape(2)
+            except Exception:
+                half_extents = np.array([0.03, 0.03], dtype=np.float32)
+            cleaned["half_extents"] = np.maximum(half_extents, 0.0).tolist()
+        if "search_z_range" in cleaned:
+            try:
+                z_range = np.asarray(cleaned["search_z_range"], dtype=np.float32).reshape(2)
+            except Exception:
+                z_range = np.array([0.035, float(cleaned.get("hover_z", 0.16))], dtype=np.float32)
+            cleaned["search_z_range"] = [float(np.min(z_range)), float(np.max(z_range))]
+        for key in ("hover_z", "release_z", "radius"):
+            if key in cleaned:
+                try:
+                    cleaned[key] = float(cleaned[key])
+                except Exception:
+                    cleaned.pop(key, None)
+        cleaned["name"] = str(name)
+        cleaned.setdefault("source", "task_public_region")
+        return cleaned
+
+    def _current_transfer_object_name(self) -> str:
+        task = self._task
+        placed = getattr(task, "object_placed", {}) if task is not None else {}
+        if isinstance(placed, dict) and bool(placed.get("object_a", False)):
+            return "object_b"
+        active_role = getattr(task, "active_role", None) if task is not None else None
+        if active_role in {"object_a", "object_b"}:
+            return str(active_role)
+        return "object_a"
+
+    def _begin_capx_role_if_available(self, role_name: str) -> None:
+        begin_fn = getattr(self._task, "begin_capx_role", None)
+        if not callable(begin_fn):
+            return
+        try:
+            result = begin_fn(role_name)
+            if isinstance(result, dict):
+                print(
+                    "[capx-univtac] begin_capx_role "
+                    f"role={result.get('role', role_name)} "
+                    f"vision_disabled={result.get('vision_disabled')}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                "[capx-univtac] begin_capx_role failed "
+                f"role={role_name} error={exc!r}",
+                flush=True,
+            )
+
     def _public_grasp_actor(self, object_name: str):
+        task_actor = getattr(self._task, "get_public_grasp_actor", None)
+        if callable(task_actor):
+            actor = task_actor(object_name)
+            if actor is not None:
+                return actor
+
         key = str(object_name).strip().lower().replace("_", " ")
         if key == "can":
             return getattr(self._task, "can", None)
@@ -1512,6 +1901,10 @@ class UniVTACLowLevelEnv(BaseEnv):
         grasp_height: float,
     ) -> Any:
         from envs.utils.transforms import construct_grasp_pose
+
+        task_pose = getattr(self._task, "make_public_grasp_pose", None)
+        if callable(task_pose):
+            return task_pose(object_name, actor=actor, grasp_height=float(grasp_height))
 
         key = str(object_name).strip().lower().replace("_", " ")
         if key == "can" or actor is getattr(self._task, "can", None):

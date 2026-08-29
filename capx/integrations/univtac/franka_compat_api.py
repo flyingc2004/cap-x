@@ -138,6 +138,18 @@ class UniVTACFrankaCompatApi(ApiBase):
             "orange_pad": "orange_pad",
             "green pad": "green_pad",
             "green_pad": "green_pad",
+            "current object": "current_object",
+            "current_object": "current_object",
+            "current slot": "current_slot",
+            "current_slot": "current_slot",
+            "object a": "object_a",
+            "object_a": "object_a",
+            "object b": "object_b",
+            "object_b": "object_b",
+            "slot a": "slot_a",
+            "slot_a": "slot_a",
+            "slot b": "slot_b",
+            "slot_b": "slot_b",
         }
         self.rgbd_perception_enabled = bool(
             cfg.get("rgbd_perception_enabled", rgbd_perception_enabled)
@@ -222,6 +234,7 @@ class UniVTACFrankaCompatApi(ApiBase):
             "goto_pose": self.goto_pose,
             "open_gripper": self.open_gripper,
             "close_gripper": self.close_gripper,
+            "get_robot_state": self.get_robot_state,
             "home_pose": self.home_pose,
         }
 
@@ -339,13 +352,12 @@ class UniVTACFrankaCompatApi(ApiBase):
             )
             return estimate.position, estimate.quaternion_wxyz
 
+        grasp_pose = self._public_grasp_pose(key)
+        if grasp_pose is not None:
+            return grasp_pose
+        if key == "can":
+            raise KeyError("object 'can' is not available for UniVTAC grasp sampling")
         tool_pos, tool_quat = self._current_tool_pose()
-        if key in {"prism", "can"}:
-            grasp_pose = self._public_grasp_pose(key)
-            if grasp_pose is not None:
-                return grasp_pose
-            if key == "can":
-                raise KeyError("object 'can' is not available for UniVTAC grasp sampling")
         return tool_pos, tool_quat
 
     def goto_pose(
@@ -556,7 +568,14 @@ class UniVTACFrankaCompatApi(ApiBase):
         )
 
     def get_robot_state(self) -> dict[str, Any]:
-        """Expose the UniVTAC robot state with stable CaP keys."""
+        """Return public robot state for local tactile servoing.
+
+        The returned dict includes ``ee_pos`` and ``ee_quat`` for the current
+        gripper/tool pose, plus public joint state when available. Use this for
+        small local adjustments, lift motions, and retreat motions. Do not use
+        ``get_object_pose("current_object")`` as a substitute for the current
+        gripper pose; object anchors are coarse task anchors, not live tracking.
+        """
         return self._env.get_robot_state()
 
     def get_step_status(self) -> dict[str, Any]:
@@ -1202,6 +1221,8 @@ class UniVTACFrankaCompatApi(ApiBase):
             return np.array([0.10, 0.10, 0.03], dtype=np.float32)
         if key == "can":
             return np.array([0.06, 0.06, 0.12], dtype=np.float32)
+        if key in {"object_a", "object_b", "current_object"}:
+            return np.array([0.04, 0.04, 0.08], dtype=np.float32)
         return np.array([0.03, 0.03, 0.03], dtype=np.float32)
 
     def _public_landmarks(self) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -1237,6 +1258,25 @@ class UniVTACFrankaCompatApi(ApiBase):
                 can_quat,
                 self._estimate_extent_from_pose_name("can"),
             )
+        public_pose_map_fn = getattr(self._env, "get_public_pose_map", None)
+        if callable(public_pose_map_fn):
+            try:
+                public_pose_map = public_pose_map_fn()
+            except Exception:
+                public_pose_map = {}
+            if isinstance(public_pose_map, dict):
+                for key, pose_tuple in public_pose_map.items():
+                    try:
+                        pos, pose_quat, extent = pose_tuple
+                        landmarks[str(key)] = (
+                            np.asarray(pos, dtype=np.float32).reshape(3),
+                            self._normalize_quat(
+                                np.asarray(pose_quat, dtype=np.float32).reshape(4)
+                            ),
+                            np.asarray(extent, dtype=np.float32).reshape(3),
+                        )
+                    except Exception:
+                        continue
         return landmarks
 
     def _current_ee_quat(self) -> np.ndarray:
@@ -1287,7 +1327,12 @@ class UniVTACFrankaCompatApi(ApiBase):
         pos = np.asarray(position, dtype=np.float32).reshape(3)
         best: tuple[str, np.ndarray] | None = None
         best_dist = float("inf")
-        for key in ("prism", "can"):
+        candidate_keys = [
+            key
+            for key in self._public_landmarks()
+            if key in {"prism", "can", "object_a", "object_b", "current_object"}
+        ]
+        for key in candidate_keys:
             sampled = self._public_grasp_pose(key)
             if sampled is None:
                 continue

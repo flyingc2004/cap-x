@@ -107,10 +107,14 @@ class UniVTACTactileApi(ApiBase):
             balanced, and slip_score is low.
         """
         summary = self.get_tactile_summary(hand="both")
+        min_area = float(summary.get("stable_contact_area_threshold", 0.01))
         return bool(
-            summary["left_contact"]
+            summary["event"] == "stable_grasp"
+            and summary["left_contact"]
             and summary["right_contact"]
             and summary["normal_force"] >= threshold
+            and float(summary["left"].get("contact_area", 0.0)) >= min_area
+            and float(summary["right"].get("contact_area", 0.0)) >= min_area
             and abs(summary["contact_balance"]) <= 0.45
             and summary["slip_score"] < 0.6
         )

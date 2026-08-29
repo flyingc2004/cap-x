@@ -150,6 +150,7 @@ def _register_univtac_components() -> None:
         UniVTACControlApi,
         UniVTACFrankaCompatApi,
         UniVTACTactileApi,
+        UniVTACTouchManipulationApi,
     )
 
     class UniVTACCodeEnv(CodeExecutionEnvBase):
@@ -162,7 +163,11 @@ def _register_univtac_components() -> None:
             return {
                 name: api
                 for name, api in self._apis.items()
-                if name in {"FrankaControlApi", "UniVTACTactileApi"}
+                if name in {
+                    "FrankaControlApi",
+                    "UniVTACTactileApi",
+                    "UniVTACTouchManipulationApi",
+                }
             }
 
     register_env("univtac_low_level", UniVTACLowLevelEnv)
@@ -178,6 +183,7 @@ def _register_univtac_components() -> None:
     register_api("UniVTACControlApi", UniVTACControlApi)
     register_api("FrankaControlApi", UniVTACFrankaCompatApi)
     register_api("UniVTACTactileApi", UniVTACTactileApi)
+    register_api("UniVTACTouchManipulationApi", UniVTACTouchManipulationApi)
 
 
 if __name__ == "__main__":

@@ -162,7 +162,11 @@ if os.getenv("CAPX_UNIVTAC_MINIMAL_IMPORTS", "0") != "1":
             return {
                 name: api
                 for name, api in self._apis.items()
-                if name in {"FrankaControlApi", "UniVTACTactileApi"}
+                if name in {
+                    "FrankaControlApi",
+                    "UniVTACTactileApi",
+                    "UniVTACTouchManipulationApi",
+                }
             }
 
     register_exec_env("univtac_code_env", UniVTACCodeEnv)

@@ -1,0 +1,113 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/UniVTAC
+      task_name: tactile_transfer_rearrange_clean
+      task_config: tactile_transfer_clean_smoke
+      seed_base: 0
+      device: cuda:0
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.035
+          max_delta_xyz: 0.012
+          max_delta_rpy: 0.25
+          max_delta_gripper: 0.02
+          default_z_approach: 0.06
+          release_hover_height: 0.14
+          home_pose_relative_lift: true
+          home_lift_delta_z: 0.06
+          preserve_landmark_orientation: true
+          gripper_settle_steps: 10
+          use_task_place_actor_for_landmarks: false
+          use_task_grasp_actor_for_objects: true
+          use_native_pose_planner: false
+          record_perception_diagnostic: false
+          official_anchor_fallback_enabled: false
+          max_goto_pose_actions: 35
+          max_home_pose_actions: 12
+          max_native_pose_actions: 2
+          max_gripper_servo_steps: 120
+          max_gripper_settle_steps: 20
+          lift_after_close: false
+          open_gripper_width: 1.0
+          tactile_adaptive_gripper_enabled: true
+          rgbd_perception_enabled: false
+          adaptive_gripper:
+            coarse_qpos_step: 0.0005
+            fine_qpos_step: 0.00005
+            contact_debounce_frames: 2
+            stable_debounce_frames: 3
+            release_debounce_frames: 2
+            settle_steps_per_command: 1
+            contact_force_threshold: 0.08
+            contact_balance_threshold: 0.50
+            depth_contact_margin_mm: 0.5
+            slip_threshold: 0.60
+          object_pose_names:
+            current object: current_object
+            current_object: current_object
+            object: current_object
+            can: current_object
+            current slot: current_slot
+            current_slot: current_slot
+            target: current_slot
+            object_a: object_a
+            object a: object_a
+            first object: object_a
+            object_b: object_b
+            object b: object_b
+            second object: object_b
+            slot_a: slot_a
+            slot a: slot_a
+            target_a: slot_a
+            slot_b: slot_b
+            slot b: slot_b
+            target_b: slot_b
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis:
+      - FrankaControlApi
+      - UniVTACTactileApi
+    prompt: |
+      You are controlling a Franka robot in the UniVTAC tactile_transfer_rearrange_clean benchmark.
+      Complete the sequence object_a -> slot_a first, then object_b -> slot_b.
+      The task reset provides a staged pre-move that brings the gripper near the current cylindrical object. Do not assume the current object is already grasped.
+      Public anchors are available through get_object_pose("current_object"), get_object_pose("current_slot"), get_object_pose("object_a"), get_object_pose("object_b"), get_object_pose("slot_a"), and get_object_pose("slot_b"). Object anchors are coarse reset anchors, not live object tracking. Slot anchors are public targets.
+      Use get_robot_state()["ee_pos"] and get_robot_state()["ee_quat"] for current gripper pose, local retry adjustments, lift motions, and retreats.
+      Use only FrankaControlApi motion functions and UniVTAC native tactile functions. Do not call low-level move_delta_ee, move_ee, or move_qpos functions.
+      For each object, open the gripper, move near the public object anchor or sample_grasp_pose target, close adaptively, verify contact with get_tactile_summary or is_grasp_stable, lift only after a stable tactile grasp, move above the matching slot, descend gently, and open the gripper to release.
+      After object_a is placed, camera observations are masked by the environment; use public anchors, robot state, and tactile feedback for object_b.
+      If a grasp is unstable, make only small local pose adjustments relative to the current gripper pose and retry. Do not move back to get_object_pose("current_object") during tactile retry or lift. Keep programs short and let expected failures reach program end normally.
+      Do not read reward, success, task_completed, metadata, material class, density, friction, or trial id. Do not load or call UniVTAC ACT or ViTAL policies.
+    multi_turn_prompt: |
+      Executed code:
+      {executed_code}
+
+      Console stdout:
+      {console_stdout}
+
+      Console stderr:
+      {console_stderr}
+
+      Decide whether to CONTINUE with the next existing code block, REGENERATE a concise corrective Python block using only public APIs, or FINISH if no further action is needed.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/univtac_tactile_transfer_rearrange_clean_tactile
+trial_timeout_seconds: 600
+max_trial_retries: 1
+max_regenerations: 1
+save_multiturn_prompts: true
+tactile_code_memory:
+  enabled: false
+  mode: read
+  path: .capx_tactile_code_memory/lift_can_v1/bank.jsonl
+  top_k_initial: 0
+  top_k_runtime: 0
+  runtime_retrieval: false
+  max_repair_turns: 0

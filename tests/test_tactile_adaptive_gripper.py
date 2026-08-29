@@ -457,3 +457,41 @@ def test_code_execution_always_exposes_numpy_alias() -> None:
 
     assert result["ok"] is True
     np.testing.assert_array_equal(result["result"], np.array([0.0, 0.0, 0.05]))
+
+
+def test_code_execution_auto_calls_new_solve_when_model_forgets_call() -> None:
+    env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.low_level_env = SimpleNamespace(get_action_count=lambda: 0, get_step_count=lambda: 0)
+    env._apis = {}
+    env._get_observation = lambda: {}
+    env._exec_globals = {"__name__": "__main__", "calls": []}
+    env._exec_env_binding = lambda: env.low_level_env
+    env._exec_apis_binding = lambda: {}
+
+    result = env._exec_user_code("def solve():\n    calls.append('ran')\n    return 'done'\n")
+
+    assert result["ok"] is True
+    assert result["result"] == "done"
+    assert env._exec_globals["calls"] == ["ran"]
+    assert "auto-calling generated solve()" in result["stdout"]
+
+
+def test_code_execution_does_not_double_call_explicit_solve() -> None:
+    env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.low_level_env = SimpleNamespace(get_action_count=lambda: 0, get_step_count=lambda: 0)
+    env._apis = {}
+    env._get_observation = lambda: {}
+    env._exec_globals = {"__name__": "__main__", "calls": []}
+    env._exec_env_binding = lambda: env.low_level_env
+    env._exec_apis_binding = lambda: {}
+
+    result = env._exec_user_code(
+        "def solve():\n"
+        "    calls.append('ran')\n"
+        "    return 'done'\n"
+        "solve()\n"
+    )
+
+    assert result["ok"] is True
+    assert env._exec_globals["calls"] == ["ran"]
+    assert "auto-calling generated solve()" not in result["stdout"]
