@@ -44,6 +44,7 @@ from capx.utils.launch_utils import (
     _get_visual_feedback,
     _normalize_extracted_code,
     _parse_multi_turn_decision,
+    _save_in_progress_trial_artifacts,
     _save_trial_artifacts,
 )
 from capx.utils.video_utils import _encode_video_base64, _write_video
@@ -127,6 +128,120 @@ def _build_log_lines(
         "-" * 100,
     ])
     return lines
+
+
+def _is_console_progress_noise(line: str) -> bool:
+    """Return whether a console line is progress-rendering noise."""
+    text = line.strip()
+    if not text:
+        return True
+    if re.match(r"^Running Trials:\s+", text):
+        return True
+    if re.match(r"^Step\s+\d+\(", text) and "FPS" in text and "Running" in text:
+        return True
+    if " FPS " in text and " Running " in text and re.search(r"\b(action|pre moving)\b", text):
+        return True
+    return False
+
+
+def _is_console_important_for_multiturn(line: str) -> bool:
+    """Return whether a console line should always be kept for regeneration."""
+    text = line.strip()
+    if not text:
+        return False
+    important_prefixes = (
+        "CAPX_",
+        "[univtac-franka]",
+        "[univtac-tactile]",
+        "[capx-task]",
+        "[capx-trial]",
+        "[capx-univtac]",
+        "Traceback",
+        "File ",
+    )
+    if text.startswith(important_prefixes):
+        return True
+    important_tokens = (
+        "Error",
+        "Exception",
+        "TimeoutError",
+        "RuntimeError",
+        "ValueError",
+        "KeyError",
+        "AttributeError",
+        "TypeError",
+        "RecoverableTaskFailure",
+        "motion planning failed",
+        "adaptive_close",
+        "adaptive_open",
+        "Task completed",
+    )
+    return any(token in text for token in important_tokens)
+
+
+def _filter_console_for_multiturn(
+    text: str,
+    *,
+    max_lines: int = 80,
+    max_chars: int = 12000,
+    keep_recent_other: int = 12,
+) -> str:
+    """Filter verbose console output before sending it back to the LLM.
+
+    Full logs are still saved as artifacts. This only trims the feedback used
+    for agent-level regeneration so progress bars and per-step simulator lines
+    do not crowd out tactile failure signatures.
+    """
+    if not text:
+        return ""
+
+    normalized = text.replace("\r", "\n")
+    important: list[str] = []
+    other: list[str] = []
+    progress_dropped = 0
+    empty_dropped = 0
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            empty_dropped += 1
+            continue
+        if _is_console_progress_noise(line):
+            progress_dropped += 1
+            continue
+        if _is_console_important_for_multiturn(line):
+            important.append(line)
+        else:
+            other.append(line)
+
+    max_lines = max(1, int(max_lines))
+    keep_recent_other = max(0, int(keep_recent_other))
+    max_important = max(1, max_lines - keep_recent_other)
+    kept_important = important[-max_important:]
+    kept_other = other[-keep_recent_other:] if keep_recent_other else []
+
+    omitted_important = max(0, len(important) - len(kept_important))
+    omitted_other = max(0, len(other) - len(kept_other))
+    header = (
+        "[console-filter] "
+        f"dropped_progress={progress_dropped} dropped_empty={empty_dropped} "
+        f"omitted_important={omitted_important} omitted_other={omitted_other}"
+    )
+    sections = [header]
+    if kept_important:
+        sections.append("[important]")
+        sections.extend(kept_important)
+    if kept_other:
+        sections.append("[recent_other]")
+        sections.extend(kept_other)
+    filtered = "\n".join(sections)
+
+    max_chars = max(2000, int(max_chars))
+    if len(filtered) > max_chars:
+        filtered = (
+            f"[console-filter] truncated_to_last_chars={max_chars}\n"
+            + filtered[-max_chars:]
+        )
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -746,10 +861,25 @@ def _handle_multi_turn_step(
 
     executed_code = "\n".join(code_blocks[:code_block_idx])
     remaining_code = "\n\n".join(code_blocks[code_block_idx:])
+    console_stdout = info_step["stdout"]
+    console_stderr = info_step["stderr"]
+    if config.get("filter_multiturn_console", False):
+        console_stdout = _filter_console_for_multiturn(
+            console_stdout,
+            max_lines=int(config.get("multiturn_console_max_lines", 80)),
+            max_chars=int(config.get("multiturn_console_max_chars", 12000)),
+            keep_recent_other=int(config.get("multiturn_console_keep_recent_other", 12)),
+        )
+        console_stderr = _filter_console_for_multiturn(
+            console_stderr,
+            max_lines=int(config.get("multiturn_console_max_lines", 80)),
+            max_chars=int(config.get("multiturn_console_max_chars", 12000)),
+            keep_recent_other=int(config.get("multiturn_console_keep_recent_other", 12)),
+        )
     complete_multi_turn_prompt = multi_turn_prompt.format(
         executed_code=executed_code,
-        console_stdout=info_step["stdout"],
-        console_stderr=info_step["stderr"],
+        console_stdout=console_stdout,
+        console_stderr=console_stderr,
     )
     if remaining_code.strip():
         complete_multi_turn_prompt = (
@@ -1013,6 +1143,14 @@ def _run_single_trial(
         "initial_prompt": copy.deepcopy(obs["full_prompt"]),
         "reasoning": reasoning if reasoning is not None else "",
     })
+    if config.get("save_in_progress_code", True):
+        _save_in_progress_trial_artifacts(
+            config,
+            trial,
+            final_code=_annotate_code_blocks(code_blocks, code_block_metadata),
+            raw_code=raw_code,
+            all_responses=all_responses,
+        )
 
     # --- 4. Execute code blocks (with optional multi-turn) ---
     info_step = {"sandbox_rc": -1, "stdout": "", "stderr": ""}

@@ -14,6 +14,7 @@ from capx.integrations.univtac.rgbd_perception import (
     GraspEstimate,
     ObjectEstimate,
     RgbdFrame,
+    SegmentationCandidate,
     UniVTACRgbdPerception,
 )
 
@@ -40,6 +41,12 @@ def _mask() -> np.ndarray:
     return mask
 
 
+def _mask_at(row: int, col: int = 2) -> np.ndarray:
+    mask = np.zeros((8, 8), dtype=bool)
+    mask[row : row + 2, col : col + 2] = True
+    return mask
+
+
 def test_rgbd_mask_deprojection_and_world_obb(monkeypatch) -> None:
     perception = UniVTACRgbdPerception(min_depth_points=8)
     monkeypatch.setattr(perception, "_segment", lambda rgb, prompt: (_mask(), 0.9))
@@ -51,6 +58,26 @@ def test_rgbd_mask_deprojection_and_world_obb(monkeypatch) -> None:
     assert estimate.extent.shape == (3,)
     assert estimate.quaternion_wxyz.shape == (4,)
     assert estimate.score == pytest.approx(0.9)
+
+
+def test_rgbd_selector_chooses_sam_candidate_by_world_axis(monkeypatch) -> None:
+    perception = UniVTACRgbdPerception(min_depth_points=4)
+    candidates = [
+        SegmentationCandidate(mask=_mask_at(1), score=0.2),
+        SegmentationCandidate(mask=_mask_at(5), score=0.9),
+    ]
+    monkeypatch.setattr(
+        perception,
+        "_segment_candidates",
+        lambda rgb, prompt: candidates,
+    )
+
+    low_y = perception.estimate_object(_frame(), "placement pad", selector="world_y_min")
+    high_y = perception.estimate_object(_frame(), "placement pad", selector="world_y_max")
+
+    assert low_y.score == pytest.approx(0.2)
+    assert high_y.score == pytest.approx(0.9)
+    assert low_y.position[1] < high_y.position[1]
 
 
 def test_rgbd_grasp_camera_to_world_transform(monkeypatch) -> None:
@@ -386,3 +413,188 @@ def test_official_yaml_uses_native_protocol_without_privileged_pose() -> None:
     assert task_config["official_task_protocol"] is True
     assert task_config["step_lim"] == 300
     assert task_config["observations"]["camera"] == ["rgb", "depth"]
+
+
+def test_transfer_easy_gt_yaml_uses_public_anchors_without_sam() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load(
+        (repo / "env_configs/univtac/tactile_transfer_easy_gt.yaml").read_text()
+    )
+    cfg = config["env"]["cfg"]
+    low = cfg["low_level"]
+    franka = low["api_configs"]["franka_control_api"]
+
+    assert low["task_name"] == "tactile_transfer_rearrange_clean"
+    assert low["task_config"] == "tactile_transfer_clean_smoke"
+    assert low["expose_actor_pose"] is False
+    assert low["privileged"] is False
+    assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
+    assert franka["rgbd_perception_enabled"] is False
+    assert "api_servers" not in config
+    assert "Easy-GT engineering check" in cfg["prompt"]
+    assert "get_object_pose(\"object_a\")" in cfg["prompt"]
+    assert "UniVTACTouchManipulationApi" not in cfg["apis"]
+    assert "search_contact" not in cfg["prompt"]
+
+
+def test_transfer_hard_sam_yaml_routes_pose_perception_without_gt_slots() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load(
+        (repo / "env_configs/univtac/tactile_transfer_hard_sam.yaml").read_text()
+    )
+    cfg = config["env"]["cfg"]
+    low = cfg["low_level"]
+    franka = low["api_configs"]["franka_control_api"]
+
+    assert low["task_name"] == "tactile_transfer_rearrange_clean"
+    assert low["task_config"] == "tactile_transfer_clean_smoke"
+    assert low["expose_actor_pose"] is False
+    assert low["privileged"] is False
+    assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
+    assert franka["rgbd_perception_enabled"] is True
+    assert franka["rgbd_pose_enabled"] is True
+    assert franka["rgbd_grasp_enabled"] is False
+    assert franka["rgbd_pose_objects"] == ["object_a", "slot_a", "slot_b"]
+    assert franka["rgbd_grasp_objects"] == []
+    assert franka["public_grasp_anchor_objects"] == [
+        "object_a",
+        "object_b",
+        "current_object",
+    ]
+    assert franka["public_pose_fallback_objects"] == []
+    assert franka["cache_rgbd_pose_objects"] == ["slot_a", "slot_b"]
+    assert franka["perception_selector_map"]["slot_a"] == "world_y_min"
+    assert franka["perception_selector_map"]["slot_b"] == "world_y_max"
+    assert len(config["api_servers"]) == 1
+    assert "launch_sam3_server" in config["api_servers"][0]["_target_"]
+    assert "launch_contact_graspnet_server" not in str(config["api_servers"])
+    assert "get_object_pose(\"object_b\")" in cfg["prompt"]
+    assert "do not call get_object_pose(\"object_b\")" in cfg["prompt"].lower()
+    assert "0.42" not in cfg["prompt"]
+    assert "UniVTACTouchManipulationApi" not in cfg["apis"]
+    assert "search_contact" not in cfg["prompt"]
+
+
+def test_hard_sam_franka_routes_object_and_slot_pose_through_rgbd() -> None:
+    calls: list[tuple[str, str | None]] = []
+    object_estimates = {
+        "object_a": ObjectEstimate(
+            position=np.array([0.58, -0.25, 0.04], dtype=np.float32),
+            quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            extent=np.array([0.04, 0.04, 0.08], dtype=np.float32),
+            mask=_mask(),
+            points_world=np.zeros((16, 3), dtype=np.float32),
+            score=0.8,
+            prompt="cylindrical can",
+        ),
+        "slot_a": ObjectEstimate(
+            position=np.array([0.42, -0.16, 0.025], dtype=np.float32),
+            quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            extent=np.array([0.10, 0.10, 0.02], dtype=np.float32),
+            mask=_mask(),
+            points_world=np.zeros((16, 3), dtype=np.float32),
+            score=0.7,
+            prompt="placement pad",
+        ),
+    }
+
+    class Perception:
+        def estimate_object(self, frame, prompt, *, selector=None):
+            if prompt == "cylindrical can":
+                key = "object_a"
+            elif selector == "world_y_min":
+                key = "slot_a"
+            else:
+                key = "slot_b"
+            calls.append((key, selector))
+            return object_estimates.get(
+                key,
+                ObjectEstimate(
+                    position=np.array([0.42, 0.16, 0.025], dtype=np.float32),
+                    quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    extent=np.array([0.10, 0.10, 0.02], dtype=np.float32),
+                    mask=_mask(),
+                    points_world=np.zeros((16, 3), dtype=np.float32),
+                    score=0.6,
+                    prompt="placement pad",
+                ),
+            )
+
+        def estimate_grasp(self, frame, prompt, *, selector=None):
+            raise AssertionError("Hard-SAM config must not call RGB-D grasp planning")
+
+    class Env:
+        def __init__(self) -> None:
+            self.api_configs = {
+                "franka_control_api": {
+                    "rgbd_perception_enabled": True,
+                    "rgbd_pose_enabled": True,
+                    "rgbd_grasp_enabled": False,
+                    "rgbd_pose_objects": ["object_a", "slot_a", "slot_b"],
+                    "rgbd_grasp_objects": [],
+                    "public_grasp_anchor_objects": [
+                        "object_a",
+                        "object_b",
+                        "current_object",
+                    ],
+                    "public_pose_fallback_objects": [],
+                    "cache_rgbd_pose_objects": ["slot_a", "slot_b"],
+                    "object_pose_names": {
+                        "object_a": "object_a",
+                        "object_b": "object_b",
+                        "slot_a": "slot_a",
+                        "slot_b": "slot_b",
+                    },
+                    "perception_prompt_map": {
+                        "object_a": "cylindrical can",
+                        "slot_a": "placement pad",
+                        "slot_b": "placement pad",
+                    },
+                    "perception_selector_map": {
+                        "slot_a": "world_y_min",
+                        "slot_b": "world_y_max",
+                    },
+                    "perception_retry_attempts": 1,
+                }
+            }
+
+        def get_rgbd_frame(self, camera_name):
+            return _frame()
+
+        def append_perception_artifact(self, record):
+            pass
+
+        def get_public_pose_map(self):
+            raise AssertionError("Hard-SAM pose route must not read public GT poses")
+
+        def get_public_grasp_pose(self, object_name, *, grasp_height):
+            assert object_name == "object_b"
+            return (
+                np.array([0.68, 0.26, grasp_height], dtype=np.float32),
+                np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            )
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.40, 0.0, 0.20],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+                "joint": [0.0] * 8,
+            }
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    api._rgbd_perception = Perception()
+
+    pos, _quat = api.get_object_pose("object_a")
+    np.testing.assert_allclose(pos, [0.58, -0.25, 0.04])
+    slot_pos, _slot_quat = api.get_object_pose("slot_a")
+    np.testing.assert_allclose(slot_pos, [0.42, -0.16, 0.025])
+    cached_slot_pos, _cached_slot_quat = api.get_object_pose("slot_a")
+    np.testing.assert_allclose(cached_slot_pos, slot_pos)
+    grasp_pos, grasp_quat = api.sample_grasp_pose("object_b")
+    np.testing.assert_allclose(grasp_pos, [0.68, 0.26, 0.04])
+    np.testing.assert_allclose(grasp_quat, [1.0, 0.0, 0.0, 0.0])
+
+    with pytest.raises(KeyError, match="configured non-privileged pose route"):
+        api.get_object_pose("object_b")
+    assert calls == [("object_a", None), ("slot_a", "world_y_min")]

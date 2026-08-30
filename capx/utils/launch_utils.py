@@ -179,6 +179,7 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         if getattr(args, "web_ui_port", None) is not None
         else configs_dict.get("web_ui_port", 8200),
         "save_multiturn_prompts": configs_dict.get("save_multiturn_prompts", False),
+        "save_in_progress_code": configs_dict.get("save_in_progress_code", True),
         "tactile_strategy_memory": tactile_strategy_memory_enabled,
         "tactile_strategy_memory_path": tactile_strategy_memory_path,
         "tactile_strategy_memory_read_path": tactile_strategy_memory_read_path,
@@ -655,6 +656,43 @@ def _save_trial_artifacts(
         img.save(trial_dir / f"visual_feedback_{i:02d}.png")
 
     return code_path
+
+
+def _save_in_progress_trial_artifacts(
+    config: dict[str, Any],
+    trial: int,
+    *,
+    final_code: str,
+    raw_code: str | None,
+    all_responses: list[dict],
+) -> str | None:
+    """Persist generated code before physical execution completes.
+
+    Isaac/Omniverse can stall inside a simulator call long enough for an
+    external watchdog to kill the process. This early copy keeps the generated
+    program auditable even when normal trial artifact saving is never reached.
+    """
+    if not config["output_dir"]:
+        return None
+    trial_dir = Path(config["output_dir"]) / f"trial_{trial:02d}_in_progress"
+    trial_dir.mkdir(parents=True, exist_ok=True)
+
+    code_path = trial_dir / "code.py"
+    code_path.write_text(final_code)
+    if raw_code:
+        (trial_dir / "raw_response.sh").write_text(raw_code)
+    (trial_dir / "all_responses.json").write_text(json.dumps(all_responses, indent=2))
+
+    if all_responses:
+        try:
+            initial_prompt_content = all_responses[0].get("initial_prompt")
+            if initial_prompt_content:
+                prompt_text = initial_prompt_content[-1]["content"][0]["text"]
+                (trial_dir / "initial_prompt.txt").write_text(str(prompt_text))
+        except Exception:
+            pass
+    print(f"[capx-trial] in-progress code saved to {code_path}", flush=True)
+    return str(code_path)
 
 
 

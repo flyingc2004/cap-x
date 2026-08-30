@@ -465,8 +465,8 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
     assert touch_low_level["task_config"] == "tactile_transfer_clean_smoke"
     assert touch_low_level["expose_actor_pose"] is False
     assert touch_low_level["privileged"] is False
-    assert touch_low_level["task_config_overrides"]["skip_task_pre_move"] is True
-    assert touch_low_level["task_config_overrides"]["record_video_during_reset"] is False
+    assert touch_low_level["task_config_overrides"]["skip_task_pre_move"] is False
+    assert touch_low_level["task_config_overrides"]["record_video_during_reset"] is True
     assert touch_cfg["apis"] == ["UniVTACTouchManipulationApi", "UniVTACTactileApi"]
     assert "FrankaControlApi" not in touch_cfg["apis"]
     assert "get_object_pose" not in touch_cfg["prompt"]

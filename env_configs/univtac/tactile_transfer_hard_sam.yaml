@@ -1,0 +1,202 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/UniVTAC
+      task_name: tactile_transfer_rearrange_clean
+      task_config: tactile_transfer_clean_smoke
+      seed_base: 0
+      device: cuda:0
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.035
+          max_delta_xyz: 0.012
+          max_delta_rpy: 0.25
+          max_delta_gripper: 0.02
+          default_z_approach: 0.06
+          release_hover_height: 0.14
+          home_pose_relative_lift: true
+          home_lift_delta_z: 0.06
+          preserve_landmark_orientation: true
+          gripper_settle_steps: 10
+          use_task_place_actor_for_landmarks: false
+          use_task_grasp_actor_for_objects: false
+          use_native_pose_planner: false
+          record_perception_diagnostic: false
+          official_anchor_fallback_enabled: false
+          max_goto_pose_actions: 60
+          max_home_pose_actions: 20
+          max_native_pose_actions: 2
+          max_gripper_servo_steps: 180
+          max_gripper_settle_steps: 20
+          lift_after_close: false
+          open_gripper_width: 1.0
+          tactile_adaptive_gripper_enabled: true
+          rgbd_perception_enabled: true
+          rgbd_pose_enabled: true
+          rgbd_grasp_enabled: false
+          rgbd_pose_objects:
+            - object_a
+            - slot_a
+            - slot_b
+          rgbd_grasp_objects: []
+          public_grasp_anchor_objects:
+            - object_a
+            - object_b
+            - current_object
+          public_pose_fallback_objects: []
+          cache_rgbd_pose_objects:
+            - slot_a
+            - slot_b
+          perception_camera: head
+          perception_prompt_map:
+            object_a:
+              - cylindrical can
+              - cylinder
+              - round object
+            slot_a:
+              - placement pad
+              - target pad
+              - flat pad
+            slot_b:
+              - placement pad
+              - target pad
+              - flat pad
+          perception_prompt_fallbacks:
+            object_a:
+              - can
+              - small cylinder
+            slot_a:
+              - pad
+            slot_b:
+              - pad
+          perception_selector_map:
+            object_a: world_y_min
+            slot_a: world_y_min
+            slot_b: world_y_max
+          perception_retry_attempts: 2
+          sam3_service_url: http://127.0.0.1:8114
+          graspnet_service_url: http://127.0.0.1:8115
+          perception_timeout_seconds: 120
+          perception_min_depth_points: 32
+          grasp_local_z_offset: 0.12
+          adaptive_gripper:
+            coarse_qpos_step: 0.0005
+            fine_qpos_step: 0.00005
+            contact_debounce_frames: 2
+            stable_debounce_frames: 3
+            release_debounce_frames: 2
+            settle_steps_per_command: 1
+            contact_force_threshold: 0.08
+            contact_balance_threshold: 0.50
+            depth_contact_margin_mm: 0.5
+            slip_threshold: 0.60
+          object_pose_names:
+            current object: current_object
+            current_object: current_object
+            object: current_object
+            can: current_object
+            current slot: current_slot
+            current_slot: current_slot
+            target: current_slot
+            object_a: object_a
+            object a: object_a
+            first object: object_a
+            object_b: object_b
+            object b: object_b
+            second object: object_b
+            slot_a: slot_a
+            slot a: slot_a
+            target_a: slot_a
+            slot_b: slot_b
+            slot b: slot_b
+            target_b: slot_b
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis:
+      - FrankaControlApi
+      - UniVTACTactileApi
+    prompt: |
+      You are controlling a Franka robot in the UniVTAC tactile_transfer_rearrange_clean Hard-SAM configuration.
+      Move object_a to slot_a first. Move object_b to slot_b only if object_a was grasped, transported, and released without a detected tactile failure.
+      The task reset/pre-move only brings the gripper near object_a; it does not grasp or place either cylinder.
+
+      At the beginning, call get_object_pose("slot_a") and get_object_pose("slot_b") and save those returned poses in Python variables. These slot poses come from head-camera RGB-D and SAM and are cached by the API for later use.
+      For object_a, call get_object_pose("object_a") once for visual RGB-D localization if useful, but use sample_grasp_pose("object_a") as the coarse side-grasp pose.
+      For object_b, do not call get_object_pose("object_b"). The scene can physically occlude object_b from the camera. Use sample_grasp_pose("object_b") only as a coarse pre-move anchor, then rely on UniVTAC native tactile feedback and get_robot_state() for the final millimeters.
+
+      Write the program as a bounded helper that returns True or False, for example grasp_place_once(object_name, slot_pos, slot_quat). The main code should be:
+      slot_a_pos, slot_a_quat = get_object_pose("slot_a")
+      slot_b_pos, slot_b_quat = get_object_pose("slot_b")
+      success_a = grasp_place_once("object_a", slot_a_pos, slot_a_quat)
+      if success_a:
+          grasp_place_once("object_b", slot_b_pos, slot_b_quat)
+      Do not run object_b after object_a fails.
+
+      Use this exact one-line diagnostic protocol so later CaP-X regeneration turns can understand failures from stdout. Values must be lowercase snake_case with no spaces.
+      Print CAPX_EVENT after every close_gripper call and after every lift increment:
+      CAPX_EVENT object=<object_name> phase=<approach|close|retry|lift|transport|release> reason=<reason> action=<action> stable=<true|false> contact=<true|false> left=<true|false> right=<true|false> force=<float> slip=<float>
+      Print CAPX_FAILURE immediately before every return False:
+      CAPX_FAILURE object=<object_name> phase=<phase> reason=<missed_grasp|one_sided_contact|weak_contact|unstable_grasp|contact_lost|slip_detected|motion_failed|release_failed> action=<next_action_or_stop> stable=<true|false> contact=<true|false> left=<true|false> right=<true|false> force=<float> slip=<float>
+      Print CAPX_SUCCESS immediately after each object is released and the helper returns True:
+      CAPX_SUCCESS object=<object_name> phase=release reason=released_at_slot action=continue_or_finish stable=<true|false> contact=<true|false> left=<true|false> right=<true|false> force=<float> slip=<float>
+
+      For each object, use this exact high-level sequence:
+      1. open_gripper(adaptive=True, max_steps between 20 and 40).
+      2. grasp_pos, grasp_quat = sample_grasp_pose(object_name).
+      3. goto_pose(grasp_pos, grasp_quat, z_approach between 0.03 and 0.06 meters), then check the returned dict when available. If the motion fails, return False.
+      4. grasp_result = close_gripper(adaptive=True, target_force between 0.75 and 0.95, max_steps between 60 and 100).
+      5. summary = get_tactile_summary(window=20, hand="both"). Treat the grasp as usable only when grasp_result["stable"] is true or is_grasp_stable(threshold=0.5) is true.
+      6. If the first close is not stable, do exactly one local retry inside this code block. Reopen with open_gripper(adaptive=True, max_steps between 20 and 40), return near the original grasp pose, lower z by 0.003 to 0.008 m if there was no contact or weak contact, and close again with target_force between 0.75 and 0.95 and max_steps between 60 and 100. Do not use blind lateral offsets after one-sided contact.
+      7. If the retry is still not stable, open the gripper with max_steps between 20 and 40 and return False. Do not call home_pose() in this failure path.
+      8. Lift in two or three small increments of 0.03 to 0.05 m using goto_pose from the current ee pose. After each increment, call get_tactile_summary(window=20, hand="both"). If contact is lost, one side disappears, or is_slipping(threshold=0.6) is true, stop, open the gripper, and return False.
+      9. Move to 0.06 to 0.09 m above the slot, descend to 0.04 to 0.06 m above the slot support, release with open_gripper(adaptive=True, max_steps between 20 and 40), wait_steps between 6 and 12, retreat upward by 0.04 to 0.07 m, and return True.
+
+      Keep each code block short and deterministic. Internal physical retry is only for small local correction; do not let one block keep searching. Use for loops with fixed small ranges only; do not use unbounded while loops. The ranges above are recommendations, but these hard limits must still hold: close_gripper max_steps <= 100, open_gripper max_steps <= 40, local z retry adjustment <= 0.008 m, lift increment <= 0.05 m. In one generated block, use at most two close_gripper calls per object and at most one local retry per object.
+      Use only FrankaControlApi and UniVTACTactileApi. Do not call low-level move_delta_ee, move_ee, or move_qpos functions. Do not read reward, success, task_completed, metadata, material class, density, friction, live actor pose, private task fields, or trial id. Do not load or call UniVTAC ACT or ViTAL policies.
+    multi_turn_prompt: |
+      Executed code:
+      {executed_code}
+
+      Console stdout:
+      {console_stdout}
+
+      Console stderr:
+      {console_stderr}
+
+      Use CaP-X as an agent-level closed loop. The previous code block may have failed physically even when Python execution succeeded. First scan stdout for CAPX_EVENT, CAPX_FAILURE, and CAPX_SUCCESS lines, then read the raw tactile/franka logs and stderr. Use the latest CAPX_FAILURE as the primary failure signature.
+      When regenerating, change the strategy according to that signature: missed_grasp means return to the coarse grasp pose and lower slightly within the recommended retry range; one_sided_contact means avoid repeating the same blind lateral offset and use a smaller z/pose correction; weak_contact or unstable_grasp means adjust approach depth or target_force within the recommended range; slip_detected or contact_lost means reduce lift increments within the recommended range and reclose before further transport; motion_failed means reduce travel height or split motion into smaller bounded moves.
+      Then choose:
+      - CONTINUE only when the previous block deliberately left useful remaining code.
+      - REGENERATE when grasp contact was weak, one-sided, missed, slipped, lost during lift, or when placement/release did not finish. Generate a new bounded corrective Python block that changes the strategy based on the tactile failure reason instead of repeating the same moves.
+      - FINISH only when the task is done, repeated corrections are unsafe, or the process is near timeout.
+      Each regenerated block must keep printing the CAPX_EVENT/CAPX_FAILURE/CAPX_SUCCESS protocol and must be short: no unbounded while loops, at most one local physical retry per object, close_gripper max_steps <= 100, open_gripper max_steps <= 40, no home_pose recovery, and no more than one object should be attempted unless the previous object was clearly completed.
+api_servers:
+  - _target_: capx.serving.launch_sam3_server.main
+    device: cuda
+    port: 8114
+    host: 127.0.0.1
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/univtac_tactile_transfer_hard_sam
+trial_timeout_seconds: 900
+max_trial_retries: 1
+max_regenerations: 10
+save_multiturn_prompts: true
+filter_multiturn_console: true
+multiturn_console_max_lines: 80
+multiturn_console_max_chars: 12000
+multiturn_console_keep_recent_other: 12
+tactile_code_memory:
+  enabled: false
+  mode: read
+  path: .capx_tactile_code_memory/lift_can_v1/bank.jsonl
+  top_k_initial: 0
+  top_k_runtime: 0
+  runtime_retrieval: false
+  max_repair_turns: 0

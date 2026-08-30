@@ -91,6 +91,13 @@ def is_openrouter_model(model: str) -> bool:
     return model.startswith("openrouter/") or model in OPENROUTER_MODELS
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 @dataclass
 class ModelQueryArgs:
     """Arguments for querying a model."""
@@ -121,17 +128,30 @@ class _SimpleResponse:
 
 
 def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float):
+    data = json.dumps(payload)
+    disable_proxy = _env_flag("CAPX_DISABLE_PROXY", False)
+    trust_env = _env_flag("CAPX_LLM_TRUST_ENV", True) and not disable_proxy
+
     if requests is not None:
-        return requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout)
+        if trust_env:
+            return requests.post(url, headers=headers, data=data, timeout=timeout)
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.post(url, headers=headers, data=data, timeout=timeout)
 
     req = urllib.request.Request(
         url,
-        data=json.dumps(payload).encode("utf-8"),
+        data=data.encode("utf-8"),
         headers=headers,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        opener = (
+            urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            if disable_proxy
+            else urllib.request
+        )
+        with opener.open(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8", errors="replace")
             return _SimpleResponse(resp.status, dict(resp.headers.items()), text)
     except urllib.error.HTTPError as exc:
@@ -144,6 +164,40 @@ def _disable_thinking_requested(args: Any) -> bool:
     if value:
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return str(getattr(args, "model", "")).lower().startswith("qwen")
+
+
+def _payload_stats(payload: dict[str, Any]) -> dict[str, int]:
+    stats = {
+        "messages": 0,
+        "text_chars": 0,
+        "image_items": 0,
+        "image_url_chars": 0,
+        "json_bytes": len(json.dumps(payload).encode("utf-8")),
+    }
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return stats
+    stats["messages"] = len(messages)
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            stats["text_chars"] += len(content)
+        elif isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "text":
+                    stats["text_chars"] += len(str(item.get("text", "")))
+                elif item_type == "image_url":
+                    stats["image_items"] += 1
+                    image_url = item.get("image_url")
+                    if isinstance(image_url, dict):
+                        image_url = image_url.get("url", "")
+                    stats["image_url_chars"] += len(str(image_url))
+    return stats
 
 
 def collapse_text_image_inputs(messages: list[dict]) -> list[dict]:
@@ -300,13 +354,25 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     request_timeout = float(os.getenv("CAPX_LLM_TIMEOUT_SECONDS", "200"))
     max_retries = max(0, int(os.getenv("CAPX_LLM_MAX_RETRIES", "1")))
     retry_sleep = float(os.getenv("CAPX_LLM_RETRY_SLEEP_SECONDS", "10"))
+    payload_stats = _payload_stats(payload)
+    disable_proxy = _env_flag("CAPX_DISABLE_PROXY", False)
+    trust_env = _env_flag("CAPX_LLM_TRUST_ENV", True) and not disable_proxy
 
     # keep calling until it works
     print(
         f"[capx-llm] querying model={args.model} url={server_url} "
         f"timeout={request_timeout:g}s max_tokens={args.max_tokens} "
         f"max_retries={max_retries} "
-        f"disable_thinking={payload.get('enable_thinking') is False}"
+        f"disable_thinking={payload.get('enable_thinking') is False} "
+        f"trust_env={trust_env}"
+    )
+    print(
+        "[capx-llm] payload "
+        f"messages={payload_stats['messages']} "
+        f"text_chars={payload_stats['text_chars']} "
+        f"image_items={payload_stats['image_items']} "
+        f"image_url_chars={payload_stats['image_url_chars']} "
+        f"json_bytes={payload_stats['json_bytes']}"
     )
     response = _post_json(server_url, headers=headers, payload=payload, timeout=request_timeout)
     retry = 1

@@ -58,6 +58,14 @@ class UniVTACFrankaCompatApi(ApiBase):
         tactile_adaptive_gripper_enabled: bool = True,
         object_pose_names: dict[str, str] | None = None,
         rgbd_perception_enabled: bool = False,
+        rgbd_pose_enabled: bool | None = None,
+        rgbd_grasp_enabled: bool | None = None,
+        rgbd_pose_objects: list[str] | tuple[str, ...] | None = None,
+        rgbd_grasp_objects: list[str] | tuple[str, ...] | None = None,
+        public_pose_fallback_objects: list[str] | tuple[str, ...] | None = None,
+        public_grasp_anchor_objects: list[str] | tuple[str, ...] | None = None,
+        cache_rgbd_pose_objects: list[str] | tuple[str, ...] | None = None,
+        perception_selector_map: dict[str, str] | None = None,
         perception_camera: str = "head",
         perception_prompt_map: dict[str, str] | None = None,
         sam3_service_url: str = "http://127.0.0.1:8114",
@@ -154,6 +162,56 @@ class UniVTACFrankaCompatApi(ApiBase):
         self.rgbd_perception_enabled = bool(
             cfg.get("rgbd_perception_enabled", rgbd_perception_enabled)
         )
+        self.rgbd_pose_enabled = bool(
+            cfg.get(
+                "rgbd_pose_enabled",
+                self.rgbd_perception_enabled if rgbd_pose_enabled is None else rgbd_pose_enabled,
+            )
+        )
+        self.rgbd_grasp_enabled = bool(
+            cfg.get(
+                "rgbd_grasp_enabled",
+                self.rgbd_perception_enabled
+                if rgbd_grasp_enabled is None
+                else rgbd_grasp_enabled,
+            )
+        )
+        pose_objects_raw = cfg.get("rgbd_pose_objects", rgbd_pose_objects)
+        grasp_objects_raw = cfg.get("rgbd_grasp_objects", rgbd_grasp_objects)
+        public_pose_raw = cfg.get(
+            "public_pose_fallback_objects",
+            public_pose_fallback_objects,
+        )
+        public_grasp_raw = cfg.get(
+            "public_grasp_anchor_objects",
+            public_grasp_anchor_objects,
+        )
+        cache_pose_raw = cfg.get("cache_rgbd_pose_objects", cache_rgbd_pose_objects)
+        self.rgbd_pose_objects = self._optional_normalized_object_set(
+            pose_objects_raw,
+            object_pose_names=self.object_pose_names,
+        )
+        self.rgbd_grasp_objects = self._optional_normalized_object_set(
+            grasp_objects_raw,
+            object_pose_names=self.object_pose_names,
+        )
+        self.public_pose_fallback_objects = self._normalize_object_set(
+            public_pose_raw,
+            object_pose_names=self.object_pose_names,
+        )
+        self.public_grasp_anchor_objects = self._optional_normalized_object_set(
+            public_grasp_raw,
+            object_pose_names=self.object_pose_names,
+        )
+        self.cache_rgbd_pose_objects = self._normalize_object_set(
+            cache_pose_raw,
+            object_pose_names=self.object_pose_names,
+        )
+        self.perception_selector_map = self._normalize_selector_map(
+            cfg.get("perception_selector_map", perception_selector_map or {}),
+            object_pose_names=self.object_pose_names,
+        )
+        self._rgbd_pose_cache: dict[str, Any] = {}
         current_tool_pose_objects = cfg.get(
             "current_tool_pose_grasp_objects",
             current_tool_pose_grasp_objects or (),
@@ -256,17 +314,33 @@ class UniVTACFrankaCompatApi(ApiBase):
             ``(position, quaternion_wxyz, bbox_extent)``.
         """
         key = self._resolve_pose_key(object_name)
-        if self.rgbd_perception_enabled:
+        if self._should_use_rgbd_pose(key):
+            cached = self._cached_rgbd_pose(key)
+            if cached is not None:
+                estimate = cached
+                print(
+                    "[univtac-franka] pose_source=rgbd_cache "
+                    f"object={key} points={len(estimate.points_world)} "
+                    f"score={estimate.score:.3f}",
+                    flush=True,
+                )
+                if return_bbox_extent:
+                    return estimate.position, estimate.quaternion_wxyz, estimate.extent
+                return estimate.position, estimate.quaternion_wxyz
             estimate, frame, prompt, attempt = self._estimate_rgbd_with_retry(
                 key,
                 kind="object_pose",
             )
+            if self._normalize_name(key) in self.cache_rgbd_pose_objects:
+                self._rgbd_pose_cache[self._normalize_name(key)] = estimate
+            selector = self._perception_selector(key)
             self._append_perception_artifact(
                 {
                     "kind": "object_pose",
                     "source": "rgbd",
                     "object_name": key,
                     "prompt": prompt,
+                    "selector": selector,
                     "attempt": attempt,
                     "frame": frame,
                     "mask": estimate.mask,
@@ -286,6 +360,23 @@ class UniVTACFrankaCompatApi(ApiBase):
             if return_bbox_extent:
                 return estimate.position, estimate.quaternion_wxyz, estimate.extent
             return estimate.position, estimate.quaternion_wxyz
+
+        if self._rgbd_pose_routes_are_restricted():
+            public_pose = self._public_pose_fallback(key)
+            if public_pose is None:
+                raise KeyError(
+                    f"object '{object_name}' is not available by configured "
+                    "non-privileged pose route"
+                )
+            pos, quat, extent = public_pose
+            print(
+                "[univtac-franka] pose_source=public_fallback "
+                f"object={key}",
+                flush=True,
+            )
+            if return_bbox_extent:
+                return pos, quat, extent
+            return pos, quat
 
         landmarks = self._public_landmarks()
         if key not in landmarks:
@@ -313,7 +404,7 @@ class UniVTACFrankaCompatApi(ApiBase):
                 flush=True,
             )
             return tool_pos, tool_quat
-        if self.rgbd_perception_enabled:
+        if self._should_use_rgbd_grasp(key):
             try:
                 estimate, frame, prompt, attempt = self._estimate_rgbd_with_retry(
                     key,
@@ -330,6 +421,7 @@ class UniVTACFrankaCompatApi(ApiBase):
                     "source": "rgbd_contact_graspnet",
                     "object_name": key,
                     "prompt": prompt,
+                    "selector": self._perception_selector(key),
                     "attempt": attempt,
                     "frame": frame,
                     "mask": estimate.mask,
@@ -352,6 +444,11 @@ class UniVTACFrankaCompatApi(ApiBase):
             )
             return estimate.position, estimate.quaternion_wxyz
 
+        if not self._allows_public_grasp_anchor(key):
+            raise KeyError(
+                f"object '{object_name}' is not available for configured public "
+                "grasp anchor sampling"
+            )
         grasp_pose = self._public_grasp_pose(key)
         if grasp_pose is not None:
             return grasp_pose
@@ -670,6 +767,7 @@ class UniVTACFrankaCompatApi(ApiBase):
     def _estimate_rgbd_with_retry(self, key: str, *, kind: str) -> tuple[Any, Any, str, int]:
         prompts = self._perception_prompts(key)
         source = "rgbd_contact_graspnet" if kind == "grasp_pose" else "rgbd"
+        selector = self._perception_selector(key)
         errors: list[dict[str, Any]] = []
         for attempt in range(1, self.perception_retry_attempts + 1):
             try:
@@ -681,6 +779,7 @@ class UniVTACFrankaCompatApi(ApiBase):
                     source=source,
                     attempt=attempt,
                     prompt=None,
+                    selector=selector,
                     frame=None,
                     exc=exc,
                 )
@@ -690,10 +789,24 @@ class UniVTACFrankaCompatApi(ApiBase):
             for prompt in prompts:
                 try:
                     if kind == "grasp_pose":
-                        estimate = self._rgbd_perception.estimate_grasp(frame, prompt)
+                        if selector == "best_score":
+                            estimate = self._rgbd_perception.estimate_grasp(frame, prompt)
+                        else:
+                            estimate = self._rgbd_perception.estimate_grasp(
+                                frame,
+                                prompt,
+                                selector=selector,
+                            )
                         extra = f"candidates={len(estimate.scores)}"
                     elif kind == "object_pose":
-                        estimate = self._rgbd_perception.estimate_object(frame, prompt)
+                        if selector == "best_score":
+                            estimate = self._rgbd_perception.estimate_object(frame, prompt)
+                        else:
+                            estimate = self._rgbd_perception.estimate_object(
+                                frame,
+                                prompt,
+                                selector=selector,
+                            )
                         extra = f"points={len(estimate.points_world)}"
                     else:
                         raise ValueError(f"unknown RGB-D estimate kind {kind!r}")
@@ -704,6 +817,7 @@ class UniVTACFrankaCompatApi(ApiBase):
                         source=source,
                         attempt=attempt,
                         prompt=prompt,
+                        selector=selector,
                         frame=frame,
                         exc=exc,
                     )
@@ -713,7 +827,7 @@ class UniVTACFrankaCompatApi(ApiBase):
                 print(
                     "[univtac-franka] rgbd_retry "
                     f"kind={kind} object={key} attempt={attempt} "
-                    f"prompt={prompt!r} ok=True {extra}",
+                    f"prompt={prompt!r} selector={selector} ok=True {extra}",
                     flush=True,
                 )
                 return estimate, frame, prompt, attempt
@@ -743,6 +857,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         source: str,
         attempt: int,
         prompt: str | None,
+        selector: str,
         frame: Any | None,
         exc: Exception,
     ) -> dict[str, Any]:
@@ -756,6 +871,7 @@ class UniVTACFrankaCompatApi(ApiBase):
             "object_name": key,
             "attempt": int(attempt),
             "prompt": prompt,
+            "selector": selector,
             "reason": reason,
             "message": message,
             "diagnostics": diagnostics,
@@ -773,7 +889,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         print(
             "[univtac-franka] rgbd_retry "
             f"kind={kind} object={key} attempt={attempt} "
-            f"prompt={prompt!r} ok=False reason={reason} "
+            f"prompt={prompt!r} selector={selector} ok=False reason={reason} "
             f"valid_depth_points={diagnostics.get('valid_depth_points', 'n/a')}",
             flush=True,
         )
@@ -856,6 +972,78 @@ class UniVTACFrankaCompatApi(ApiBase):
             mapped = object_pose_names.get(key, key.replace(" ", "_"))
             normalized.add(str(mapped).strip().lower().replace(" ", "_"))
         return normalized
+
+    @staticmethod
+    def _optional_normalized_object_set(
+        raw: Any,
+        *,
+        object_pose_names: dict[str, str],
+    ) -> set[str] | None:
+        if raw is None:
+            return None
+        return UniVTACFrankaCompatApi._normalize_object_set(
+            raw,
+            object_pose_names=object_pose_names,
+        )
+
+    @staticmethod
+    def _normalize_selector_map(
+        raw: Any,
+        *,
+        object_pose_names: dict[str, str],
+    ) -> dict[str, str]:
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, str] = {}
+        for key, value in raw.items():
+            raw_key = str(key).strip().lower()
+            if not raw_key:
+                continue
+            mapped = object_pose_names.get(raw_key, raw_key.replace(" ", "_"))
+            selector = str(value).strip().lower().replace("-", "_")
+            if selector:
+                out[str(mapped).strip().lower().replace(" ", "_")] = selector
+        return out
+
+    def _should_use_rgbd_pose(self, key: str) -> bool:
+        if not self.rgbd_pose_enabled:
+            return False
+        normalized = self._normalize_name(key)
+        return self.rgbd_pose_objects is None or normalized in self.rgbd_pose_objects
+
+    def _should_use_rgbd_grasp(self, key: str) -> bool:
+        if not self.rgbd_grasp_enabled:
+            return False
+        normalized = self._normalize_name(key)
+        return self.rgbd_grasp_objects is None or normalized in self.rgbd_grasp_objects
+
+    def _rgbd_pose_routes_are_restricted(self) -> bool:
+        return self.rgbd_pose_enabled and self.rgbd_pose_objects is not None
+
+    def _allows_public_grasp_anchor(self, key: str) -> bool:
+        normalized = self._normalize_name(key)
+        return (
+            self.public_grasp_anchor_objects is None
+            or normalized in self.public_grasp_anchor_objects
+        )
+
+    def _public_pose_fallback(
+        self,
+        key: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        normalized = self._normalize_name(key)
+        if normalized not in self.public_pose_fallback_objects:
+            return None
+        return self._public_landmarks().get(normalized)
+
+    def _cached_rgbd_pose(self, key: str) -> Any | None:
+        normalized = self._normalize_name(key)
+        if normalized not in self.cache_rgbd_pose_objects:
+            return None
+        return self._rgbd_pose_cache.get(normalized)
+
+    def _perception_selector(self, key: str) -> str:
+        return self.perception_selector_map.get(self._normalize_name(key), "best_score")
 
     def _perception_prompts(self, key: str) -> list[str]:
         normalized = str(key).strip().lower().replace(" ", "_")
@@ -1429,17 +1617,20 @@ class UniVTACFrankaCompatApi(ApiBase):
             return None
 
     def _public_grasp_pose(self, key: str) -> tuple[np.ndarray, np.ndarray] | None:
+        normalized = self._normalize_name(key)
         if key != "prism":
-            sampled = self._sample_public_grasp_from_env(key)
+            sampled = self._sample_public_grasp_from_env(normalized)
             if sampled is not None:
                 return sampled
+            if self.public_grasp_anchor_objects is not None:
+                return None
 
-        if self._public_actor_pose(key) is None:
+        if self._public_actor_pose(normalized) is None:
             return None
-        sampled = self._sample_public_grasp_from_env(key)
+        sampled = self._sample_public_grasp_from_env(normalized)
         if sampled is not None:
             return sampled
-        if key == "prism":
+        if normalized == "prism":
             pos = self._public_prism_pose()
             if pos is not None:
                 grasp_pos = pos.copy()

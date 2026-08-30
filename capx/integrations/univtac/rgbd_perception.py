@@ -15,6 +15,12 @@ from scipy.spatial.transform import Rotation as SciRotation
 
 
 @dataclass(frozen=True)
+class SegmentationCandidate:
+    mask: np.ndarray
+    score: float
+
+
+@dataclass(frozen=True)
 class RgbdFrame:
     """One calibrated RGB-D observation in the ROS optical camera frame."""
 
@@ -117,9 +123,15 @@ class UniVTACRgbdPerception:
         radii = [max(0, int(radius)) for radius in mask_dilation_radii]
         self.mask_dilation_radii = tuple(dict.fromkeys(radii or [0]))
 
-    def estimate_object(self, frame: RgbdFrame, prompt: str) -> ObjectEstimate:
+    def estimate_object(
+        self,
+        frame: RgbdFrame,
+        prompt: str,
+        *,
+        selector: str | None = None,
+    ) -> ObjectEstimate:
         frame = frame.validated()
-        mask, score = self._segment(frame.rgb, prompt)
+        mask, score = self._segment_for_selector(frame, prompt, selector)
         points_world, depth_mask, _diagnostics = self.masked_points_world_with_mask(frame, mask)
         try:
             position, quaternion, extent = _oriented_bounding_box(points_world)
@@ -140,9 +152,15 @@ class UniVTACRgbdPerception:
             prompt=str(prompt),
         )
 
-    def estimate_grasp(self, frame: RgbdFrame, prompt: str) -> GraspEstimate:
+    def estimate_grasp(
+        self,
+        frame: RgbdFrame,
+        prompt: str,
+        *,
+        selector: str | None = None,
+    ) -> GraspEstimate:
         frame = frame.validated()
-        mask, _score = self._segment(frame.rgb, prompt)
+        mask, _score = self._segment_for_selector(frame, prompt, selector)
         # Validate masked depth before invoking the heavier grasp service.
         points_world, depth_mask, _diagnostics = self.masked_points_world_with_mask(frame, mask)
         try:
@@ -280,7 +298,24 @@ class UniVTACRgbdPerception:
         }
         return points_world, best_mask, diagnostics
 
+    def _segment_for_selector(
+        self,
+        frame: RgbdFrame,
+        prompt: str,
+        selector: str | None,
+    ) -> tuple[np.ndarray, float]:
+        selector_key = self._normalize_selector(selector)
+        if selector_key == "best_score":
+            return self._segment(frame.rgb, prompt)
+        candidates = self._segment_candidates(frame.rgb, prompt)
+        return self._select_candidate_by_world_axis(frame, candidates, selector_key)
+
     def _segment(self, rgb: np.ndarray, prompt: str) -> tuple[np.ndarray, float]:
+        candidates = self._segment_candidates(rgb, prompt)
+        best = max(candidates, key=lambda item: item.score)
+        return best.mask, best.score
+
+    def _segment_candidates(self, rgb: np.ndarray, prompt: str) -> list[SegmentationCandidate]:
         payload = {
             "image_base64": _encode_png(rgb),
             "text_prompt": str(prompt),
@@ -303,19 +338,92 @@ class UniVTACRgbdPerception:
                 "sam3_no_detection",
                 f"SAM3 returned no detection for {prompt!r}",
             )
-        best = max(results, key=lambda item: float(item.get("score", 0.0)))
-        try:
-            shape = tuple(int(v) for v in best["shape"])
-            mask = np.frombuffer(
-                base64.b64decode(best["mask_base64"]),
-                dtype=np.uint8,
-            ).reshape(shape)
-        except (KeyError, TypeError, ValueError) as exc:
+        candidates: list[SegmentationCandidate] = []
+        for item in results:
+            try:
+                shape = tuple(int(v) for v in item["shape"])
+                mask = np.frombuffer(
+                    base64.b64decode(item["mask_base64"]),
+                    dtype=np.uint8,
+                ).reshape(shape)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RgbdPerceptionError(
+                    "sam3_invalid_mask",
+                    f"SAM3 returned an invalid mask: {exc}",
+                ) from exc
+            candidates.append(
+                SegmentationCandidate(
+                    mask=np.asarray(mask, dtype=bool).squeeze(),
+                    score=float(item.get("score", 0.0)),
+                )
+            )
+        return candidates
+
+    @staticmethod
+    def _normalize_selector(selector: str | None) -> str:
+        key = str(selector or "best_score").strip().lower().replace("-", "_")
+        return key or "best_score"
+
+    def _select_candidate_by_world_axis(
+        self,
+        frame: RgbdFrame,
+        candidates: list[SegmentationCandidate],
+        selector: str,
+    ) -> tuple[np.ndarray, float]:
+        axis_map = {
+            "world_x_min": (0, "min"),
+            "world_x_max": (0, "max"),
+            "world_y_min": (1, "min"),
+            "world_y_max": (1, "max"),
+            "world_z_min": (2, "min"),
+            "world_z_max": (2, "max"),
+        }
+        if selector not in axis_map:
             raise RgbdPerceptionError(
-                "sam3_invalid_mask",
-                f"SAM3 returned an invalid mask: {exc}",
-            ) from exc
-        return np.asarray(mask, dtype=bool).squeeze(), float(best.get("score", 0.0))
+                "unsupported_selector",
+                f"Unsupported SAM/RGB-D selector {selector!r}",
+            )
+        axis, direction = axis_map[selector]
+        scored: list[tuple[float, float, SegmentationCandidate]] = []
+        errors: list[dict[str, Any]] = []
+        for candidate in candidates:
+            try:
+                points_world, _mask, diagnostics = self.masked_points_world_with_mask(
+                    frame,
+                    candidate.mask,
+                )
+            except RgbdPerceptionError as exc:
+                errors.append(
+                    {
+                        "reason": exc.reason,
+                        "message": str(exc),
+                        "diagnostics": exc.diagnostics,
+                        "score": candidate.score,
+                    }
+                )
+                continue
+            axis_value = float(np.median(points_world[:, axis]))
+            scored.append((axis_value, float(candidate.score), candidate))
+            errors.append(
+                {
+                    "reason": "ok",
+                    "selector_axis_value": axis_value,
+                    "diagnostics": diagnostics,
+                    "score": candidate.score,
+                }
+            )
+        if not scored:
+            best_mask = max(candidates, key=lambda item: item.score).mask if candidates else None
+            raise RgbdPerceptionError(
+                "selector_no_valid_depth",
+                f"SAM/RGB-D selector {selector!r} had no candidate with valid depth",
+                diagnostics={"selector": selector, "candidate_errors": errors},
+                mask=best_mask,
+            )
+        selected = min(scored, key=lambda item: (item[0], -item[1]))
+        if direction == "max":
+            selected = max(scored, key=lambda item: (item[0], item[1]))
+        return selected[2].mask, selected[2].score
 
     def _request_grasps(
         self,
