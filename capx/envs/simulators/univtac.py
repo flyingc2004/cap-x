@@ -45,6 +45,12 @@ class UniVTACLowLevelEnv(BaseEnv):
         expose_actor_pose: bool = True,
         max_steps: int | None = None,
         video_size: tuple[int, int] = (960, 320),
+        live_preview_enabled: bool = False,
+        live_preview_path: str | os.PathLike[str] | None = (
+            "/mnt/sdc/ljz/t-cap/capx-runs/latest_preview.jpg"
+        ),
+        live_preview_stride: int = 5,
+        live_preview_jpeg_quality: int = 80,
         tactile_buffer_size: int = 500,
         lift_success_height_delta: float = 0.10,
         lift_success_require_contact: bool = True,
@@ -63,6 +69,14 @@ class UniVTACLowLevelEnv(BaseEnv):
         self.expose_actor_pose = bool(expose_actor_pose)
         self.max_steps = int(max_steps) if max_steps is not None else 999999
         self.video_size = tuple(video_size)
+        self.live_preview_enabled = bool(live_preview_enabled)
+        self.live_preview_path = (
+            Path(live_preview_path).expanduser() if live_preview_path else None
+        )
+        self.live_preview_stride = max(1, int(live_preview_stride))
+        self.live_preview_jpeg_quality = int(
+            np.clip(int(live_preview_jpeg_quality), 1, 95)
+        )
         self._record_action_frames = True
         self._video_frame_stride = 1
         self._record_pre_move_frames = True
@@ -84,6 +98,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._last_recorded_tactile_step: int | None = None
         self._last_recorded_video_step: int | None = None
         self._video_record_failures = 0
+        self._live_preview_write_failures = 0
         self._last_action_result: dict[str, Any] = {}
         self._sim_step_count = 0
         self._start_time = time.time()
@@ -127,6 +142,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._last_recorded_tactile_step = None
         self._last_recorded_video_step = None
         self._video_record_failures = 0
+        self._live_preview_write_failures = 0
         self._last_action_result = {}
         self._sim_step_count = 0
         self._start_time = time.time()
@@ -1660,12 +1676,38 @@ class UniVTACLowLevelEnv(BaseEnv):
         if not force and self._last_recorded_video_step == step:
             return
         obs = obs or self._read_native_observation(include_camera=True, include_tactile=True)
-        self._frame_buffer.append(self._compose_frame(obs))
+        frame = self._compose_frame(obs)
+        self._frame_buffer.append(frame)
         self._last_recorded_video_step = step
+        self._write_live_preview(frame, force=force)
         if self._record_wrist_camera:
             wrist = obs.get("observation", {}).get("wrist", {}).get("rgb")
             if wrist is not None:
                 self._wrist_frame_buffer.append(_as_uint8_rgb(wrist))
+
+    def _write_live_preview(self, frame: np.ndarray, *, force: bool = False) -> None:
+        if not self.live_preview_enabled or self.live_preview_path is None:
+            return
+        if not force and len(self._frame_buffer) % self.live_preview_stride != 0:
+            return
+        try:
+            out_path = self.live_preview_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = out_path.with_name(f".{out_path.name}.tmp")
+            image = Image.fromarray(np.ascontiguousarray(_as_uint8_rgb(frame)))
+            image.save(
+                tmp_path,
+                format="JPEG",
+                quality=self.live_preview_jpeg_quality,
+            )
+            tmp_path.replace(out_path)
+        except Exception as exc:
+            self._live_preview_write_failures += 1
+            if self._live_preview_write_failures <= 3:
+                print(
+                    f"WARNING: failed to write UniVTAC live preview: {exc!r}",
+                    flush=True,
+                )
 
     def _refresh_public_pose_cache(self) -> None:
         """Cache only task-declared public anchors and slots for LLM APIs."""

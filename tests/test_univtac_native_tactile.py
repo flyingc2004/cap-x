@@ -974,6 +974,37 @@ def test_univtac_franka_compat_can_pregrasp_anchor_uses_current_tool_pose() -> N
     np.testing.assert_allclose(grasp_quat, [1.0, 0.0, 0.0, 0.0])
 
 
+def test_univtac_franka_robot_state_uses_gripper_center_control_frame() -> None:
+    class Pose:
+        p = np.array([0.50, -0.10, 0.075], dtype=np.float32)
+        q = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+
+    class RobotManager:
+        def get_gripper_center_pose(self):
+            return Pose()
+
+    class Task:
+        _robot_manager = RobotManager()
+
+    class Env:
+        task = Task()
+        api_configs = {"franka_control_api": {}}
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.50, -0.10, 0.205],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+                "joint": [0.0] * 8,
+            }
+
+    state = UniVTACFrankaCompatApi(Env()).get_robot_state()
+
+    np.testing.assert_allclose(state["ee_pos"], [0.50, -0.10, 0.075])
+    np.testing.assert_allclose(state["tool_pos"], state["ee_pos"])
+    np.testing.assert_allclose(state["raw_ee_pos"], [0.50, -0.10, 0.205])
+    assert state["control_frame"] == "gripper_center"
+
+
 def test_univtac_franka_compat_exposes_transfer_public_anchors() -> None:
     object_a = (
         np.array([0.58, -0.26, 0.04], dtype=np.float32),

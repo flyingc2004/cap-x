@@ -9,6 +9,10 @@ env:
       task_config: tactile_transfer_clean_smoke
       seed_base: 0
       device: cuda:0
+      live_preview_enabled: true
+      live_preview_path: /mnt/sdc/ljz/t-cap/capx-runs/latest_preview.jpg
+      live_preview_stride: 5
+      live_preview_jpeg_quality: 80
       api_configs:
         franka_control_api:
           min_safe_z: 0.035
@@ -22,7 +26,12 @@ env:
           preserve_landmark_orientation: true
           gripper_settle_steps: 10
           use_task_place_actor_for_landmarks: false
-          use_task_grasp_actor_for_objects: false
+          use_task_grasp_actor_for_objects: true
+          grasp_xy_tolerance: 0.08
+          grasp_z_tolerance: 0.04
+          grasp_pre_dis: 0.04
+          grasp_dis: 0.0
+          grasp_height: 0.04
           use_native_pose_planner: false
           record_perception_diagnostic: false
           official_anchor_fallback_enabled: false
@@ -129,12 +138,12 @@ env:
       For object_a, call get_object_pose("object_a") once for visual RGB-D localization if useful, but use sample_grasp_pose("object_a") as the coarse side-grasp pose.
       For object_b, do not call get_object_pose("object_b"). The scene can physically occlude object_b from the camera. Use sample_grasp_pose("object_b") only as a coarse pre-move anchor, then rely on UniVTAC native tactile feedback and get_robot_state() for the final millimeters.
 
-      Write the program as a bounded helper that returns True or False, for example grasp_place_once(object_name, slot_pos, slot_quat). The main code should be:
+      Write the program as a bounded helper that returns True or False, for example grasp_place_once(object_name, slot_pos, slot_quat, already_near_grasp=False). The main code should be:
       slot_a_pos, slot_a_quat = get_object_pose("slot_a")
       slot_b_pos, slot_b_quat = get_object_pose("slot_b")
-      success_a = grasp_place_once("object_a", slot_a_pos, slot_a_quat)
+      success_a = grasp_place_once("object_a", slot_a_pos, slot_a_quat, already_near_grasp=True)
       if success_a:
-          grasp_place_once("object_b", slot_b_pos, slot_b_quat)
+          grasp_place_once("object_b", slot_b_pos, slot_b_quat, already_near_grasp=False)
       Do not run object_b after object_a fails.
 
       Use this exact one-line diagnostic protocol so later CaP-X regeneration turns can understand failures from stdout. Values must be lowercase snake_case with no spaces.
@@ -145,18 +154,20 @@ env:
       Print CAPX_SUCCESS immediately after each object is released and the helper returns True:
       CAPX_SUCCESS object=<object_name> phase=release reason=released_at_slot action=continue_or_finish stable=<true|false> contact=<true|false> left=<true|false> right=<true|false> force=<float> slip=<float>
 
-      For each object, use this exact high-level sequence:
-      1. open_gripper(adaptive=True, max_steps between 20 and 40).
-      2. grasp_pos, grasp_quat = sample_grasp_pose(object_name).
-      3. goto_pose(grasp_pos, grasp_quat, z_approach between 0.03 and 0.06 meters), then check the returned dict when available. If the motion fails, return False.
-      4. grasp_result = close_gripper(adaptive=True, target_force between 0.75 and 0.95, max_steps between 60 and 100).
-      5. summary = get_tactile_summary(window=20, hand="both"). Treat the grasp as usable only when grasp_result["stable"] is true or is_grasp_stable(threshold=0.5) is true.
-      6. If the first close is not stable, do exactly one local retry inside this code block. Reopen with open_gripper(adaptive=True, max_steps between 20 and 40), return near the original grasp pose, lower z by 0.003 to 0.008 m if there was no contact or weak contact, and close again with target_force between 0.75 and 0.95 and max_steps between 60 and 100. Do not use blind lateral offsets after one-sided contact.
-      7. If the retry is still not stable, open the gripper with max_steps between 20 and 40 and return False. Do not call home_pose() in this failure path.
-      8. Lift in two or three small increments of 0.03 to 0.05 m using goto_pose from the current ee pose. After each increment, call get_tactile_summary(window=20, hand="both"). If contact is lost, one side disappears, or is_slipping(threshold=0.6) is true, stop, open the gripper, and return False.
-      9. Move to 0.06 to 0.09 m above the slot, descend to 0.04 to 0.06 m above the slot support, release with open_gripper(adaptive=True, max_steps between 20 and 40), wait_steps between 6 and 12, retreat upward by 0.04 to 0.07 m, and return True.
+      Use two entry modes:
+      - For object_a, already_near_grasp=True means the task reset/pre-move has already brought the gripper near the first cylinder. Do not call sample_grasp_pose() or goto_pose() before the first close_gripper() for object_a. You may call get_tactile_summary() first for logging, but the first manipulation action should be close_gripper().
+      - For object_b, already_near_grasp=False means the gripper must first move from slot_a toward the second cylinder. Use grasp_pos, grasp_quat = sample_grasp_pose("object_b") followed by goto_pose(grasp_pos, grasp_quat, z_approach=0.0). This goto_pose should use the unmodified sampled grasp pose so the adapter can execute the UniVTAC native grasp-approach atom.
 
-      Keep each code block short and deterministic. Internal physical retry is only for small local correction; do not let one block keep searching. Use for loops with fixed small ranges only; do not use unbounded while loops. The ranges above are recommendations, but these hard limits must still hold: close_gripper max_steps <= 100, open_gripper max_steps <= 40, local z retry adjustment <= 0.008 m, lift increment <= 0.05 m. In one generated block, use at most two close_gripper calls per object and at most one local retry per object.
+      For each object, use this high-level sequence:
+      1. If already_near_grasp is false, open_gripper(adaptive=True, max_steps between 20 and 40), then sample_grasp_pose(object_name), then goto_pose(grasp_pos, grasp_quat, z_approach=0.0). If already_near_grasp is true, do not move upward, retreat, or call goto_pose before closing.
+      2. grasp_result = close_gripper(adaptive=True, target_force between 0.75 and 0.95, max_steps between 60 and 100).
+      3. summary = get_tactile_summary(window=20, hand="both"). Treat the grasp as usable only when grasp_result["stable"] is true, left_contact and right_contact are both true, normal_force is at least 0.45, and is_slipping(threshold=0.6) is false. Do not use a plain OR between weak tactile contact and stable grasp.
+      4. If the first close is not usable, do exactly one local retry inside this code block. Reopen with open_gripper(adaptive=True, max_steps between 20 and 40). If already_near_grasp was false, return near the original grasp pose. If already_near_grasp was true, stay near the current gripper pose. Lower z by 0.003 to 0.008 m only if there was no contact or weak contact, then close again with target_force between 0.75 and 0.95 and max_steps between 60 and 100. Do not use blind lateral offsets after one-sided contact.
+      5. If the retry is still not stable, open the gripper with max_steps between 20 and 40 and return False. Do not call home_pose() in this failure path.
+      6. Lift only enough to clear the table: use one or two very small increments of 0.015 to 0.025 m from the current ee pose, with total lift no more than 0.04 m before transport. After each increment, call get_tactile_summary(window=20, hand="both"). If contact is lost, one side disappears, or is_slipping(threshold=0.6) is true, stop, open the gripper, and return False.
+      7. Move at low height to 0.035 to 0.055 m above the slot, descend to 0.018 to 0.030 m above the slot support, release with open_gripper(adaptive=True, max_steps between 20 and 40), then wait_steps between 8 and 15. After release, call get_tactile_summary(window=20, hand="both"). If contact remains or normal_force is above 0.08, open again and wait; do not retreat upward while the object is still touching both fingers. Once released, retreat upward by only 0.02 to 0.035 m and return True.
+
+      Keep each code block short and deterministic. Internal physical retry is only for small local correction; do not let one block keep searching. Use for loops with fixed small ranges only; do not use unbounded while loops. The ranges above are recommendations, but these hard limits must still hold: close_gripper max_steps <= 100, open_gripper max_steps <= 40, local z retry adjustment <= 0.008 m, lift increment <= 0.025 m, total lift before transport <= 0.04 m, slot hover height <= 0.055 m above the slot, release retreat <= 0.035 m. In one generated block, use at most two close_gripper calls per object and at most one local retry per object.
       Use only FrankaControlApi and UniVTACTactileApi. Do not call low-level move_delta_ee, move_ee, or move_qpos functions. Do not read reward, success, task_completed, metadata, material class, density, friction, live actor pose, private task fields, or trial id. Do not load or call UniVTAC ACT or ViTAL policies.
     multi_turn_prompt: |
       Executed code:
@@ -169,7 +180,8 @@ env:
       {console_stderr}
 
       Use CaP-X as an agent-level closed loop. The previous code block may have failed physically even when Python execution succeeded. First scan stdout for CAPX_EVENT, CAPX_FAILURE, and CAPX_SUCCESS lines, then read the raw tactile/franka logs and stderr. Use the latest CAPX_FAILURE as the primary failure signature.
-      When regenerating, change the strategy according to that signature: missed_grasp means return to the coarse grasp pose and lower slightly within the recommended retry range; one_sided_contact means avoid repeating the same blind lateral offset and use a smaller z/pose correction; weak_contact or unstable_grasp means adjust approach depth or target_force within the recommended range; slip_detected or contact_lost means reduce lift increments within the recommended range and reclose before further transport; motion_failed means reduce travel height or split motion into smaller bounded moves.
+      If object_a moved upward before the first close_gripper call, regenerate with object_a using the reset/pre-move position directly: close first, verify tactile grasp, then lift.
+      When regenerating, change the strategy according to that signature: missed_grasp means return to the coarse grasp pose and lower slightly within the recommended retry range; one_sided_contact means avoid repeating the same blind lateral offset and use a smaller z/pose correction; weak_contact or unstable_grasp means adjust approach depth or target_force within the recommended range; slip_detected or contact_lost means reduce lift increments below 0.02 m and reclose before further transport; release_failed or object re-lifted after release means use a lower slot hover/release height and wait until tactile contact is gone before retreat; motion_failed means reduce travel height or split motion into smaller bounded moves.
       Then choose:
       - CONTINUE only when the previous block deliberately left useful remaining code.
       - REGENERATE when grasp contact was weak, one-sided, missed, slipped, lost during lift, or when placement/release did not finish. Generate a new bounded corrective Python block that changes the strategy based on the tactile failure reason instead of repeating the same moves.

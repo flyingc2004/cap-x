@@ -673,7 +673,42 @@ class UniVTACFrankaCompatApi(ApiBase):
         ``get_object_pose("current_object")`` as a substitute for the current
         gripper pose; object anchors are coarse task anchors, not live tracking.
         """
-        return self._env.get_robot_state()
+        state = dict(self._env.get_robot_state())
+        task = getattr(self._env, "task", None)
+        robot_manager = getattr(task, "_robot_manager", None)
+        if robot_manager is None:
+            return state
+
+        try:
+            pose = robot_manager.get_gripper_center_pose()
+            tool_pos = np.asarray(pose.p, dtype=np.float32).reshape(3)
+            tool_quat = self._normalize_quat(np.asarray(pose.q, dtype=np.float32).reshape(4))
+        except Exception:
+            return state
+
+        raw_ee_pos = state.get("ee_pos")
+        raw_ee_quat = state.get("ee_quat")
+        raw_ee_pose = state.get("ee_pose") or state.get("ee")
+        if raw_ee_pos is not None:
+            state.setdefault("raw_ee_pos", raw_ee_pos)
+        if raw_ee_quat is not None:
+            state.setdefault("raw_ee_quat", raw_ee_quat)
+        if raw_ee_pose is not None:
+            state.setdefault("raw_ee_pose", raw_ee_pose)
+
+        # CaP-facing pose APIs use the gripper center as the control frame.
+        # Keep ee_pos/ee_quat in that same frame so relative motions such as
+        # ``get_robot_state()["ee_pos"][2] += dz`` remain consistent with
+        # ``goto_pose``.
+        state["ee_pos"] = tool_pos.tolist()
+        state["ee_quat"] = tool_quat.tolist()
+        state["ee_pose"] = [*state["ee_pos"], *state["ee_quat"]]
+        state["ee"] = state["ee_pose"]
+        state["tool_pos"] = state["ee_pos"]
+        state["tool_quat"] = state["ee_quat"]
+        state["tool_pose"] = state["ee_pose"]
+        state["control_frame"] = "gripper_center"
+        return state
 
     def get_step_status(self) -> dict[str, Any]:
         """Expose step status without reward leakage."""
