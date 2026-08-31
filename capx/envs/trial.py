@@ -244,6 +244,23 @@ def _filter_console_for_multiturn(
     return filtered
 
 
+def _clip_multiturn_code(text: str, max_chars: int, label: str) -> str:
+    """Bound code history sent to the repair model.
+
+    A regenerated block runs in the current simulator state. Replaying every
+    previous full program adds noise and encourages restarting completed
+    phases, so retain only the newest suffix when history is large.
+    """
+    text = str(text or "")
+    limit = max(1000, int(max_chars))
+    if len(text) <= limit:
+        return text
+    return (
+        f"# [{label} clipped: omitted {len(text) - limit} chars of older code]\n"
+        + text[-limit:]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Trial video directory helper
 # ---------------------------------------------------------------------------
@@ -861,6 +878,16 @@ def _handle_multi_turn_step(
 
     executed_code = "\n".join(code_blocks[:code_block_idx])
     remaining_code = "\n\n".join(code_blocks[code_block_idx:])
+    executed_code = _clip_multiturn_code(
+        executed_code,
+        int(config.get("multiturn_executed_code_max_chars", 12000)),
+        "executed code history",
+    )
+    remaining_code = _clip_multiturn_code(
+        remaining_code,
+        int(config.get("multiturn_remaining_code_max_chars", 8000)),
+        "remaining code",
+    )
     console_stdout = info_step["stdout"]
     console_stderr = info_step["stderr"]
     if config.get("filter_multiturn_console", False):
@@ -880,6 +907,11 @@ def _handle_multi_turn_step(
         executed_code=executed_code,
         console_stdout=console_stdout,
         console_stderr=console_stderr,
+    )
+    complete_multi_turn_prompt += (
+        "\n\nThe simulator is already at the state reached by the executed block. "
+        "For REGENERATE, output only a short recovery/continuation block; do "
+        "not replay the whole task or repeat completed object stages."
     )
     if remaining_code.strip():
         complete_multi_turn_prompt = (

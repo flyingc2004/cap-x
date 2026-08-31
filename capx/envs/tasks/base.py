@@ -1,7 +1,9 @@
 import ast
+import builtins as py_builtins
 import contextlib
 import io
 import sys
+import symtable
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -186,6 +188,21 @@ class CodeExecutionEnvBase(Env):
         stderr_buffer = io.StringIO()
         tee_err = Tee(sys.stderr, stderr_buffer)
         ok = True
+        undefined_names = self._find_static_undefined_globals(code)
+        if undefined_names:
+            ok = False
+            print(
+                "StaticCodeError: generated code references undefined global "
+                f"name(s): {', '.join(undefined_names)}. "
+                "Use only documented APIs or define helpers before calling them.",
+                file=tee_err,
+            )
+            return {
+                "ok": ok,
+                "stdout": stdout_buffer.getvalue(),
+                "stderr": stderr_buffer.getvalue(),
+                "result": self._exec_globals.get("RESULT"),
+            }
         previous_solve = self._exec_globals.get("solve")
         progress_before = self._low_level_progress_marker()
         should_auto_call_solve = not _has_top_level_solve_call(code)
@@ -232,6 +249,43 @@ class CodeExecutionEnvBase(Env):
             "stderr": stderr_buffer.getvalue(),
             "result": self._exec_globals.get("RESULT"),
         }
+
+    def _find_static_undefined_globals(self, code: str) -> list[str]:
+        """Find obvious undefined global names before executing generated code."""
+        try:
+            table = symtable.symtable(code, "<generated-code>", "exec")
+        except SyntaxError:
+            return []
+
+        allowed_names = set(self._exec_globals.keys())
+        allowed_names.update(dir(py_builtins))
+        allowed_names.update(self._module_bound_names(table))
+
+        undefined: set[str] = set()
+
+        def visit(scope: symtable.SymbolTable) -> None:
+            for name in scope.get_identifiers():
+                symbol = scope.lookup(name)
+                if not symbol.is_referenced() or not symbol.is_global():
+                    continue
+                if symbol.is_assigned() or symbol.is_imported():
+                    continue
+                if name not in allowed_names:
+                    undefined.add(name)
+            for child in scope.get_children():
+                visit(child)
+
+        visit(table)
+        return sorted(undefined)
+
+    @staticmethod
+    def _module_bound_names(table: symtable.SymbolTable) -> set[str]:
+        bound: set[str] = set()
+        for name in table.get_identifiers():
+            symbol = table.lookup(name)
+            if symbol.is_assigned() or symbol.is_imported():
+                bound.add(name)
+        return bound
 
     def _auto_call_generated_solve(self, previous_solve: Any, progress_before: tuple[Any, ...]) -> None:
         """Run a newly defined solve() when the model forgot the top-level call."""

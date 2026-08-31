@@ -85,6 +85,8 @@ class UniVTACFrankaCompatApi(ApiBase):
         max_native_pose_actions: int | None = None,
         max_gripper_servo_steps: int | None = None,
         max_gripper_settle_steps: int | None = None,
+        goto_pose_tactile_guard_force_threshold: float = 0.30,
+        goto_pose_tactile_guard_slip_threshold: float = 0.60,
     ) -> None:
         super().__init__(env)
         cfg = self._runtime_config()
@@ -212,6 +214,7 @@ class UniVTACFrankaCompatApi(ApiBase):
             object_pose_names=self.object_pose_names,
         )
         self._rgbd_pose_cache: dict[str, Any] = {}
+        self._holding_with_tactile = False
         current_tool_pose_objects = cfg.get(
             "current_tool_pose_grasp_objects",
             current_tool_pose_grasp_objects or (),
@@ -270,6 +273,18 @@ class UniVTACFrankaCompatApi(ApiBase):
         self.max_gripper_settle_steps = self._optional_positive_int(
             cfg.get("max_gripper_settle_steps", max_gripper_settle_steps),
         )
+        self.goto_pose_tactile_guard_force_threshold = float(
+            cfg.get(
+                "goto_pose_tactile_guard_force_threshold",
+                goto_pose_tactile_guard_force_threshold,
+            )
+        )
+        self.goto_pose_tactile_guard_slip_threshold = float(
+            cfg.get(
+                "goto_pose_tactile_guard_slip_threshold",
+                goto_pose_tactile_guard_slip_threshold,
+            )
+        )
         self._perception_diagnostic_reset_serial: int | None = None
         self._rgbd_perception = UniVTACRgbdPerception(
             sam3_url=str(cfg.get("sam3_service_url", sam3_service_url)),
@@ -294,12 +309,15 @@ class UniVTACFrankaCompatApi(ApiBase):
             "close_gripper": self.close_gripper,
             "get_robot_state": self.get_robot_state,
             "home_pose": self.home_pose,
+            "get_step_status": self.get_step_status,
+            "wait_steps": self.wait_steps,
         }
 
     def get_object_pose(
         self,
         object_name: str,
         return_bbox_extent: bool = False,
+        source: str = "auto",
     ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Estimate an object pose or read a configured public landmark.
 
@@ -307,6 +325,9 @@ class UniVTACFrankaCompatApi(ApiBase):
             object_name: Public object or landmark name, including the active
                 lift-can object under the name "can".
             return_bbox_extent: Whether to also return an approximate extent.
+            source: ``"auto"`` follows the YAML route, ``"rgbd"`` forces
+                configured RGB-D/SAM perception, and ``"anchor"`` forces
+                explicitly public reset/slot anchors.
 
         Returns:
             ``(position, quaternion_wxyz)`` by default. When
@@ -314,7 +335,26 @@ class UniVTACFrankaCompatApi(ApiBase):
             ``(position, quaternion_wxyz, bbox_extent)``.
         """
         key = self._resolve_pose_key(object_name)
-        if self._should_use_rgbd_pose(key):
+        source_key = self._normalize_pose_source(source)
+        if source_key == "rgbd" and not self._should_use_rgbd_pose(key):
+            raise KeyError(
+                f"object '{object_name}' is not available by configured RGB-D pose route"
+            )
+        if source_key == "anchor":
+            public_pose = self._public_anchor_pose(key)
+            if public_pose is None:
+                raise KeyError(f"object '{object_name}' is not available as a public anchor")
+            pos, quat, extent = public_pose
+            print(
+                "[univtac-franka] pose_source=public_anchor "
+                f"object={key}",
+                flush=True,
+            )
+            if return_bbox_extent:
+                return pos, quat, extent
+            return pos, quat
+
+        if source_key == "rgbd" or self._should_use_rgbd_pose(key):
             cached = self._cached_rgbd_pose(key)
             if cached is not None:
                 estimate = cached
@@ -462,21 +502,33 @@ class UniVTACFrankaCompatApi(ApiBase):
         position: np.ndarray,
         quaternion_wxyz: np.ndarray,
         z_approach: float = 0.0,
+        monitor_tactile: bool = False,
+        abort_on_contact_loss: bool = True,
+        tactile_force_threshold: float | None = None,
+        slip_threshold: float | None = None,
     ) -> dict[str, Any]:
-        """Move to a target pose using bounded UniVTAC delta actions."""
+        """Move to a target pose using bounded UniVTAC delta actions.
+
+        ``monitor_tactile=True`` is intended for transport/descent while an
+        object is already grasped. The call stops early if native tactile
+        feedback indicates contact loss, weak holding force, or slip.
+        """
         pos = np.asarray(position, dtype=np.float32).reshape(3)
         quat = np.asarray(quaternion_wxyz, dtype=np.float32).reshape(4)
 
-        if self.use_native_pose_planner:
+        active_tactile_monitor = bool(monitor_tactile or self._holding_with_tactile)
+
+        if self.use_native_pose_planner and not active_tactile_monitor:
             return self._goto_pose_native(pos, quat, z_approach=float(z_approach))
 
-        grasp_result = self._try_approach_public_grasp(pos)
-        if grasp_result is not None:
-            return grasp_result
+        if not active_tactile_monitor:
+            grasp_result = self._try_approach_public_grasp(pos)
+            if grasp_result is not None:
+                return grasp_result
 
-        place_result = self._try_place_on_public_landmark(pos, quat)
-        if place_result is not None:
-            return place_result
+            place_result = self._try_place_on_public_landmark(pos, quat)
+            if place_result is not None:
+                return place_result
 
         cur_pos, cur_quat = self._current_tool_pose()
         if self._nearest_public_landmark(pos) is not None and self.preserve_landmark_orientation:
@@ -495,6 +547,10 @@ class UniVTACFrankaCompatApi(ApiBase):
                 cur_pos,
                 cur_quat,
                 max_actions=remaining_api_actions,
+                monitor_tactile=active_tactile_monitor,
+                abort_on_contact_loss=abort_on_contact_loss,
+                tactile_force_threshold=tactile_force_threshold,
+                slip_threshold=slip_threshold,
             )
             if isinstance(result, dict) and not bool(result.get("ok", False)):
                 return result
@@ -509,6 +565,10 @@ class UniVTACFrankaCompatApi(ApiBase):
             cur_pos,
             cur_quat,
             max_actions=remaining_api_actions,
+            monitor_tactile=active_tactile_monitor,
+            abort_on_contact_loss=abort_on_contact_loss,
+            tactile_force_threshold=tactile_force_threshold,
+            slip_threshold=slip_threshold,
         )
 
     def open_gripper(
@@ -539,9 +599,12 @@ class UniVTACFrankaCompatApi(ApiBase):
             print(
                 "[univtac-franka] adaptive_open "
                 f"released={result['released']} reason={result['reason']} "
-                f"width={result['width']:.4f} steps={result['steps']}",
+                f"width={result['width']:.4f} steps={result['steps']} "
+                f"holding_cleared={self._release_clears_tactile_holding(result)}",
                 flush=True,
             )
+            if bool(result.get("holding_cleared", False)):
+                self._holding_with_tactile = False
             self._finalize_high_level_action()
             return result
 
@@ -563,6 +626,8 @@ class UniVTACFrankaCompatApi(ApiBase):
                 "reason": "fixed_open",
                 "target_width": float(np.clip(target_width, 0.0, 1.0)),
             }
+            if self._release_clears_tactile_holding(output):
+                self._holding_with_tactile = False
             self._finalize_high_level_action()
             return output
         self._move_gripper(target_width)
@@ -572,14 +637,50 @@ class UniVTACFrankaCompatApi(ApiBase):
             "reason": "fixed_open",
             "target_width": float(np.clip(target_width, 0.0, 1.0)),
         }
+        self._holding_with_tactile = False
         self._finalize_high_level_action()
         return output
+
+    def _release_clears_tactile_holding(self, result: dict[str, Any]) -> bool:
+        if bool(result.get("released", False)):
+            result["holding_cleared"] = True
+            result["holding_clear_reason"] = "released"
+            return True
+        if result.get("contact") is False:
+            result["holding_cleared"] = True
+            result["holding_clear_reason"] = "no_tactile_contact"
+            return True
+        try:
+            summary = self._read_adaptive_tactile_summary()
+        except Exception as exc:
+            result["holding_cleared"] = False
+            result["holding_clear_error"] = str(exc)
+            return False
+
+        contact = bool(summary.get("contact", False))
+        force = float(summary.get("normal_force", 0.0))
+        force_threshold = float(
+            self.adaptive_gripper_config.get("contact_force_threshold", 0.08)
+        )
+        result["release_contact"] = contact
+        result["release_force"] = force
+        if (not contact) or force <= force_threshold:
+            result["holding_cleared"] = True
+            result["holding_clear_reason"] = "release_tactile_low_contact"
+            return True
+        result["holding_cleared"] = False
+        return False
 
     def close_gripper(
         self,
         adaptive: bool = True,
         target_force: float = 0.35,
         max_steps: int = 80,
+        target_depth_delta_mm: float | None = None,
+        min_stable_contact_area: float | None = None,
+        post_squeeze_qpos: float | None = None,
+        post_squeeze_steps: int | None = None,
+        hold_steps: int | None = None,
     ) -> dict[str, Any]:
         """Close the gripper using optional feedback-driven width control.
 
@@ -587,6 +688,12 @@ class UniVTACFrankaCompatApi(ApiBase):
             adaptive: Use feedback-driven coarse/fine closing when enabled by config.
             target_force: Normalized target force used for stable-contact stop.
             max_steps: Maximum tactile servo iterations.
+            target_depth_delta_mm: Optional minimum per-pad compression before
+                accepting a stable grasp.
+            min_stable_contact_area: Optional minimum per-pad contact area.
+            post_squeeze_qpos: Optional extra qpos squeeze after first stable contact.
+            post_squeeze_steps: Number of extra squeeze commands.
+            hold_steps: Number of no-op confirmation commands after squeezing.
 
         Returns:
             Result containing ``stable``, contact state, and stop reason. The
@@ -599,16 +706,27 @@ class UniVTACFrankaCompatApi(ApiBase):
         self._record_rgbd_diagnostic_if_needed()
         if adaptive and self.tactile_adaptive_gripper_enabled:
             controller = self._adaptive_gripper_controller()
-            result = controller.close(target_force=target_force, max_steps=max_steps)
+            result = controller.close(
+                target_force=target_force,
+                max_steps=max_steps,
+                target_depth_delta_mm=target_depth_delta_mm,
+                min_stable_contact_area=min_stable_contact_area,
+                post_squeeze_qpos=post_squeeze_qpos,
+                post_squeeze_steps=post_squeeze_steps,
+                hold_steps=hold_steps,
+            )
             self._annotate_servo_limit(result, requested_max_steps, max_steps)
             self._save_adaptive_trace(controller.trace)
             print(
                 "[univtac-franka] adaptive_close "
                 f"stable={result['stable']} reason={result['reason']} "
-                f"force={result['normal_force']:.3f} width={result['width']:.4f} "
+                f"force={result['normal_force']:.3f} depth={result['depth_delta_mm']:.3f}mm "
+                f"area={result['contact_area']:.4f} width={result['width']:.4f} "
+                f"post_squeeze={result['post_squeeze_applied']} hold={result['hold_steps']} "
                 f"steps={result['steps']}",
                 flush=True,
             )
+            self._holding_with_tactile = bool(result.get("stable", False))
             self._finalize_high_level_action()
             return result
 
@@ -631,6 +749,7 @@ class UniVTACFrankaCompatApi(ApiBase):
                 "stable": False,
                 "reason": "fixed_close_requires_tactile_confirmation",
             }
+            self._holding_with_tactile = bool(output.get("stable", False))
             self._finalize_high_level_action()
             return output
         self._move_gripper(0.0)
@@ -639,6 +758,7 @@ class UniVTACFrankaCompatApi(ApiBase):
             "stable": False,
             "reason": "fixed_close_requires_tactile_confirmation",
         }
+        self._holding_with_tactile = False
         self._finalize_high_level_action()
         return output
 
@@ -755,6 +875,11 @@ class UniVTACFrankaCompatApi(ApiBase):
             slip_threshold=float(cfg.get("slip_threshold", 0.60)),
             one_sided_force_limit=float(cfg.get("one_sided_force_limit", 0.90)),
             max_qpos=max_qpos,
+            target_depth_delta_mm=float(cfg.get("target_depth_delta_mm", 0.0)),
+            min_stable_contact_area=float(cfg.get("min_stable_contact_area", 0.0)),
+            post_squeeze_qpos=float(cfg.get("post_squeeze_qpos", 0.0)),
+            post_squeeze_steps=int(cfg.get("post_squeeze_steps", 0)),
+            hold_steps=int(cfg.get("hold_steps", 0)),
         )
         return TactileAdaptiveGripperController(
             get_width=lambda: float(calibration_fn()["current_width"]),
@@ -1055,6 +1180,23 @@ class UniVTACFrankaCompatApi(ApiBase):
     def _rgbd_pose_routes_are_restricted(self) -> bool:
         return self.rgbd_pose_enabled and self.rgbd_pose_objects is not None
 
+    @staticmethod
+    def _normalize_pose_source(source: str | None) -> str:
+        raw = "auto" if source is None else str(source).strip().lower()
+        aliases = {
+            "": "auto",
+            "default": "auto",
+            "public": "anchor",
+            "public_anchor": "anchor",
+            "task_anchor": "anchor",
+            "sam": "rgbd",
+            "rgb_d": "rgbd",
+        }
+        normalized = aliases.get(raw.replace("-", "_"), raw.replace("-", "_"))
+        if normalized not in {"auto", "rgbd", "anchor"}:
+            raise ValueError("source must be one of 'auto', 'rgbd', or 'anchor'")
+        return normalized
+
     def _allows_public_grasp_anchor(self, key: str) -> bool:
         normalized = self._normalize_name(key)
         return (
@@ -1070,6 +1212,13 @@ class UniVTACFrankaCompatApi(ApiBase):
         if normalized not in self.public_pose_fallback_objects:
             return None
         return self._public_landmarks().get(normalized)
+
+    def _public_anchor_pose(
+        self,
+        key: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        normalized = self._normalize_name(key)
+        return self._public_anchor_landmarks().get(normalized)
 
     def _cached_rgbd_pose(self, key: str) -> Any | None:
         normalized = self._normalize_name(key)
@@ -1228,6 +1377,10 @@ class UniVTACFrankaCompatApi(ApiBase):
         current_quat: np.ndarray,
         *,
         max_actions: int | None = None,
+        monitor_tactile: bool = False,
+        abort_on_contact_loss: bool = True,
+        tactile_force_threshold: float | None = None,
+        slip_threshold: float | None = None,
     ) -> dict[str, Any]:
         target_pos = np.asarray(target_pos, dtype=np.float32).reshape(3)
         target_quat = np.asarray(target_quat, dtype=np.float32).reshape(4)
@@ -1285,7 +1438,83 @@ class UniVTACFrankaCompatApi(ApiBase):
                     flush=True,
                 )
                 return last_result
+            if monitor_tactile:
+                guard_failure = self._tactile_guard_failure(
+                    abort_on_contact_loss=abort_on_contact_loss,
+                    tactile_force_threshold=tactile_force_threshold,
+                    slip_threshold=slip_threshold,
+                )
+                if guard_failure is not None:
+                    guarded_result = {
+                        **last_result,
+                        **guard_failure,
+                        "steps": steps,
+                        "completed_steps": idx + 1,
+                        "tactile_monitoring": True,
+                    }
+                    print(
+                        "[univtac-franka] goto_pose_tactile_guard_stopped "
+                        f"reason={guarded_result.get('reason')} step={idx + 1}/{steps}",
+                        flush=True,
+                    )
+                    return guarded_result
         return last_result
+
+    def _tactile_guard_failure(
+        self,
+        *,
+        abort_on_contact_loss: bool,
+        tactile_force_threshold: float | None,
+        slip_threshold: float | None,
+    ) -> dict[str, Any] | None:
+        try:
+            summary = self._read_adaptive_tactile_summary()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": "tactile_guard_unavailable",
+                "message": f"tactile guard could not read native tactile summary: {exc}",
+            }
+
+        force_threshold = (
+            self.goto_pose_tactile_guard_force_threshold
+            if tactile_force_threshold is None
+            else float(tactile_force_threshold)
+        )
+        slip_limit = (
+            self.goto_pose_tactile_guard_slip_threshold
+            if slip_threshold is None
+            else float(slip_threshold)
+        )
+        contact_ok = bool(summary.get("contact", False))
+        left_ok = bool(summary.get("left_contact", False))
+        right_ok = bool(summary.get("right_contact", False))
+        force = float(summary.get("normal_force", 0.0))
+        slip = float(summary.get("slip_score", 0.0))
+        event = str(summary.get("event", "unknown"))
+
+        if slip >= slip_limit or event == "slip_detected":
+            return {
+                "ok": False,
+                "reason": "tactile_guard_slip_detected",
+                "message": "native tactile guard detected slip during goto_pose",
+                "tactile_summary": summary,
+            }
+        if abort_on_contact_loss and (not contact_ok or not left_ok or not right_ok):
+            return {
+                "ok": False,
+                "reason": "tactile_guard_contact_lost",
+                "message": "native tactile guard detected contact loss during goto_pose",
+                "tactile_summary": summary,
+            }
+        if abort_on_contact_loss and force < force_threshold:
+            return {
+                "ok": False,
+                "reason": "tactile_guard_weak_contact",
+                "message": "native tactile guard detected weak holding force during goto_pose",
+                "tactile_summary": summary,
+            }
+        return None
 
     def _call_move_to_pose_bounded(
         self,
@@ -1295,13 +1524,26 @@ class UniVTACFrankaCompatApi(ApiBase):
         current_quat: np.ndarray,
         *,
         max_actions: int | None,
+        monitor_tactile: bool = False,
+        abort_on_contact_loss: bool = True,
+        tactile_force_threshold: float | None = None,
+        slip_threshold: float | None = None,
     ) -> dict[str, Any]:
+        monitor_kwargs: dict[str, Any] = {}
+        if monitor_tactile:
+            monitor_kwargs = {
+                "monitor_tactile": True,
+                "abort_on_contact_loss": abort_on_contact_loss,
+                "tactile_force_threshold": tactile_force_threshold,
+                "slip_threshold": slip_threshold,
+            }
         if max_actions is None:
             result = self._move_to_pose_bounded(
                 target_pos,
                 target_quat,
                 current_pos,
                 current_quat,
+                **monitor_kwargs,
             )
         else:
             result = self._move_to_pose_bounded(
@@ -1310,6 +1552,7 @@ class UniVTACFrankaCompatApi(ApiBase):
                 current_pos,
                 current_quat,
                 max_actions=max_actions,
+                **monitor_kwargs,
             )
         return result if isinstance(result, dict) else {"ok": True, "message": "movement completed"}
 
@@ -1481,6 +1724,45 @@ class UniVTACFrankaCompatApi(ApiBase):
                 can_quat,
                 self._estimate_extent_from_pose_name("can"),
             )
+        public_pose_map_fn = getattr(self._env, "get_public_pose_map", None)
+        if callable(public_pose_map_fn):
+            try:
+                public_pose_map = public_pose_map_fn()
+            except Exception:
+                public_pose_map = {}
+            if isinstance(public_pose_map, dict):
+                for key, pose_tuple in public_pose_map.items():
+                    try:
+                        pos, pose_quat, extent = pose_tuple
+                        landmarks[str(key)] = (
+                            np.asarray(pos, dtype=np.float32).reshape(3),
+                            self._normalize_quat(
+                                np.asarray(pose_quat, dtype=np.float32).reshape(4)
+                            ),
+                            np.asarray(extent, dtype=np.float32).reshape(3),
+                        )
+                    except Exception:
+                        continue
+        return landmarks
+
+    def _public_anchor_landmarks(self) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        quat = (
+            self._current_ee_quat()
+            if self.preserve_landmark_orientation
+            else np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        )
+        landmarks = {
+            "orange_pad": (
+                np.array([0.40, -0.08, 0.025], dtype=np.float32),
+                quat.copy(),
+                np.array([0.10, 0.10, 0.03], dtype=np.float32),
+            ),
+            "green_pad": (
+                np.array([0.40, 0.08, 0.025], dtype=np.float32),
+                quat.copy(),
+                np.array([0.10, 0.10, 0.03], dtype=np.float32),
+            ),
+        }
         public_pose_map_fn = getattr(self._env, "get_public_pose_map", None)
         if callable(public_pose_map_fn):
             try:

@@ -374,8 +374,47 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         f"image_url_chars={payload_stats['image_url_chars']} "
         f"json_bytes={payload_stats['json_bytes']}"
     )
-    response = _post_json(server_url, headers=headers, payload=payload, timeout=request_timeout)
-    retry = 1
+    retry = 0
+    while True:
+        try:
+            response = _post_json(
+                server_url,
+                headers=headers,
+                payload=payload,
+                timeout=request_timeout,
+            )
+            break
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            if retry >= max_retries:
+                raise
+            retry += 1
+            sleep_time = retry_sleep + random.uniform(0, min(2.0, retry_sleep))
+            print(
+                f"Retry {retry}/{max_retries}. Model query raised "
+                f"{type(exc).__name__}: {exc}. Retrying in {sleep_time:.1f} seconds..."
+            )
+            time.sleep(sleep_time)
+        except Exception as exc:
+            # requests raises its own RequestException hierarchy, which is not
+            # available when requests is absent. Match it by module/name so
+            # transient read/connect failures get the same retry behavior.
+            is_request_error = (
+                requests is not None
+                and isinstance(exc, requests.exceptions.RequestException)
+            )
+            if not is_request_error:
+                raise
+            if retry >= max_retries:
+                raise
+            retry += 1
+            sleep_time = retry_sleep + random.uniform(0, min(2.0, retry_sleep))
+            print(
+                f"Retry {retry}/{max_retries}. Model query raised "
+                f"{type(exc).__name__}: {exc}. Retrying in {sleep_time:.1f} seconds..."
+            )
+            time.sleep(sleep_time)
+
+    retry += 1
     while response.status_code in [500, 502, 503, 504] and retry <= max_retries:
         sleep_time = retry_sleep + random.uniform(0, min(2.0, retry_sleep))
         print(

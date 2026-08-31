@@ -59,6 +59,7 @@ def _frame(
 
 def test_native_tactile_summary_events() -> None:
     assert summarize_native_tactile([_frame(step=0)])["event"] == "no_contact"
+    assert summarize_native_tactile([_frame(step=0)])["stable"] is False
     assert (
         summarize_native_tactile([_frame(step=0, left_contact=True)])["event"]
         == "one_hand_contact"
@@ -68,6 +69,8 @@ def test_native_tactile_summary_events() -> None:
         [_frame(step=0, left_contact=True, right_contact=True)]
     )
     assert stable["event"] == "stable_grasp"
+    assert stable["stable"] is True
+    assert stable["grasp_stable"] is True
     assert stable["left_contact"] is True
     assert stable["right_contact"] is True
 

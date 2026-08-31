@@ -1,4 +1,4 @@
-from capx.envs.trial import _filter_console_for_multiturn
+from capx.envs.trial import _clip_multiturn_code, _filter_console_for_multiturn
 
 
 def test_filter_console_for_multiturn_keeps_structured_tactile_lines() -> None:
@@ -35,3 +35,9 @@ def test_filter_console_for_multiturn_limits_recent_other_lines() -> None:
     assert "ordinary 6" in filtered
     assert "ordinary 7" in filtered
     assert "omitted_other=6" in filtered
+
+
+def test_clip_multiturn_code_keeps_recent_suffix() -> None:
+    clipped = _clip_multiturn_code("old\n" * 600 + "latest", 1000, "history")
+    assert "latest" in clipped
+    assert "clipped" in clipped

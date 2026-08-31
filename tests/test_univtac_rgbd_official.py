@@ -195,6 +195,26 @@ def test_rgbd_object_pose_failure_does_not_use_official_anchor_fallback() -> Non
     assert all(record["source"] != "official_anchor_fallback" for record in env.artifacts)
 
 
+def test_univtac_franka_api_exposes_wait_and_status_helpers() -> None:
+    class Env:
+        api_configs = {"franka_control_api": {}}
+
+        def wait_steps(self, n):
+            return {"ok": True, "steps": n}
+
+        def get_status(self):
+            return {"step": 0}
+
+    api = UniVTACFrankaCompatApi(Env())
+
+    functions = api.functions()
+
+    assert "wait_steps" in functions
+    assert "get_step_status" in functions
+    assert functions["wait_steps"](3) == {"ok": True, "steps": 3}
+    assert functions["get_step_status"]() == {"step": 0}
+
+
 def test_goto_pose_api_action_limit_blocks_before_physical_action() -> None:
     class Env:
         api_configs = {
@@ -232,6 +252,150 @@ def test_goto_pose_api_action_limit_blocks_before_physical_action() -> None:
     assert result["requested_actions"] > result["max_api_actions"]
     assert result["max_api_actions"] == 3
     assert env.actions == []
+
+
+def test_goto_pose_tactile_guard_stops_on_contact_loss() -> None:
+    class Env:
+        task = None
+        api_configs = {
+            "franka_control_api": {
+                "min_safe_z": 0.0,
+                "max_delta_xyz": 0.01,
+                "preserve_landmark_orientation": False,
+                "goto_pose_tactile_guard_force_threshold": 0.4,
+            }
+        }
+
+        def __init__(self) -> None:
+            self.actions = []
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.0, 0.0, 0.2],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+            }
+
+        def take_action(self, action, *, action_type):
+            self.actions.append((np.asarray(action), action_type))
+            return {"ok": True}
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    api._read_adaptive_tactile_summary = lambda: {
+        "contact": False,
+        "left_contact": False,
+        "right_contact": False,
+        "normal_force": 0.0,
+        "slip_score": 0.0,
+        "event": "contact_lost",
+    }
+
+    result = api.goto_pose(
+        np.array([0.03, 0.0, 0.2], dtype=np.float32),
+        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        monitor_tactile=True,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "tactile_guard_contact_lost"
+    assert result["completed_steps"] == 1
+    assert len(env.actions) == 1
+
+
+def test_goto_pose_tactile_guard_stops_on_slip() -> None:
+    class Env:
+        task = None
+        api_configs = {
+            "franka_control_api": {
+                "min_safe_z": 0.0,
+                "max_delta_xyz": 0.01,
+                "preserve_landmark_orientation": False,
+            }
+        }
+
+        def __init__(self) -> None:
+            self.actions = []
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.0, 0.0, 0.2],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+            }
+
+        def take_action(self, action, *, action_type):
+            self.actions.append((np.asarray(action), action_type))
+            return {"ok": True}
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    api._read_adaptive_tactile_summary = lambda: {
+        "contact": True,
+        "left_contact": True,
+        "right_contact": True,
+        "normal_force": 0.9,
+        "slip_score": 0.7,
+        "event": "stable_grasp",
+    }
+
+    result = api.goto_pose(
+        np.array([0.03, 0.0, 0.2], dtype=np.float32),
+        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        monitor_tactile=True,
+        slip_threshold=0.45,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "tactile_guard_slip_detected"
+    assert result["completed_steps"] == 1
+    assert len(env.actions) == 1
+
+
+def test_goto_pose_auto_monitors_after_stable_close_state() -> None:
+    class Env:
+        task = None
+        api_configs = {
+            "franka_control_api": {
+                "min_safe_z": 0.0,
+                "max_delta_xyz": 0.01,
+                "preserve_landmark_orientation": False,
+                "goto_pose_tactile_guard_force_threshold": 0.4,
+            }
+        }
+
+        def __init__(self) -> None:
+            self.actions = []
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.0, 0.0, 0.2],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+            }
+
+        def take_action(self, action, *, action_type):
+            self.actions.append((np.asarray(action), action_type))
+            return {"ok": True}
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    api._holding_with_tactile = True
+    api._read_adaptive_tactile_summary = lambda: {
+        "contact": True,
+        "left_contact": True,
+        "right_contact": True,
+        "normal_force": 0.1,
+        "slip_score": 0.0,
+        "event": "one_hand_contact",
+    }
+
+    result = api.goto_pose(
+        np.array([0.03, 0.0, 0.2], dtype=np.float32),
+        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "tactile_guard_weak_contact"
+    assert result["tactile_monitoring"] is True
+    assert len(env.actions) == 1
 
 
 def test_official_compat_uses_rgbd_and_never_reads_task_can() -> None:
@@ -429,10 +593,26 @@ def test_transfer_easy_gt_yaml_uses_public_anchors_without_sam() -> None:
     assert low["expose_actor_pose"] is False
     assert low["privileged"] is False
     assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
-    assert franka["rgbd_perception_enabled"] is False
-    assert "api_servers" not in config
-    assert "Easy-GT engineering check" in cfg["prompt"]
-    assert "get_object_pose(\"object_a\")" in cfg["prompt"]
+    assert franka["rgbd_perception_enabled"] is True
+    assert franka["rgbd_pose_enabled"] is True
+    assert franka["rgbd_grasp_enabled"] is False
+    assert franka["rgbd_pose_objects"] == ["object_a"]
+    assert franka["public_pose_fallback_objects"] == []
+    assert len(config["api_servers"]) == 1
+    assert "launch_sam3_server" in config["api_servers"][0]["_target_"]
+    assert "get_object_pose(\"object_a\", source=\"rgbd\")" in cfg["prompt"]
+    assert "get_object_pose(slot_name, source=\"anchor\")" in cfg["prompt"]
+    assert "visual orientation changes by more than 15 degrees" in cfg["prompt"]
+    assert "visual_rotation" in cfg["prompt"]
+    assert "move straight upward by 0.045 to 0.060 m" in cfg["prompt"]
+    assert "CAPX_EVENT object=object_b phase=approach reason=clear_object_a" in cfg["prompt"]
+    assert "CAPX_EVENT phase=approach reason=move_to_grasp action=close" in cfg["prompt"]
+    assert "Only after an ok approach may object_b call close_gripper()" in cfg["prompt"]
+    assert franka["adaptive_gripper"]["target_depth_delta_mm"] == 5.0
+    assert franka["adaptive_gripper"]["post_squeeze_qpos"] == 0.00015
+    assert franka["goto_pose_tactile_guard_force_threshold"] == pytest.approx(0.45)
+    assert franka["goto_pose_tactile_guard_slip_threshold"] == pytest.approx(0.45)
+    assert "monitor_tactile=True" in cfg["prompt"]
     assert "UniVTACTouchManipulationApi" not in cfg["apis"]
     assert "search_contact" not in cfg["prompt"]
 
@@ -468,8 +648,20 @@ def test_transfer_hard_sam_yaml_routes_pose_perception_without_gt_slots() -> Non
     assert len(config["api_servers"]) == 1
     assert "launch_sam3_server" in config["api_servers"][0]["_target_"]
     assert "launch_contact_graspnet_server" not in str(config["api_servers"])
+    assert "get_object_pose(\"slot_a\", source=\"rgbd\")" in cfg["prompt"]
+    assert "get_object_pose(\"object_a\", source=\"rgbd\")" in cfg["prompt"]
     assert "get_object_pose(\"object_b\")" in cfg["prompt"]
     assert "do not call get_object_pose(\"object_b\")" in cfg["prompt"].lower()
+    assert "visual_rotation" in cfg["prompt"]
+    assert "move straight upward by 0.045 to 0.060 m" in cfg["prompt"]
+    assert "CAPX_EVENT object=object_b phase=approach reason=clear_object_a" in cfg["prompt"]
+    assert "CAPX_EVENT phase=approach reason=move_to_grasp action=close" in cfg["prompt"]
+    assert "Only after an ok approach may object_b call close_gripper()" in cfg["prompt"]
+    assert franka["adaptive_gripper"]["target_depth_delta_mm"] == 5.0
+    assert franka["adaptive_gripper"]["post_squeeze_qpos"] == 0.00015
+    assert franka["goto_pose_tactile_guard_force_threshold"] == pytest.approx(0.45)
+    assert franka["goto_pose_tactile_guard_slip_threshold"] == pytest.approx(0.45)
+    assert "monitor_tactile=True" in cfg["prompt"]
     assert "0.42" not in cfg["prompt"]
     assert "UniVTACTouchManipulationApi" not in cfg["apis"]
     assert "search_contact" not in cfg["prompt"]
@@ -598,3 +790,132 @@ def test_hard_sam_franka_routes_object_and_slot_pose_through_rgbd() -> None:
     with pytest.raises(KeyError, match="configured non-privileged pose route"):
         api.get_object_pose("object_b")
     assert calls == [("object_a", None), ("slot_a", "world_y_min")]
+
+
+def test_get_object_pose_source_rgbd_forces_configured_perception_route() -> None:
+    class ForbiddenActor:
+        def get_pose(self):
+            raise AssertionError("source='rgbd' must not read actor pose")
+
+    class Env:
+        task = types.SimpleNamespace(object_a=ForbiddenActor())
+
+        def __init__(self) -> None:
+            self.api_configs = {
+                "franka_control_api": {
+                    "rgbd_perception_enabled": True,
+                    "rgbd_pose_enabled": True,
+                    "rgbd_pose_objects": ["object_a"],
+                    "object_pose_names": {"object_a": "object_a"},
+                    "perception_prompt_map": {"object_a": "cylindrical can"},
+                    "perception_retry_attempts": 1,
+                }
+            }
+            self.artifacts = []
+
+        def get_rgbd_frame(self, camera_name):
+            return _frame()
+
+        def append_perception_artifact(self, record):
+            self.artifacts.append(record)
+
+        def get_public_pose_map(self):
+            raise AssertionError("source='rgbd' must not read public anchors")
+
+    estimate = ObjectEstimate(
+        position=np.array([0.57, -0.24, 0.04], dtype=np.float32),
+        quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        extent=np.array([0.04, 0.04, 0.08], dtype=np.float32),
+        mask=_mask(),
+        points_world=np.zeros((16, 3), dtype=np.float32),
+        score=0.8,
+        prompt="cylindrical can",
+    )
+
+    env = Env()
+    api = UniVTACFrankaCompatApi(env)
+    api._rgbd_perception = types.SimpleNamespace(
+        estimate_object=lambda frame, prompt: estimate,
+    )
+
+    pos, quat = api.get_object_pose("object_a", source="rgbd")
+
+    np.testing.assert_allclose(pos, estimate.position)
+    np.testing.assert_allclose(quat, estimate.quaternion_wxyz)
+    assert env.artifacts[-1]["source"] == "rgbd"
+
+
+def test_get_object_pose_source_anchor_forces_public_anchor_without_rgbd() -> None:
+    anchor = (
+        np.array([0.42, -0.16, 0.025], dtype=np.float32),
+        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        np.array([0.10, 0.10, 0.02], dtype=np.float32),
+    )
+
+    class Env:
+        task = object()
+        api_configs = {
+            "franka_control_api": {
+                "rgbd_perception_enabled": True,
+                "rgbd_pose_enabled": True,
+                "rgbd_pose_objects": ["slot_a"],
+                "object_pose_names": {"slot_a": "slot_a"},
+            }
+        }
+
+        def get_public_pose_map(self):
+            return {"slot_a": anchor}
+
+        def get_rgbd_frame(self, camera_name):
+            raise AssertionError("source='anchor' must not request an RGB-D frame")
+
+        def get_robot_state(self):
+            return {
+                "ee_pos": [0.40, 0.0, 0.20],
+                "ee_quat": [1.0, 0.0, 0.0, 0.0],
+            }
+
+    api = UniVTACFrankaCompatApi(Env())
+    pos, quat, extent = api.get_object_pose(
+        "slot_a",
+        return_bbox_extent=True,
+        source="anchor",
+    )
+
+    np.testing.assert_allclose(pos, anchor[0])
+    np.testing.assert_allclose(quat, anchor[1])
+    np.testing.assert_allclose(extent, anchor[2])
+
+
+def test_get_object_pose_source_rgbd_rejects_unconfigured_object_b() -> None:
+    class Env:
+        task = object()
+        api_configs = {
+            "franka_control_api": {
+                "rgbd_perception_enabled": True,
+                "rgbd_pose_enabled": True,
+                "rgbd_pose_objects": ["object_a"],
+                "object_pose_names": {
+                    "object_a": "object_a",
+                    "object_b": "object_b",
+                },
+                "public_pose_fallback_objects": [],
+            }
+        }
+
+        def get_rgbd_frame(self, camera_name):
+            raise AssertionError("object_b is not configured for RGB-D")
+
+        def get_public_pose_map(self):
+            return {
+                "object_b": (
+                    np.array([0.68, 0.26, 0.04], dtype=np.float32),
+                    np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    np.array([0.04, 0.04, 0.08], dtype=np.float32),
+                )
+            }
+
+    api = UniVTACFrankaCompatApi(Env())
+
+    with pytest.raises(KeyError, match="RGB-D pose route"):
+        api.get_object_pose("object_b", source="rgbd")

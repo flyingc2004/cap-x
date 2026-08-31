@@ -28,22 +28,37 @@ def _summary(
     right_force: float | None = None,
     balance: float = 0.0,
     slip: float = 0.0,
+    depth: float = 0.0,
+    left_depth: float | None = None,
+    right_depth: float | None = None,
+    area: float = 0.0,
+    left_area: float | None = None,
+    right_area: float | None = None,
 ) -> dict:
+    stable = bool(left and right and force >= 0.2)
     return {
         "contact": left or right,
         "left_contact": left,
         "right_contact": right,
+        "stable": stable,
+        "grasp_stable": stable,
         "normal_force": force,
+        "depth_delta_mm": depth,
+        "contact_area": area,
         "contact_balance": balance,
         "slip_score": slip,
         "event": "stable_grasp" if left and right and force >= 0.2 else "unknown",
         "left": {
             "contact": left,
             "normal_force": force if left_force is None else left_force,
+            "depth_delta_mm": depth if left_depth is None else left_depth,
+            "contact_area": area if left_area is None else left_area,
         },
         "right": {
             "contact": right,
             "normal_force": force if right_force is None else right_force,
+            "depth_delta_mm": depth if right_depth is None else right_depth,
+            "contact_area": area if right_area is None else right_area,
         },
     }
 
@@ -160,6 +175,45 @@ def test_adaptive_close_requires_target_force_on_both_hands() -> None:
     assert result["reason"] == "max_steps"
 
 
+def test_adaptive_close_requires_depth_area_then_post_squeezes_and_holds() -> None:
+    weak_depth = _summary(
+        left=True,
+        right=True,
+        force=0.90,
+        depth=3.0,
+        area=0.010,
+    )
+    stable = _summary(
+        left=True,
+        right=True,
+        force=0.95,
+        depth=6.0,
+        area=0.012,
+    )
+    rig = _ControllerRig([weak_depth, stable, stable, stable, stable, stable], width=0.50)
+    controller = _controller(rig)
+
+    result = controller.close(
+        target_force=0.90,
+        max_steps=10,
+        target_depth_delta_mm=5.0,
+        min_stable_contact_area=0.006,
+        post_squeeze_qpos=0.004,
+        post_squeeze_steps=2,
+        hold_steps=1,
+    )
+
+    assert result["stable"] is True
+    assert result["post_squeeze_applied"] == 2
+    assert result["hold_steps"] == 1
+    assert result["depth_delta_mm"] == pytest.approx(6.0)
+    assert result["contact_area"] == pytest.approx(0.012)
+    phases = [item["phase"] for item in controller.trace]
+    assert "post_squeeze" in phases
+    assert "hold_confirm" in phases
+    assert phases[0] == "contact_debounce"
+
+
 def test_adaptive_open_releases_fine_then_opens_coarse() -> None:
     contact = _summary(left=True, right=True, force=0.30)
     no_contact = _summary()
@@ -200,6 +254,11 @@ def test_univtac_api_converts_qpos_calibration_to_normalized_steps() -> None:
                 "adaptive_gripper": {
                     "coarse_qpos_step": 0.0005,
                     "fine_qpos_step": 0.00005,
+                    "target_depth_delta_mm": 5.8,
+                    "min_stable_contact_area": 0.006,
+                    "post_squeeze_qpos": 0.0003,
+                    "post_squeeze_steps": 8,
+                    "hold_steps": 10,
                 }
             }
         }
@@ -220,6 +279,11 @@ def test_univtac_api_converts_qpos_calibration_to_normalized_steps() -> None:
 
     assert config.coarse_step == pytest.approx(0.0005 / 0.039)
     assert config.fine_step == pytest.approx(0.00005 / 0.039)
+    assert config.target_depth_delta_mm == pytest.approx(5.8)
+    assert config.min_stable_contact_area == pytest.approx(0.006)
+    assert config.post_squeeze_qpos == pytest.approx(0.0003)
+    assert config.post_squeeze_steps == 8
+    assert config.hold_steps == 10
 
 
 def test_univtac_native_tactile_calibration_uses_robot_depth_range() -> None:
@@ -300,6 +364,37 @@ def test_config_can_force_adaptive_requests_to_fixed_native_control() -> None:
     assert close_result["reason"] == "fixed_close_requires_tactile_confirmation"
     assert open_result["reason"] == "fixed_open"
     assert [call["opening"] for call in env.calls] == [False, True]
+
+
+def test_adaptive_open_clears_holding_after_tactile_release() -> None:
+    class Env:
+        task = SimpleNamespace(_robot_manager=SimpleNamespace(gripper_max_qpos=0.039))
+        api_configs = {"franka_control_api": {}}
+
+    class Controller:
+        trace = []
+
+        def open(self, *, target_width, max_steps):
+            return {
+                "ok": False,
+                "released": False,
+                "reason": "max_steps",
+                "steps": max_steps,
+                "width": 0.55,
+                "target_width": target_width,
+                "contact": False,
+            }
+
+    api = UniVTACFrankaCompatApi(Env())
+    api._holding_with_tactile = True
+    api._adaptive_gripper_controller = lambda: Controller()
+
+    result = api.open_gripper(adaptive=True, target_width=1.0, max_steps=3)
+
+    assert result["released"] is False
+    assert result["holding_cleared"] is True
+    assert result["holding_clear_reason"] == "no_tactile_contact"
+    assert api._holding_with_tactile is False
 
 
 def test_lift_can_ablation_configs_isolate_tactile_access() -> None:
@@ -457,6 +552,30 @@ def test_code_execution_always_exposes_numpy_alias() -> None:
 
     assert result["ok"] is True
     np.testing.assert_array_equal(result["result"], np.array([0.0, 0.0, 0.05]))
+
+
+def test_code_execution_blocks_undefined_global_before_motion() -> None:
+    low_level = SimpleNamespace(
+        called=False,
+        get_action_count=lambda: 0,
+        get_step_count=lambda: 0,
+        take_action=lambda *args, **kwargs: setattr(low_level, "called", True),
+    )
+    env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.low_level_env = low_level
+    env._apis = {}
+    env._init_exec_globals()
+    env._get_observation = lambda: {}
+
+    result = env._exec_user_code(
+        "missing_helper()\n"
+        "env.take_action([0, 0, 0], action_type='delta_ee')\n"
+    )
+
+    assert result["ok"] is False
+    assert "StaticCodeError" in result["stderr"]
+    assert "missing_helper" in result["stderr"]
+    assert low_level.called is False
 
 
 def test_code_execution_auto_calls_new_solve_when_model_forgets_call() -> None:

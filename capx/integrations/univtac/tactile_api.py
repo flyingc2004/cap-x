@@ -49,8 +49,8 @@ class UniVTACTactileApi(ApiBase):
         Returns:
             Dictionary with contact, left_contact, right_contact, normal_force,
             contact_area, depth_delta_mm, shear_magnitude, slip_score,
-            contact_balance, per-hand metrics, and event. The summary is based
-            only on UniVTAC tactile depth and marker outputs.
+            contact_balance, stable, per-hand metrics, and event. The summary
+            is based only on UniVTAC tactile depth and marker outputs.
         """
         _refresh_native_tactile(self._env, data_types=["rgb", "rgb_marker", "marker", "depth", "pose"])
         frames = self._env.tactile_buffer.recent(window)
@@ -66,7 +66,8 @@ class UniVTACTactileApi(ApiBase):
             f"force={summary['normal_force']:.3f} depth={summary['depth_delta_mm']:.3f}mm "
             f"shear={summary['shear_magnitude']:.3f} "
             f"centroid={summary['marker_centroid_displacement']:.3f} "
-            f"slip={summary['slip_score']:.3f} event={summary['event']}"
+            f"slip={summary['slip_score']:.3f} stable={summary['stable']} "
+            f"event={summary['event']}"
         )
         return summary
 

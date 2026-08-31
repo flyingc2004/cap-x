@@ -163,10 +163,13 @@ def summarize_native_tactile(
     else:
         event = "unknown"
 
+    stable = bool(event == "stable_grasp")
     return {
         "contact": bool(contact),
         "left_contact": bool(left_metrics["contact"]),
         "right_contact": bool(right_metrics["contact"]),
+        "stable": stable,
+        "grasp_stable": stable,
         "normal_force": normal_force,
         "contact_area": contact_area,
         "depth_delta_mm": depth_delta_mm,
@@ -219,6 +222,8 @@ def _empty_summary() -> dict[str, Any]:
         "left": _empty_hand_metrics(),
         "right": _empty_hand_metrics(),
         "event": "no_contact",
+        "stable": False,
+        "grasp_stable": False,
     }
 
 
