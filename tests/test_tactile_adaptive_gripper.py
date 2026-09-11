@@ -397,6 +397,45 @@ def test_adaptive_open_clears_holding_after_tactile_release() -> None:
     assert api._holding_with_tactile is False
 
 
+def test_configured_open_release_floor_overrides_short_model_request() -> None:
+    class Env:
+        task = SimpleNamespace(_robot_manager=SimpleNamespace(gripper_max_qpos=0.039))
+        api_configs = {
+            "franka_control_api": {
+                "max_gripper_servo_steps": 160,
+                "min_open_gripper_servo_steps": 80,
+            }
+        }
+
+    class Controller:
+        trace = []
+
+        def __init__(self) -> None:
+            self.received_max_steps: int | None = None
+
+        def open(self, *, target_width, max_steps):
+            self.received_max_steps = max_steps
+            return {
+                "ok": True,
+                "released": True,
+                "reason": "target_width",
+                "steps": max_steps,
+                "width": target_width,
+                "target_width": target_width,
+                "contact": False,
+            }
+
+    api = UniVTACFrankaCompatApi(Env())
+    controller = Controller()
+    api._adaptive_gripper_controller = lambda: controller
+
+    result = api.open_gripper(adaptive=True, target_width=1.0, max_steps=30)
+
+    assert controller.received_max_steps == 80
+    assert result["requested_max_steps"] == 30
+    assert result["max_steps_limit"] == 80
+
+
 def test_lift_can_ablation_configs_isolate_tactile_access() -> None:
     config_root = Path(__file__).resolve().parents[1] / "env_configs" / "univtac"
     controller_only = yaml.safe_load(

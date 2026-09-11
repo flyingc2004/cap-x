@@ -16,7 +16,7 @@ import yaml
 from PIL import Image
 
 from capx.envs.base import BaseEnv
-from capx.envs.tasks.exceptions import HardStopTrial
+from capx.envs.tasks.exceptions import HardStopTrial, RecoverableTaskFailure
 from capx.integrations.univtac.native_tactile import (
     UniVTACTactileBuffer,
     frame_from_observation,
@@ -105,6 +105,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._debug_records: list[dict[str, Any]] = []
         self._tactile_gripper_trace: list[dict[str, Any]] = []
         self._primitive_trace: list[dict[str, Any]] = []
+        self._tactile_working_memory_trace: list[dict[str, Any]] = []
+        self._tactile_trial_memory_snapshot: dict[str, Any] = {}
         self._pre_move_tactile_timeline: list[dict[str, Any]] = []
         self._pre_move_tactile_last_error: str | None = None
         self._perception_artifacts: list[dict[str, Any]] = []
@@ -114,6 +116,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._protocol_stop_reason: str | None = None
         self._trial_deadline_time: float | None = None
         self._trial_deadline_seconds: float | None = None
+        self._code_block_action_start: int | None = None
+        self._code_block_action_limit: int | None = None
+        self._code_block_index: int | None = None
         self._reset_serial = 0
 
         self._prepare_import_path()
@@ -149,6 +154,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._debug_records.clear()
         self._tactile_gripper_trace.clear()
         self._primitive_trace.clear()
+        self._tactile_working_memory_trace.clear()
+        self._tactile_trial_memory_snapshot.clear()
         self._pre_move_tactile_timeline.clear()
         self._pre_move_tactile_last_error = None
         self._perception_artifacts.clear()
@@ -156,6 +163,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._protocol_stopped = False
         self._protocol_stop_reason = None
         self.clear_trial_deadline()
+        self.clear_code_block_action_budget()
         self._reset_serial += 1
 
         print(
@@ -305,11 +313,23 @@ class UniVTACLowLevelEnv(BaseEnv):
             return self._protocol_blocked_result()
         from envs.utils.transforms import Pose
 
-        tool_pose = Pose(
-            np.asarray(position, dtype=np.float32).reshape(3),
-            np.asarray(quaternion_wxyz, dtype=np.float32).reshape(4),
-        )
+        tool_position = np.asarray(position, dtype=np.float32).reshape(3).copy()
+        tool_quaternion = np.asarray(quaternion_wxyz, dtype=np.float32).reshape(4)
+        tool_pose = Pose(tool_position, tool_quaternion)
         ee_pose = self._task._robot_manager.gripper_center_to_ee(tool_pose)
+        api_config = self.api_configs.get("franka_control_api", {})
+        native_min_ee_z = float(api_config.get("native_min_ee_z", 0.0))
+        ee_z = float(np.asarray(ee_pose.p, dtype=np.float32).reshape(3)[2])
+        if ee_z < native_min_ee_z:
+            tool_position[2] += native_min_ee_z - ee_z
+            tool_pose = Pose(tool_position, tool_quaternion)
+            ee_pose = self._task._robot_manager.gripper_center_to_ee(tool_pose)
+            print(
+                "[capx-univtac] native_ee_z_clamped "
+                f"requested_ee_z={ee_z:.4f} safe_ee_z={native_min_ee_z:.4f} "
+                f"adjusted_tool_z={tool_position[2]:.4f}",
+                flush=True,
+            )
         gripper_qpos = float(self._task._robot_manager.get_gripper_qpos())
         action = np.concatenate(
             [
@@ -347,20 +367,48 @@ class UniVTACLowLevelEnv(BaseEnv):
 
     def finalize_high_level_action(self) -> dict[str, Any]:
         """Apply native success/early-stop rules after one CaP physical action."""
-        if not self._official_task_protocol:
-            return self.get_protocol_status()
-        if self.get_action_count() >= self.max_steps:
-            self._stop_protocol("action_budget")
-        elif not self._protocol_stopped:
-            try:
-                if bool(self._task.check_success()):
-                    self._task.eval_success = True
-                    self._stop_protocol("native_success")
-                elif bool(self._task.check_early_stop()):
-                    self._stop_protocol("early_stop")
-            except Exception as exc:
-                self._stop_protocol(f"protocol_check_error:{type(exc).__name__}")
+        if self._official_task_protocol:
+            if self.get_action_count() >= self.max_steps:
+                self._stop_protocol("action_budget")
+            elif not self._protocol_stopped:
+                try:
+                    if bool(self._task.check_success()):
+                        self._task.eval_success = True
+                        self._stop_protocol("native_success")
+                    elif bool(self._task.check_early_stop()):
+                        self._stop_protocol("early_stop")
+                except Exception as exc:
+                    self._stop_protocol(f"protocol_check_error:{type(exc).__name__}")
+        self.refresh_live_preview()
         return self.get_protocol_status()
+
+    def refresh_live_preview(self) -> None:
+        """Refresh the local preview after a high-level action attempt.
+
+        Native motion planning can reject a pose before any simulator substep
+        occurs.  Recording only from the substep hook leaves ``latest.jpg``
+        stale in exactly that failure mode, which is misleading during manual
+        debugging.
+        """
+        if not self._record_frames or not self.live_preview_enabled:
+            return
+        try:
+            self._task._update_render()
+            obs = self._read_native_observation(
+                include_camera=True,
+                include_tactile=True,
+                include_embodiment=False,
+                include_actor=False,
+                tactile_data_types=["rgb", "rgb_marker"],
+            )
+            self._record_frame(obs, force=True)
+        except Exception as exc:
+            self._live_preview_write_failures += 1
+            if self._live_preview_write_failures <= 3:
+                print(
+                    f"WARNING: failed to refresh UniVTAC live preview: {exc!r}",
+                    flush=True,
+                )
 
     def get_protocol_status(self) -> dict[str, Any]:
         return {
@@ -389,22 +437,71 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._trial_deadline_time = None
         self._trial_deadline_seconds = None
 
+    def set_code_block_action_budget(
+        self,
+        max_actions: int | None,
+        *,
+        block_index: int | None = None,
+    ) -> None:
+        if max_actions is None or int(max_actions) <= 0:
+            self.clear_code_block_action_budget()
+            return
+        self._code_block_action_start = self.get_action_count()
+        self._code_block_action_limit = int(max_actions)
+        self._code_block_index = int(block_index) if block_index is not None else None
+
+    def clear_code_block_action_budget(self) -> None:
+        self._code_block_action_start = None
+        self._code_block_action_limit = None
+        self._code_block_index = None
+
     def _raise_if_hard_stopped(self, where: str) -> None:
         deadline = getattr(self, "_trial_deadline_time", None)
-        if deadline is None or time.monotonic() < float(deadline):
+        if deadline is not None and time.monotonic() >= float(deadline):
+            if not self._protocol_stopped:
+                self._stop_protocol("trial_timeout")
+            try:
+                self._task.plan_success = False
+            except Exception:
+                pass
+            timeout = float(getattr(self, "_trial_deadline_seconds", None) or 0.0)
+            raise HardStopTrial(
+                "trial_timeout",
+                f"trial deadline reached before {where} after {timeout:.1f}s",
+                details={
+                    "where": where,
+                    "action_count": self.get_action_count(),
+                    "max_steps": self.max_steps,
+                },
+            )
+
+        start = self._code_block_action_start
+        limit = self._code_block_action_limit
+        if start is None or limit is None:
             return
-        if not self._protocol_stopped:
-            self._stop_protocol("trial_timeout")
-        try:
-            self._task.plan_success = False
-        except Exception:
-            pass
-        timeout = float(getattr(self, "_trial_deadline_seconds", None) or 0.0)
-        raise HardStopTrial(
-            "trial_timeout",
-            f"trial deadline reached before {where} after {timeout:.1f}s",
+        used = self.get_action_count() - int(start)
+        if used < int(limit):
+            return
+        reason = "block_action_budget"
+        print(
+            "CAPX_FAILURE object=current phase=code_block "
+            f"reason={reason} action=regenerate stable=false contact=false "
+            f"force=0.0000 slip=0.0000 used_actions={used} "
+            f"limit={int(limit)} block={self._code_block_index}",
+            flush=True,
+        )
+        raise RecoverableTaskFailure(
+            reason,
+            (
+                f"code block {self._code_block_index} used {used} physical "
+                f"action(s), reaching the configured limit {int(limit)} "
+                f"before {where}"
+            ),
             details={
                 "where": where,
+                "block_index": self._code_block_index,
+                "used_actions": int(used),
+                "max_code_block_actions": int(limit),
                 "action_count": self.get_action_count(),
                 "max_steps": self.max_steps,
             },
@@ -801,6 +898,24 @@ class UniVTACLowLevelEnv(BaseEnv):
             self._primitive_trace = []
         self._primitive_trace.append(_jsonable(dict(record)))
 
+    def append_tactile_working_memory_trace(self, record: dict[str, Any]) -> None:
+        """Store public trial-memory capture/write/clear events for audit."""
+        if not hasattr(self, "_tactile_working_memory_trace"):
+            self._tactile_working_memory_trace = []
+        self._tactile_working_memory_trace.append(_jsonable(dict(record)))
+
+    def get_tactile_working_memory_trace(self) -> list[dict[str, Any]]:
+        """Return trial-local tactile memory events without private task fields."""
+        return list(getattr(self, "_tactile_working_memory_trace", []))
+
+    def set_tactile_trial_memory_snapshot(self, memory: dict[str, Any]) -> None:
+        """Store a public, agent-authored memory snapshot for trial artifacts."""
+        self._tactile_trial_memory_snapshot = _jsonable(dict(memory))
+
+    def get_tactile_trial_memory_snapshot(self) -> dict[str, Any]:
+        """Return the current public trial-memory snapshot for audit only."""
+        return _jsonable(getattr(self, "_tactile_trial_memory_snapshot", {}))
+
     def wait_steps(self, n: int = 1) -> dict[str, Any]:
         steps = max(0, int(n))
         for _ in range(steps):
@@ -845,6 +960,14 @@ class UniVTACLowLevelEnv(BaseEnv):
                 "to slot_b. The task reset places the gripper near the current object; "
                 "do not assume it is already grasped. Use public anchors and UniVTAC "
                 "native tactile feedback for local grasping, stable transport, and release."
+            )
+        if self.task_name == "tactile_memory_match":
+            return (
+                "Probe the reference cylinder with UniVTAC native tactile feedback, "
+                "probe candidate_left and candidate_right, choose the candidate whose "
+                "tactile signature best matches the reference, then place the selected "
+                "candidate on match_slot. Do not use private labels, reward, success, "
+                "density, friction, or task metadata."
             )
         return f"Solve the UniVTAC task: {self.task_name}."
 
@@ -1036,6 +1159,8 @@ class UniVTACLowLevelEnv(BaseEnv):
 
     def get_video_frames(self, *, clear: bool = False) -> list[np.ndarray]:
         frames = [frame.copy() for frame in self._frame_buffer]
+        if frames:
+            self._write_live_preview(frames[-1], force=True)
         if clear:
             self._frame_buffer.clear()
         return frames
@@ -1058,10 +1183,14 @@ class UniVTACLowLevelEnv(BaseEnv):
     def export_debug_artifacts(self, output_dir: str | os.PathLike[str]) -> str | None:
         """Write private UniVTAC diagnostics for audit, never for LLM prompts."""
         primitive_trace = getattr(self, "_primitive_trace", [])
+        working_memory_trace = getattr(self, "_tactile_working_memory_trace", [])
+        trial_memory_snapshot = getattr(self, "_tactile_trial_memory_snapshot", {})
         if (
             not self._debug_records
             and not self._tactile_gripper_trace
             and not primitive_trace
+            and not working_memory_trace
+            and not trial_memory_snapshot
             and not self._perception_artifacts
         ):
             return None
@@ -1092,6 +1221,26 @@ class UniVTACLowLevelEnv(BaseEnv):
             with open(primitive_path, "w", encoding="utf-8") as f:
                 json.dump(primitive_trace, f, indent=2, sort_keys=True)
             print(f"[capx-univtac] saved primitive trace to {primitive_path}", flush=True)
+        working_memory_path = None
+        if working_memory_trace:
+            working_memory_path = output_path / "tactile_working_memory_trace.json"
+            with open(working_memory_path, "w", encoding="utf-8") as f:
+                json.dump(working_memory_trace, f, indent=2, sort_keys=True)
+            print(
+                "[capx-univtac] saved tactile working memory trace "
+                f"to {working_memory_path}",
+                flush=True,
+            )
+        trial_memory_path = None
+        if working_memory_trace or trial_memory_snapshot:
+            trial_memory_path = output_path / "tactile_trial_memory.json"
+            with open(trial_memory_path, "w", encoding="utf-8") as f:
+                json.dump(trial_memory_snapshot, f, indent=2, sort_keys=True)
+            print(
+                "[capx-univtac] saved tactile trial memory snapshot "
+                f"to {trial_memory_path}",
+                flush=True,
+            )
         perception_path = self._export_perception_artifacts(output_path)
         self._export_pre_move_tactile_timeline(output_path)
         if self._debug_records:
@@ -1100,6 +1249,10 @@ class UniVTACLowLevelEnv(BaseEnv):
             return str(trace_path)
         if primitive_path is not None:
             return str(primitive_path)
+        if working_memory_path is not None:
+            return str(working_memory_path)
+        if trial_memory_path is not None:
+            return str(trial_memory_path)
         return str(perception_path) if perception_path is not None else None
 
     def _export_perception_artifacts(self, output_path: Path) -> Path | None:
@@ -1716,11 +1869,33 @@ class UniVTACLowLevelEnv(BaseEnv):
         if task is None:
             return
 
+        task_public_pose_map = getattr(task, "get_public_pose_map", None)
+        if callable(task_public_pose_map):
+            try:
+                raw_map = task_public_pose_map()
+            except Exception as exc:
+                print(
+                    f"[capx-univtac] task public pose map failed: {exc!r}",
+                    flush=True,
+                )
+                raw_map = {}
+            if isinstance(raw_map, dict):
+                for name, raw_pose in raw_map.items():
+                    parsed = self._public_pose_entry_to_record(
+                        raw_pose,
+                        name=str(name),
+                        source="task_public_pose",
+                    )
+                    if parsed is not None:
+                        self._public_pose_cache[str(name)] = parsed
+
         object_extent = np.array([0.04, 0.04, 0.08], dtype=np.float32)
         slot_extent = np.array([0.10, 0.10, 0.02], dtype=np.float32)
         start_poses = getattr(task, "start_poses", None)
         if isinstance(start_poses, dict):
             for role in ("object_a", "object_b"):
+                if role in self._public_pose_cache:
+                    continue
                 pose = start_poses.get(role)
                 parsed = self._pose_to_public_record(
                     pose,
@@ -1733,6 +1908,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         target_poses = getattr(task, "target_poses", None)
         if isinstance(target_poses, dict):
             for role, slot in (("object_a", "slot_a"), ("object_b", "slot_b")):
+                if slot in self._public_pose_cache:
+                    continue
                 pose = target_poses.get(role)
                 parsed = self._pose_to_public_record(
                     pose,
@@ -1765,12 +1942,128 @@ class UniVTACLowLevelEnv(BaseEnv):
                 if parsed is not None:
                     self._public_pose_cache[role] = parsed
 
+        self._install_public_pose_aliases()
+
         if self._public_pose_cache:
             print(
                 "[capx-univtac] public pose cache "
                 f"keys={sorted(self._public_pose_cache)}",
                 flush=True,
             )
+
+    def _public_pose_entry_to_record(
+        self,
+        raw_pose: Any,
+        *,
+        name: str,
+        source: str,
+    ) -> dict[str, Any] | None:
+        """Parse a task-declared public pose record without task-private fields."""
+        if isinstance(raw_pose, dict):
+            pos = (
+                raw_pose.get("position")
+                if "position" in raw_pose
+                else raw_pose.get("pos")
+            )
+            quat = raw_pose.get("quaternion_wxyz", raw_pose.get("quat", None))
+            extent = raw_pose.get("extent", raw_pose.get("bbox_extent", None))
+            record_source = str(raw_pose.get("source", source))
+        elif isinstance(raw_pose, (list, tuple)) and len(raw_pose) >= 2:
+            pos = raw_pose[0]
+            quat = raw_pose[1]
+            extent = raw_pose[2] if len(raw_pose) >= 3 else None
+            record_source = source
+        else:
+            return None
+        try:
+            position = np.asarray(pos, dtype=np.float32).reshape(3)
+            quaternion = np.asarray(
+                [1.0, 0.0, 0.0, 0.0] if quat is None else quat,
+                dtype=np.float32,
+            ).reshape(4)
+            bbox_extent = (
+                self._estimate_extent_from_public_pose_name(str(name))
+                if extent is None
+                else np.asarray(extent, dtype=np.float32).reshape(3)
+            )
+        except Exception:
+            return None
+        if (
+            not np.all(np.isfinite(position))
+            or not np.all(np.isfinite(quaternion))
+            or not np.all(np.isfinite(bbox_extent))
+        ):
+            return None
+        return {
+            "position": position,
+            "quaternion_wxyz": quaternion,
+            "extent": bbox_extent,
+            "source": record_source,
+        }
+
+    @staticmethod
+    def _estimate_extent_from_public_pose_name(name: str) -> np.ndarray:
+        key = str(name).strip().lower().replace(" ", "_")
+        if "slot" in key or "pad" in key or "target" in key:
+            return np.array([0.10, 0.10, 0.03], dtype=np.float32)
+        if key in {
+            "reference",
+            "reference_object",
+            "object_a",
+            "candidate_left",
+            "candidate_right",
+            "left_candidate",
+            "right_candidate",
+            "candidate_1",
+            "candidate_2",
+            "current_object",
+            "can",
+        }:
+            return np.array([0.04, 0.04, 0.12], dtype=np.float32)
+        return np.array([0.03, 0.03, 0.03], dtype=np.float32)
+
+    def _install_public_pose_aliases(self) -> None:
+        """Install public aliases without introducing private task state."""
+        aliases = {
+            "reference": "reference_object",
+            "object_a": "reference_object",
+            "a": "reference_object",
+            "left_candidate": "candidate_left",
+            "left": "candidate_left",
+            "candidate_1": "candidate_left",
+            "right_candidate": "candidate_right",
+            "right": "candidate_right",
+            "candidate_2": "candidate_right",
+            "slot": "match_slot",
+            "target": "match_slot",
+            "target_slot": "match_slot",
+            "current_slot": "match_slot",
+        }
+        for alias, target in aliases.items():
+            if alias in self._public_pose_cache or target not in self._public_pose_cache:
+                continue
+            self._public_pose_cache[alias] = self._copy_public_pose_record(
+                self._public_pose_cache[target],
+                source_alias=target,
+            )
+
+    @staticmethod
+    def _copy_public_pose_record(
+        record: dict[str, Any],
+        *,
+        source_alias: str | None = None,
+    ) -> dict[str, Any]:
+        copied = {
+            "position": np.asarray(record["position"], dtype=np.float32).reshape(3).copy(),
+            "quaternion_wxyz": np.asarray(
+                record["quaternion_wxyz"], dtype=np.float32
+            ).reshape(4).copy(),
+            "extent": np.asarray(record["extent"], dtype=np.float32).reshape(3).copy(),
+            "source": str(record.get("source", "public_anchor")),
+        }
+        if source_alias is not None:
+            copied["source_alias"] = str(source_alias)
+        return copied
 
     @staticmethod
     def _pose_to_public_record(
@@ -1801,6 +2094,33 @@ class UniVTACLowLevelEnv(BaseEnv):
 
     def _resolve_public_pose_name(self, name: str) -> str:
         key = str(name).strip().lower().replace(" ", "_")
+        if key in self._public_pose_cache:
+            source_alias = self._public_pose_cache[key].get("source_alias")
+            if isinstance(source_alias, str) and source_alias in self._public_pose_cache:
+                return source_alias
+            return key
+        memory_aliases = {
+            "reference": "reference_object",
+            "reference_object": "reference_object",
+            "object_a": "reference_object",
+            "a": "reference_object",
+            "candidate_left": "candidate_left",
+            "left_candidate": "candidate_left",
+            "left": "candidate_left",
+            "candidate_1": "candidate_left",
+            "candidate_right": "candidate_right",
+            "right_candidate": "candidate_right",
+            "right": "candidate_right",
+            "candidate_2": "candidate_right",
+            "match_slot": "match_slot",
+            "slot": "match_slot",
+            "target": "match_slot",
+            "target_slot": "match_slot",
+            "current_slot": "match_slot",
+        }
+        resolved_memory = memory_aliases.get(key)
+        if resolved_memory in self._public_pose_cache:
+            return str(resolved_memory)
         if key in {"current", "current_object", "object", "target_object", "can"}:
             return self._current_transfer_object_name()
         if key in {"current_slot", "slot", "target", "target_slot"}:
@@ -1822,6 +2142,8 @@ class UniVTACLowLevelEnv(BaseEnv):
             "target_b": "slot_b",
         }
         resolved = aliases.get(key, key)
+        if resolved in self._public_pose_cache:
+            return resolved
         if resolved not in {"object_a", "object_b", "slot_a", "slot_b"}:
             raise KeyError(f"unknown public pose {name!r}")
         return resolved
@@ -1839,6 +2161,14 @@ class UniVTACLowLevelEnv(BaseEnv):
             "target_a": "slot_a_region",
             "slot_b": "slot_b_region",
             "target_b": "slot_b_region",
+            "reference": "reference_region",
+            "reference_object": "reference_region",
+            "candidate_left": "candidate_left_region",
+            "left_candidate": "candidate_left_region",
+            "candidate_right": "candidate_right_region",
+            "right_candidate": "candidate_right_region",
+            "match_slot": "match_slot_region",
+            "target_slot": "match_slot_region",
         }
         resolved = aliases.get(key, key)
         if resolved in regions:

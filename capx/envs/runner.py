@@ -24,7 +24,11 @@ from capx.envs.trial import (
     _annotate_code_blocks,
     _build_log_lines,
     _run_single_trial,
+    _save_env_debug_artifacts,
+    _save_tactile_artifacts,
     _save_tactile_code_memory_trace,
+    _save_trial_video,
+    _save_turn_and_combined_videos,
 )
 from capx.utils.launch_utils import (
     TrialSummary,
@@ -361,6 +365,21 @@ def _run_single_trial_with_timeout(
         return _run_single_trial(
             env, trial, args, config, multi_turn_prompt, partial_artifacts=partial_artifacts
         )
+    except KeyboardInterrupt as exc:
+        # A manual interrupt is common while inspecting a long Isaac run.  The
+        # simulator has already accumulated frames in memory, so flush them
+        # before propagating Ctrl-C and stopping the batch.
+        print(
+            f"[capx-runner] Ctrl-C received during trial {trial}; "
+            "saving partial artifacts before exit...",
+            flush=True,
+        )
+        _build_interrupted_summary(env, trial, partial_artifacts, config, exc)
+        print(
+            f"[capx-runner] trial {trial} partial artifacts saved; exiting with code 130",
+            flush=True,
+        )
+        raise
     except BaseException as exc:
         is_timeout = timed_out or isinstance(exc, TimeoutError)
         try:
@@ -375,7 +394,7 @@ def _run_single_trial_with_timeout(
             raise TimeoutError(f"Trial {trial} timed out") from exc
 
         print(f"Trial {trial} timed out after {timeout_seconds} seconds")
-        return _build_timeout_summary(trial, timeout_seconds, partial_artifacts, config, exc)
+        return _build_timeout_summary(env, trial, timeout_seconds, partial_artifacts, config, exc)
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)
@@ -385,6 +404,7 @@ def _run_single_trial_with_timeout(
 
 
 def _build_timeout_summary(
+    env: CodeExecutionEnvBase,
     trial: int,
     timeout_seconds: int,
     pa: dict[str, Any],
@@ -392,20 +412,71 @@ def _build_timeout_summary(
     exc: BaseException,
 ) -> TrialSummary:
     """Build a TrialSummary from partial artifacts after a timeout."""
+    return _build_aborted_summary(
+        env,
+        trial,
+        pa,
+        config,
+        exc,
+        sandbox_rc=1,
+        truncated=False,
+        prefix=f"Trial {trial} timed out after {timeout_seconds} seconds.",
+        error_label="Timeout Error",
+        video_suffix="timeout",
+    )
+
+
+def _build_interrupted_summary(
+    env: CodeExecutionEnvBase,
+    trial: int,
+    pa: dict[str, Any],
+    config: dict[str, Any],
+    exc: KeyboardInterrupt,
+) -> TrialSummary:
+    """Flush partial trial output when the user stops the run with Ctrl-C."""
+    return _build_aborted_summary(
+        env,
+        trial,
+        pa,
+        config,
+        exc,
+        sandbox_rc=130,
+        truncated=True,
+        prefix=f"Trial {trial} interrupted by user (Ctrl-C).",
+        error_label="KeyboardInterrupt",
+        video_suffix="interrupted",
+    )
+
+
+def _build_aborted_summary(
+    env: CodeExecutionEnvBase,
+    trial: int,
+    pa: dict[str, Any],
+    config: dict[str, Any],
+    exc: BaseException,
+    *,
+    sandbox_rc: int,
+    truncated: bool,
+    prefix: str,
+    error_label: str,
+    video_suffix: str,
+) -> TrialSummary:
+    """Persist code, video, and diagnostics for an interrupted trial."""
     raw_code = pa.get("raw_code", "")
     code_blocks = pa.get("code_blocks", [])
     code_block_metadata = pa.get("code_block_metadata", [])
     final_code = _annotate_code_blocks(code_blocks, code_block_metadata)
 
     info_step = pa.get("info_step", {"sandbox_rc": 1, "stdout": "", "stderr": str(exc)})
+    info_step["sandbox_rc"] = sandbox_rc
     if info_step.get("stderr") == "":
         info_step["stderr"] = str(exc)
     else:
-        info_step["stderr"] += f"\n\nTimeout Error: {exc}"
+        info_step["stderr"] += f"\n\n{error_label}: {exc}"
 
     reward = pa.get("reward", 0.0)
     terminated = pa.get("terminated", False)
-    truncated = pa.get("truncated", False)
+    truncated = bool(truncated or pa.get("truncated", False))
     num_regenerations = pa.get("num_regenerations", 0)
     num_finishes = pa.get("num_finishes", 0)
     num_code_blocks = pa.get("num_code_blocks", len(code_blocks))
@@ -413,12 +484,12 @@ def _build_timeout_summary(
     log_lines = _build_log_lines(
         final_code, info_step, reward, terminated, truncated,
         num_regenerations, num_finishes, num_code_blocks,
-        prefix=f"Trial {trial} timed out after {timeout_seconds} seconds.",
+        prefix=prefix,
     )
 
     code_path = _save_trial_artifacts(
         config, trial,
-        sandbox_rc=1,
+        sandbox_rc=sandbox_rc,
         reward=reward,
         task_completed=info_step.get("task_completed", False),
         final_code=final_code,
@@ -429,9 +500,40 @@ def _build_timeout_summary(
         ensemble_data=pa.get("ensemble_data"),
         multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
     )
-    trace = pa.get("tactile_code_memory_trace", [])
-    if isinstance(trace, list):
-        _save_tactile_code_memory_trace(config, trial, info_step, reward, trace)
+    # Ignore repeated Ctrl-C while serializing the buffered frames.  The first
+    # interrupt has already been handled; a second should not corrupt the only
+    # copy of the partial video.
+    previous_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        if config.get("record_video", False):
+            turn_frame_ranges = list(pa.get("turn_frame_ranges", []))
+            current_frame_start = pa.get("current_frame_start")
+            if current_frame_start is not None and hasattr(env, "get_video_frame_count"):
+                frame_count = int(env.get_video_frame_count())
+                start = int(current_frame_start)
+                if frame_count > start and (
+                    not turn_frame_ranges or turn_frame_ranges[-1] != (start, frame_count)
+                ):
+                    turn_frame_ranges.append((start, frame_count))
+
+            if pa.get("recording_frames", False) and turn_frame_ranges:
+                _save_turn_and_combined_videos(
+                    env, config, trial, info_step, reward, turn_frame_ranges,
+                )
+            else:
+                _save_trial_video(
+                    env, config, trial, info_step, reward, num_code_blocks,
+                    suffix_extra=video_suffix,
+                )
+        _save_tactile_artifacts(env, config, trial, info_step, reward)
+        _save_env_debug_artifacts(env, config, trial, info_step, reward)
+        trace = pa.get("tactile_code_memory_trace", [])
+        if isinstance(trace, list):
+            _save_tactile_code_memory_trace(config, trial, info_step, reward, trace)
+    except Exception as artifact_exc:
+        print(f"WARNING: Failed to save interrupted trial artifacts: {artifact_exc}")
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
 
     return TrialSummary(
         trial=trial,
@@ -439,7 +541,7 @@ def _build_timeout_summary(
         reward=reward,
         terminated=terminated,
         truncated=truncated,
-        sandbox_rc=1,
+        sandbox_rc=sandbox_rc,
         log="\n".join(log_lines),
         task_completed=info_step.get("task_completed", False),
         code_path=code_path,

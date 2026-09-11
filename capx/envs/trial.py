@@ -244,6 +244,23 @@ def _filter_console_for_multiturn(
     return filtered
 
 
+def _set_code_block_action_budget(
+    env: CodeExecutionEnvBase,
+    config: dict[str, Any],
+    code_block_index: int,
+) -> None:
+    max_actions = int(config.get("max_code_block_actions", 0) or 0)
+    setter = getattr(env, "set_code_block_action_budget", None)
+    if max_actions > 0 and callable(setter):
+        setter(max_actions, block_index=code_block_index)
+
+
+def _clear_code_block_action_budget(env: CodeExecutionEnvBase) -> None:
+    clearer = getattr(env, "clear_code_block_action_budget", None)
+    if callable(clearer):
+        clearer()
+
+
 def _clip_multiturn_code(text: str, max_chars: int, label: str) -> str:
     """Bound code history sent to the repair model.
 
@@ -259,6 +276,64 @@ def _clip_multiturn_code(text: str, max_chars: int, label: str) -> str:
         f"# [{label} clipped: omitted {len(text) - limit} chars of older code]\n"
         + text[-limit:]
     )
+
+
+def _should_query_multiturn_after_block(
+    info_step: dict[str, Any],
+    *,
+    code_block_idx: int,
+    total_code_blocks: int,
+    config: dict[str, Any],
+) -> bool:
+    """Return whether a multi-turn decision should be requested after a block."""
+    if not config.get("multi_turn_on_failure_only", False):
+        return True
+
+    stdout = str(info_step.get("stdout", "") or "")
+    stderr = str(info_step.get("stderr", "") or "")
+    combined = f"{stdout}\n{stderr}"
+    try:
+        sandbox_rc = int(info_step.get("sandbox_rc", 0) or 0)
+    except (TypeError, ValueError):
+        sandbox_rc = 1
+
+    if sandbox_rc != 0:
+        return True
+
+    failure_tokens = (
+        "CAPX_FAILURE",
+        "Traceback",
+        "RecoverableTaskFailure",
+        "TimeoutError",
+        "RuntimeError",
+        "ValueError",
+        "KeyError",
+        "AttributeError",
+        "TypeError",
+        "api_action_limit",
+        "block_action_budget",
+        "motion planning failed",
+        "terminated episode",
+    )
+    if any(token in combined for token in failure_tokens):
+        return True
+
+    # If the generated program ran out of blocks without task completion, give
+    # the agent one chance to decide whether to repair, continue, or finish.
+    if code_block_idx >= total_code_blocks and not bool(info_step.get("task_completed", False)):
+        return True
+
+    return False
+
+
+def _was_static_code_rejected_for_full_regeneration(
+    config: dict[str, Any],
+    stderr: str,
+) -> bool:
+    """Return whether rejected initial code must be regenerated as a full chain."""
+    if not config.get("regenerate_full_chain_on_static_failure", False):
+        return False
+    return any(marker in stderr for marker in ("StaticCodeError", "SyntaxError"))
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +607,28 @@ def _build_tactile_code_memory_runtime_context(
         trace.append({"kind": "runtime_retrieval_error", "error": repr(exc)})
         print(f"WARNING: tactile code memory runtime retrieval failed: {exc}")
         return None
+
+
+def _build_trial_working_memory_runtime_context(
+    env: CodeExecutionEnvBase,
+    config: dict[str, Any],
+) -> str | None:
+    """Return bounded, agent-authored trial state for a repair turn."""
+    if not config.get("include_trial_memory_in_multiturn", False):
+        return None
+    provider = getattr(env, "get_runtime_memory_context", None)
+    if not callable(provider):
+        return None
+    context = provider(
+        max_chars=int(config.get("multiturn_trial_memory_max_chars", 4000))
+    )
+    if not context:
+        return None
+    return (
+        "Public trial-local tactile memory snapshot. It is agent-authored state, "
+        "not a task label; preserve completed work and use it for continuation:\n"
+        f"```json\n{context}\n```"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -890,6 +987,10 @@ def _handle_multi_turn_step(
     )
     console_stdout = info_step["stdout"]
     console_stderr = info_step["stderr"]
+    static_code_rejected = _was_static_code_rejected_for_full_regeneration(
+        config,
+        info_step["stderr"],
+    )
     if config.get("filter_multiturn_console", False):
         console_stdout = _filter_console_for_multiturn(
             console_stdout,
@@ -908,17 +1009,29 @@ def _handle_multi_turn_step(
         console_stdout=console_stdout,
         console_stderr=console_stderr,
     )
-    complete_multi_turn_prompt += (
-        "\n\nThe simulator is already at the state reached by the executed block. "
-        "For REGENERATE, output only a short recovery/continuation block; do "
-        "not replay the whole task or repeat completed object stages."
-    )
-    if remaining_code.strip():
+    if static_code_rejected:
+        complete_multi_turn_prompt += (
+            "\n\nThe previous code was rejected before a valid action chain could run. "
+            "For REGENERATE, output one concise, self-contained full main chain. "
+            "Do not assume any probe, selection, grasp, or placement was completed."
+        )
+    else:
+        complete_multi_turn_prompt += (
+            "\n\nThe simulator is already at the state reached by the executed block. "
+            "For REGENERATE, output only a short recovery/continuation block; do "
+            "not replay the whole task or repeat completed object stages."
+        )
+    if remaining_code.strip() and not static_code_rejected:
         complete_multi_turn_prompt = (
             f"{complete_multi_turn_prompt}\n\n"
             "Remaining existing code blocks. Answer CONTINUE to run the next "
             "one unchanged, or REGENERATE to replace all remaining code:\n"
             f"```python\n{remaining_code}\n```"
+        )
+    trial_memory_context = _build_trial_working_memory_runtime_context(env, config)
+    if trial_memory_context:
+        complete_multi_turn_prompt = (
+            f"{complete_multi_turn_prompt}\n\n{trial_memory_context}"
         )
     if tactile_code_memory_trace is not None:
         memory_context = _build_tactile_code_memory_runtime_context(
@@ -1162,6 +1275,7 @@ def _run_single_trial(
             "ensemble_data": ensemble_data,
             "multiturn_ensemble_data": multiturn_ensemble_data,
             "tactile_code_memory_trace": tactile_code_memory_trace,
+            "turn_frame_ranges": turn_frame_ranges,
         })
 
     # Parse initial code into blocks
@@ -1176,12 +1290,20 @@ def _run_single_trial(
         "reasoning": reasoning if reasoning is not None else "",
     })
     if config.get("save_in_progress_code", True):
+        print(
+            f"[capx-trial] trial={trial} in-progress artifact save begin",
+            flush=True,
+        )
         _save_in_progress_trial_artifacts(
             config,
             trial,
             final_code=_annotate_code_blocks(code_blocks, code_block_metadata),
             raw_code=raw_code,
             all_responses=all_responses,
+        )
+        print(
+            f"[capx-trial] trial={trial} in-progress artifact save end",
+            flush=True,
         )
 
     # --- 4. Execute code blocks (with optional multi-turn) ---
@@ -1195,6 +1317,9 @@ def _run_single_trial(
         (config["record_video"] or use_video_diff)
         and hasattr(env, "get_video_frame_count")
     )
+    if partial_artifacts is not None:
+        partial_artifacts["recording_frames"] = recording_frames
+        partial_artifacts["turn_frame_ranges"] = turn_frame_ranges
 
     while code_block_idx < len(code_blocks) and code_block_idx <= MULTITURN_LIMIT:
         code = code_blocks[code_block_idx]
@@ -1202,12 +1327,25 @@ def _run_single_trial(
 
         # Record frame index before step
         frame_start = env.get_video_frame_count() if recording_frames else 0
+        if partial_artifacts is not None:
+            partial_artifacts["current_frame_start"] = frame_start
 
-        obs_next, reward, terminated, truncated, info_step = env.step(code)
+        _set_code_block_action_budget(env, config, code_block_idx)
+        try:
+            print(
+                f"[capx-trial] trial={trial} execute code block "
+                f"{code_block_idx}/{len(code_blocks)} begin",
+                flush=True,
+            )
+            obs_next, reward, terminated, truncated, info_step = env.step(code)
+        finally:
+            _clear_code_block_action_budget(env)
 
         # Record frame index after step
         frame_end = env.get_video_frame_count() if recording_frames else 0
         turn_frame_ranges.append((frame_start, frame_end))
+        if partial_artifacts is not None:
+            partial_artifacts["current_frame_start"] = None
 
         if partial_artifacts is not None:
             partial_artifacts.update({
@@ -1227,7 +1365,20 @@ def _run_single_trial(
             break
 
         # Multi-turn decision
-        if multi_turn_prompt:
+        query_multi_turn = bool(multi_turn_prompt)
+        if query_multi_turn and not _should_query_multiturn_after_block(
+            info_step,
+            code_block_idx=code_block_idx,
+            total_code_blocks=len(code_blocks),
+            config=config,
+        ):
+            query_multi_turn = False
+            print(
+                "[capx-trial] multi-turn decision skipped after clean block; continuing",
+                flush=True,
+            )
+
+        if query_multi_turn:
             if "terminated episode" in info_step["stderr"]:
                 truncated = True
                 break

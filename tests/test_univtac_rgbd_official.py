@@ -215,7 +215,7 @@ def test_univtac_franka_api_exposes_wait_and_status_helpers() -> None:
     assert functions["get_step_status"]() == {"step": 0}
 
 
-def test_goto_pose_api_action_limit_blocks_before_physical_action() -> None:
+def test_goto_pose_api_action_limit_auto_splits_long_motion() -> None:
     class Env:
         api_configs = {
             "franka_control_api": {
@@ -229,15 +229,18 @@ def test_goto_pose_api_action_limit_blocks_before_physical_action() -> None:
 
         def __init__(self) -> None:
             self.actions = []
+            self.ee_pos = np.array([0.0, 0.0, 0.2], dtype=np.float32)
 
         def get_robot_state(self):
             return {
-                "ee_pos": [0.0, 0.0, 0.2],
+                "ee_pos": self.ee_pos.tolist(),
                 "ee_quat": [1.0, 0.0, 0.0, 0.0],
             }
 
         def take_action(self, action, *, action_type):
-            self.actions.append((np.asarray(action), action_type))
+            action = np.asarray(action, dtype=np.float32)
+            self.actions.append((action, action_type))
+            self.ee_pos += action[:3]
             return {"ok": True}
 
     env = Env()
@@ -247,11 +250,17 @@ def test_goto_pose_api_action_limit_blocks_before_physical_action() -> None:
         np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
     )
 
-    assert result["ok"] is False
-    assert result["reason"] == "api_action_limit"
-    assert result["requested_actions"] > result["max_api_actions"]
-    assert result["max_api_actions"] == 3
-    assert env.actions == []
+    assert result["ok"] is True
+    assert result["auto_split"] is True
+    assert result["requested_actions"] > 3
+    assert result["max_api_actions_per_segment"] == 3
+    assert result["segments"] == int(np.ceil(result["requested_actions"] / 3))
+    assert len(env.actions) == result["completed_steps"]
+    assert len(env.actions) <= result["segments"] * result["max_api_actions_per_segment"]
+    assert len(env.actions) > result["max_api_actions_per_segment"]
+    assert all(action_type == "delta_ee" for _, action_type in env.actions)
+    assert all(abs(float(action[0])) <= 0.01 + 1e-6 for action, _ in env.actions)
+    assert np.allclose(env.ee_pos, [0.10, 0.0, 0.2])
 
 
 def test_goto_pose_tactile_guard_stops_on_contact_loss() -> None:

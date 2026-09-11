@@ -57,6 +57,8 @@ class CodeExecEnvConfig:
     privileged: bool = False
     enable_render: bool = True
     viser_debug: bool = False
+    stream_user_code_output: bool = True
+    """Mirror generated-code stdout/stderr to the terminal while it executes."""
 
 
 class SimpleExecutor:
@@ -184,9 +186,15 @@ class CodeExecutionEnvBase(Env):
                 self._exec_globals[fn_name] = fn
 
         stdout_buffer = io.StringIO()
-        tee_out = Tee(sys.stdout, stdout_buffer)
         stderr_buffer = io.StringIO()
-        tee_err = Tee(sys.stderr, stderr_buffer)
+        if self.cfg.stream_user_code_output:
+            tee_out = Tee(sys.stdout, stdout_buffer)
+            tee_err = Tee(sys.stderr, stderr_buffer)
+        else:
+            # Keep generated-code logs available to the runner and multi-turn
+            # repair prompt without flooding an interactive terminal.
+            tee_out = Tee(stdout_buffer)
+            tee_err = Tee(stderr_buffer)
         ok = True
         undefined_names = self._find_static_undefined_globals(code)
         if undefined_names:
@@ -356,6 +364,23 @@ class CodeExecutionEnvBase(Env):
         if callable(clearer):
             clearer()
 
+    def set_code_block_action_budget(
+        self,
+        max_actions: int | None,
+        *,
+        block_index: int | None = None,
+    ) -> None:
+        """Forward an optional per-code-block action budget to low-level envs."""
+        setter = getattr(self.low_level_env, "set_code_block_action_budget", None)
+        if callable(setter):
+            setter(max_actions, block_index=block_index)
+
+    def clear_code_block_action_budget(self) -> None:
+        """Clear any per-code-block action budget on the low-level env."""
+        clearer = getattr(self.low_level_env, "clear_code_block_action_budget", None)
+        if callable(clearer):
+            clearer()
+
     def _exec_apis_binding(self) -> dict[str, ApiBase]:
         return self._apis
 
@@ -417,6 +442,32 @@ class CodeExecutionEnvBase(Env):
                 api.reset_episode()
         info.update({"task_prompt": self._task_prompt})
         return obs, info
+
+    def get_runtime_memory_context(self, max_chars: int = 4000) -> str:
+        """Collect bounded, public runtime memory from APIs for regeneration.
+
+        This hook is intentionally optional. Environments without an API-owned
+        runtime memory simply return an empty string, preserving existing CaP-X
+        multi-turn behavior.
+        """
+        budget = max(256, int(max_chars))
+        sections: list[str] = []
+        remaining = budget
+        for api_name, api in self._apis.items():
+            provider = getattr(api, "runtime_memory_context", None)
+            if not callable(provider) or remaining <= 0:
+                continue
+            context = provider(max_chars=max(256, remaining - len(api_name) - 2))
+            if not context:
+                continue
+            section = f"{api_name}: {context}"
+            if len(section) > remaining:
+                section = f'{api_name}: {{"truncated":true}}'
+            if len(section) > remaining:
+                continue
+            sections.append(section)
+            remaining -= len(section)
+        return "\n".join(sections)
 
     def step(self, action: str) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
         """

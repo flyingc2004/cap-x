@@ -356,6 +356,8 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
         "close_gripper",
         "get_robot_state",
         "home_pose",
+        "get_step_status",
+        "wait_steps",
     }
 
     functions = UniVTACTactileApi.__new__(UniVTACTactileApi).functions()

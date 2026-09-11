@@ -113,6 +113,23 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         if current_value == cli_default and field in configs_dict:
             setattr(args, field, configs_dict[field])
 
+    tactile_memory_config = _normalize_tactile_memory_config(
+        configs_dict.get("tactile_memory")
+    )
+    trial_memory_config = tactile_memory_config["trial"]
+    if not tactile_memory_config["configured"]:
+        trial_memory_config = {
+            "enabled": bool(configs_dict.get("include_trial_memory_in_multiturn", False)),
+            "include_in_multiturn": bool(
+                configs_dict.get("include_trial_memory_in_multiturn", False)
+            ),
+            "max_context_chars": int(
+                configs_dict.get("multiturn_trial_memory_max_chars", 4000)
+            ),
+        }
+        tactile_memory_config["trial"] = trial_memory_config
+    persistent_memory_enabled = tactile_memory_config["persistent"]["enabled"]
+
     tactile_strategy_memory_path = configs_dict.get(
         "tactile_strategy_memory_path",
         ".capx_tactile_strategies.jsonl",
@@ -123,6 +140,10 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
     )
     tactile_strategy_top_k = int(configs_dict.get("tactile_strategy_top_k", 3))
     tactile_strategy_memory_enabled = bool(configs_dict.get("tactile_strategy_memory", False))
+    if tactile_memory_config["configured"]:
+        tactile_strategy_memory_enabled = (
+            tactile_strategy_memory_enabled and persistent_memory_enabled
+        )
     os.environ["CAPX_TACTILE_STRATEGY_MEMORY_ENABLED"] = (
         "1" if tactile_strategy_memory_enabled else "0"
     )
@@ -132,9 +153,10 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
     )
     os.environ["CAPX_TACTILE_STRATEGY_TOP_K"] = str(tactile_strategy_top_k)
 
-    tactile_code_memory_config = _normalize_tactile_code_memory_config(
-        configs_dict.get("tactile_code_memory", {})
-    )
+    tactile_code_memory_raw = configs_dict.get("tactile_code_memory", {})
+    if tactile_memory_config["configured"] and not persistent_memory_enabled:
+        tactile_code_memory_raw = {"enabled": False}
+    tactile_code_memory_config = _normalize_tactile_code_memory_config(tactile_code_memory_raw)
 
     # Build merged config dict (CLI args override YAML)
     merged_config = {
@@ -180,11 +202,26 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         else configs_dict.get("web_ui_port", 8200),
         "save_multiturn_prompts": configs_dict.get("save_multiturn_prompts", False),
         "save_in_progress_code": configs_dict.get("save_in_progress_code", True),
+        "split_code_blocks_on_breakpoint": configs_dict.get(
+            "split_code_blocks_on_breakpoint",
+            False,
+        ),
+        "max_code_block_actions": int(
+            os.getenv(
+                "CAPX_MAX_CODE_BLOCK_ACTIONS",
+                configs_dict.get("max_code_block_actions", 0),
+            )
+        ),
         "tactile_strategy_memory": tactile_strategy_memory_enabled,
         "tactile_strategy_memory_path": tactile_strategy_memory_path,
         "tactile_strategy_memory_read_path": tactile_strategy_memory_read_path,
         "tactile_strategy_top_k": tactile_strategy_top_k,
         "tactile_code_memory": tactile_code_memory_config,
+        "tactile_memory": tactile_memory_config,
+        "include_trial_memory_in_multiturn": trial_memory_config[
+            "enabled"
+        ] and trial_memory_config["include_in_multiturn"],
+        "multiturn_trial_memory_max_chars": trial_memory_config["max_context_chars"],
         "trial_timeout_seconds": float(
             os.getenv(
                 "CAPX_TRIAL_TIMEOUT_SECONDS",
@@ -216,6 +253,29 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         _inject_tactile_code_memory_prompt(env_factory, merged_config)
 
     return env_factory, merged_config, api_servers
+
+
+def _normalize_tactile_memory_config(raw: Any) -> dict[str, Any]:
+    """Normalize the UniVTAC trial/persistent tactile-memory switch."""
+    configured = isinstance(raw, dict)
+    cfg = dict(raw or {}) if configured else {}
+    trial_raw = cfg.get("trial", {})
+    persistent_raw = cfg.get("persistent", {})
+    if not isinstance(trial_raw, dict):
+        raise TypeError("tactile_memory.trial must be a mapping")
+    if not isinstance(persistent_raw, dict):
+        raise TypeError("tactile_memory.persistent must be a mapping")
+    return {
+        "configured": configured,
+        "trial": {
+            "enabled": bool(trial_raw.get("enabled", False)),
+            "include_in_multiturn": bool(
+                trial_raw.get("include_in_multiturn", False)
+            ),
+            "max_context_chars": int(trial_raw.get("max_context_chars", 4000)),
+        },
+        "persistent": {"enabled": bool(persistent_raw.get("enabled", False))},
+    }
 
 
 def _normalize_tactile_code_memory_config(raw: Any) -> dict[str, Any]:
@@ -342,7 +402,11 @@ def _normalize_extracted_code(content: str) -> str:
     content = "\n".join(
         line
         for line in content.splitlines()
-        if not re.match(r"^\s*#\s*Code block\s+\d+\s*$", line, flags=re.IGNORECASE)
+        if not re.match(
+            r"^\s*(?:#\s*Code block\s+\d+|```(?:python|py)?|```)\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
     )
     return textwrap.dedent(content).strip()
 
@@ -675,20 +739,40 @@ def _save_in_progress_trial_artifacts(
     if not config["output_dir"]:
         return None
     trial_dir = Path(config["output_dir"]) / f"trial_{trial:02d}_in_progress"
+    print(f"[capx-trial] in-progress save mkdir path={trial_dir}", flush=True)
     trial_dir.mkdir(parents=True, exist_ok=True)
 
     code_path = trial_dir / "code.py"
+    print(
+        f"[capx-trial] in-progress save code.py bytes={len(final_code.encode('utf-8'))}",
+        flush=True,
+    )
     code_path.write_text(final_code)
+    print("[capx-trial] in-progress save code.py done", flush=True)
     if raw_code:
+        print(
+            f"[capx-trial] in-progress save raw_response bytes={len(raw_code.encode('utf-8'))}",
+            flush=True,
+        )
         (trial_dir / "raw_response.sh").write_text(raw_code)
-    (trial_dir / "all_responses.json").write_text(json.dumps(all_responses, indent=2))
+        print("[capx-trial] in-progress save raw_response done", flush=True)
+    print("[capx-trial] in-progress save all_responses serialize", flush=True)
+    serialized_responses = json.dumps(all_responses, indent=2)
+    print(
+        f"[capx-trial] in-progress save all_responses bytes={len(serialized_responses.encode('utf-8'))}",
+        flush=True,
+    )
+    (trial_dir / "all_responses.json").write_text(serialized_responses)
+    print("[capx-trial] in-progress save all_responses done", flush=True)
 
     if all_responses:
         try:
             initial_prompt_content = all_responses[0].get("initial_prompt")
             if initial_prompt_content:
+                print("[capx-trial] in-progress save initial_prompt", flush=True)
                 prompt_text = initial_prompt_content[-1]["content"][0]["text"]
                 (trial_dir / "initial_prompt.txt").write_text(str(prompt_text))
+                print("[capx-trial] in-progress save initial_prompt done", flush=True)
         except Exception:
             pass
     print(f"[capx-trial] in-progress code saved to {code_path}", flush=True)

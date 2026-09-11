@@ -62,6 +62,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         rgbd_grasp_enabled: bool | None = None,
         rgbd_pose_objects: list[str] | tuple[str, ...] | None = None,
         rgbd_grasp_objects: list[str] | tuple[str, ...] | None = None,
+        public_anchor_pose_enabled: bool = True,
         public_pose_fallback_objects: list[str] | tuple[str, ...] | None = None,
         public_grasp_anchor_objects: list[str] | tuple[str, ...] | None = None,
         cache_rgbd_pose_objects: list[str] | tuple[str, ...] | None = None,
@@ -84,6 +85,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         max_home_pose_actions: int | None = None,
         max_native_pose_actions: int | None = None,
         max_gripper_servo_steps: int | None = None,
+        min_open_gripper_servo_steps: int | None = None,
         max_gripper_settle_steps: int | None = None,
         goto_pose_tactile_guard_force_threshold: float = 0.30,
         goto_pose_tactile_guard_slip_threshold: float = 0.60,
@@ -160,6 +162,18 @@ class UniVTACFrankaCompatApi(ApiBase):
             "slot_a": "slot_a",
             "slot b": "slot_b",
             "slot_b": "slot_b",
+            "reference": "reference_object",
+            "reference_object": "reference_object",
+            "candidate left": "candidate_left",
+            "candidate_left": "candidate_left",
+            "left candidate": "candidate_left",
+            "left_candidate": "candidate_left",
+            "candidate right": "candidate_right",
+            "candidate_right": "candidate_right",
+            "right candidate": "candidate_right",
+            "right_candidate": "candidate_right",
+            "match slot": "match_slot",
+            "match_slot": "match_slot",
         }
         self.rgbd_perception_enabled = bool(
             cfg.get("rgbd_perception_enabled", rgbd_perception_enabled)
@@ -196,6 +210,9 @@ class UniVTACFrankaCompatApi(ApiBase):
         self.rgbd_grasp_objects = self._optional_normalized_object_set(
             grasp_objects_raw,
             object_pose_names=self.object_pose_names,
+        )
+        self.public_anchor_pose_enabled = bool(
+            cfg.get("public_anchor_pose_enabled", public_anchor_pose_enabled)
         )
         self.public_pose_fallback_objects = self._normalize_object_set(
             public_pose_raw,
@@ -270,6 +287,17 @@ class UniVTACFrankaCompatApi(ApiBase):
         self.max_gripper_servo_steps = self._optional_positive_int(
             cfg.get("max_gripper_servo_steps", max_gripper_servo_steps),
         )
+        self.min_open_gripper_servo_steps = self._optional_positive_int(
+            cfg.get("min_open_gripper_servo_steps", min_open_gripper_servo_steps),
+        )
+        if (
+            self.min_open_gripper_servo_steps is not None
+            and self.max_gripper_servo_steps is not None
+        ):
+            self.min_open_gripper_servo_steps = min(
+                self.min_open_gripper_servo_steps,
+                self.max_gripper_servo_steps,
+            )
         self.max_gripper_settle_steps = self._optional_positive_int(
             cfg.get("max_gripper_settle_steps", max_gripper_settle_steps),
         )
@@ -341,6 +369,10 @@ class UniVTACFrankaCompatApi(ApiBase):
                 f"object '{object_name}' is not available by configured RGB-D pose route"
             )
         if source_key == "anchor":
+            if not self.public_anchor_pose_enabled:
+                raise KeyError(
+                    f"object '{object_name}' is not available by configured public anchor route"
+                )
             public_pose = self._public_anchor_pose(key)
             if public_pose is None:
                 raise KeyError(f"object '{object_name}' is not available as a public anchor")
@@ -517,11 +549,13 @@ class UniVTACFrankaCompatApi(ApiBase):
         quat = np.asarray(quaternion_wxyz, dtype=np.float32).reshape(4)
 
         active_tactile_monitor = bool(monitor_tactile or self._holding_with_tactile)
-
-        if self.use_native_pose_planner and not active_tactile_monitor:
-            return self._goto_pose_native(pos, quat, z_approach=float(z_approach))
-
-        if not active_tactile_monitor:
+        approach = max(0.0, float(z_approach))
+        if not active_tactile_monitor and approach <= 0.0:
+            # A sampled grasp pose is a semantic task target, not a generic
+            # end-effector pose. Resolve it through the task atom first so
+            # UniVTAC applies its object geometry, pre-displacement, and
+            # grasp-height convention. The same rule applies to public slot
+            # landmarks when the task provides a native placement atom.
             grasp_result = self._try_approach_public_grasp(pos)
             if grasp_result is not None:
                 return grasp_result
@@ -530,14 +564,18 @@ class UniVTACFrankaCompatApi(ApiBase):
             if place_result is not None:
                 return place_result
 
+        if self.use_native_pose_planner and not active_tactile_monitor:
+            return self._goto_pose_native(pos, quat, z_approach=float(z_approach))
+
         cur_pos, cur_quat = self._current_tool_pose()
         if self._nearest_public_landmark(pos) is not None and self.preserve_landmark_orientation:
             quat = cur_quat
 
         # Preserve the original CaP contract: zero means a direct bounded move.
         # Callers request a staged approach explicitly with a positive value.
-        remaining_api_actions = self.max_goto_pose_actions
-        approach = max(0.0, float(z_approach))
+        # ``max_goto_pose_actions`` is a per-segment safety cap; long motions
+        # are split by the adapter instead of failing before transport.
+        api_action_limit = self.max_goto_pose_actions
         if approach > 0.0:
             approach_target = pos.copy()
             approach_target[2] = max(approach_target[2] + approach, self.min_safe_z)
@@ -546,7 +584,7 @@ class UniVTACFrankaCompatApi(ApiBase):
                 quat,
                 cur_pos,
                 cur_quat,
-                max_actions=remaining_api_actions,
+                max_actions=api_action_limit,
                 monitor_tactile=active_tactile_monitor,
                 abort_on_contact_loss=abort_on_contact_loss,
                 tactile_force_threshold=tactile_force_threshold,
@@ -554,7 +592,6 @@ class UniVTACFrankaCompatApi(ApiBase):
             )
             if isinstance(result, dict) and not bool(result.get("ok", False)):
                 return result
-            remaining_api_actions = self._consume_api_actions(remaining_api_actions, result)
             cur_pos, cur_quat = self._current_tool_pose()
 
         final_target = pos.copy()
@@ -564,7 +601,7 @@ class UniVTACFrankaCompatApi(ApiBase):
             quat,
             cur_pos,
             cur_quat,
-            max_actions=remaining_api_actions,
+            max_actions=api_action_limit,
             monitor_tactile=active_tactile_monitor,
             abort_on_contact_loss=abort_on_contact_loss,
             tactile_force_threshold=tactile_force_threshold,
@@ -575,7 +612,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         self,
         adaptive: bool = True,
         target_width: float = 1.0,
-        max_steps: int = 80,
+        max_steps: int = 160,
     ) -> dict[str, Any]:
         """Open the gripper, releasing gently while native contact remains.
 
@@ -588,7 +625,7 @@ class UniVTACFrankaCompatApi(ApiBase):
             Result containing ``released``, final width, and stop reason.
         """
         requested_max_steps = int(max_steps)
-        max_steps = self._limit_gripper_servo_steps(requested_max_steps)
+        max_steps = self._limit_open_gripper_servo_steps(requested_max_steps)
         if not self._begin_gripper_action():
             return self._blocked_gripper_result(opening=True)
         if adaptive and self.tactile_adaptive_gripper_enabled:
@@ -1316,6 +1353,14 @@ class UniVTACFrankaCompatApi(ApiBase):
         if not callable(move_fn):
             raise RuntimeError("UniVTAC environment does not provide native pose planning")
         target = np.asarray(position, dtype=np.float32).reshape(3)
+        requested_z = float(target[2])
+        target[2] = max(target[2], self.min_safe_z)
+        if requested_z < self.min_safe_z:
+            print(
+                "[univtac-franka] native_target_z_clamped "
+                f"requested={requested_z:.4f} safe_z={self.min_safe_z:.4f}",
+                flush=True,
+            )
         quat = self._normalize_quat(quaternion_wxyz)
         result: dict[str, Any] = {"ok": True, "message": "no movement requested"}
         approach = max(0.0, float(z_approach))
@@ -1388,13 +1433,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         current_quat = np.asarray(current_quat, dtype=np.float32).reshape(4)
 
         delta_pos = target_pos - current_pos
-        dist = float(np.linalg.norm(delta_pos))
-        rot_angle = self._rotation_angle(current_quat, target_quat)
-        steps = max(
-            1,
-            int(np.ceil(dist / max(self.max_delta_xyz, 1e-6))),
-            int(np.ceil(rot_angle / max(self.max_delta_rpy, 1e-6))),
-        )
+        steps = self._pose_step_count(current_pos, current_quat, target_pos, target_quat)
         limit_failure = self._api_action_limit_failure(
             "goto_pose",
             steps,
@@ -1459,6 +1498,25 @@ class UniVTACFrankaCompatApi(ApiBase):
                     )
                     return guarded_result
         return last_result
+
+    def _pose_step_count(
+        self,
+        current_pos: np.ndarray,
+        current_quat: np.ndarray,
+        target_pos: np.ndarray,
+        target_quat: np.ndarray,
+    ) -> int:
+        current_pos = np.asarray(current_pos, dtype=np.float32).reshape(3)
+        target_pos = np.asarray(target_pos, dtype=np.float32).reshape(3)
+        current_quat = np.asarray(current_quat, dtype=np.float32).reshape(4)
+        target_quat = np.asarray(target_quat, dtype=np.float32).reshape(4)
+        dist = float(np.linalg.norm(target_pos - current_pos))
+        rot_angle = self._rotation_angle(current_quat, target_quat)
+        return max(
+            1,
+            int(np.ceil(dist / max(self.max_delta_xyz, 1e-6))),
+            int(np.ceil(rot_angle / max(self.max_delta_rpy, 1e-6))),
+        )
 
     def _tactile_guard_failure(
         self,
@@ -1529,6 +1587,10 @@ class UniVTACFrankaCompatApi(ApiBase):
         tactile_force_threshold: float | None = None,
         slip_threshold: float | None = None,
     ) -> dict[str, Any]:
+        target_pos = np.asarray(target_pos, dtype=np.float32).reshape(3)
+        target_quat = np.asarray(target_quat, dtype=np.float32).reshape(4)
+        current_pos = np.asarray(current_pos, dtype=np.float32).reshape(3)
+        current_quat = np.asarray(current_quat, dtype=np.float32).reshape(4)
         monitor_kwargs: dict[str, Any] = {}
         if monitor_tactile:
             monitor_kwargs = {
@@ -1546,14 +1608,101 @@ class UniVTACFrankaCompatApi(ApiBase):
                 **monitor_kwargs,
             )
         else:
-            result = self._move_to_pose_bounded(
-                target_pos,
-                target_quat,
+            segment_limit = max(0, int(max_actions))
+            total_steps = self._pose_step_count(
                 current_pos,
                 current_quat,
-                max_actions=max_actions,
-                **monitor_kwargs,
+                target_pos,
+                target_quat,
             )
+            remaining_protocol_actions = self._remaining_protocol_actions()
+            if (
+                remaining_protocol_actions is not None
+                and total_steps > remaining_protocol_actions
+            ):
+                limit_failure = self._api_action_limit_failure(
+                    "goto_pose",
+                    total_steps,
+                    max_actions,
+                )
+                if limit_failure is not None:
+                    return limit_failure
+            if segment_limit <= 0 or total_steps <= segment_limit:
+                result = self._move_to_pose_bounded(
+                    target_pos,
+                    target_quat,
+                    current_pos,
+                    current_quat,
+                    max_actions=max_actions,
+                    **monitor_kwargs,
+                )
+                return result if isinstance(result, dict) else {"ok": True, "message": "movement completed"}
+
+            num_segments = int(np.ceil(total_steps / segment_limit))
+            pos_waypoints = [
+                current_pos + ((target_pos - current_pos) * (i / num_segments))
+                for i in range(1, num_segments + 1)
+            ]
+            quat_waypoints = self._slerp_quaternion_path(
+                current_quat,
+                target_quat,
+                num_segments + 1,
+            )[1:]
+            print(
+                "[univtac-franka] goto_pose_auto_split "
+                f"requested={total_steps} segment_limit={segment_limit} "
+                f"segments={num_segments}",
+                flush=True,
+            )
+            total_completed = 0
+            last_result: dict[str, Any] = {
+                "ok": True,
+                "message": "split bounded pose movement completed",
+            }
+            for segment_idx, (segment_pos, segment_quat) in enumerate(
+                zip(pos_waypoints, quat_waypoints, strict=True),
+                start=1,
+            ):
+                segment_current_pos, segment_current_quat = self._current_tool_pose()
+                result = self._move_to_pose_bounded(
+                    segment_pos,
+                    segment_quat,
+                    segment_current_pos,
+                    segment_current_quat,
+                    max_actions=segment_limit,
+                    **monitor_kwargs,
+                )
+                segment_completed = int(
+                    result.get("completed_steps", result.get("steps", 0)) or 0
+                )
+                total_completed += max(0, segment_completed)
+                last_result = dict(result)
+                if not bool(result.get("ok", False)):
+                    last_result.update(
+                        {
+                            "auto_split": True,
+                            "segment_index": segment_idx,
+                            "segments": num_segments,
+                            "requested_actions": total_steps,
+                            "max_api_actions_per_segment": segment_limit,
+                            "completed_steps_total": total_completed,
+                        }
+                    )
+                    return last_result
+            last_result.update(
+                {
+                    "ok": True,
+                    "auto_split": True,
+                    "segments": num_segments,
+                    "requested_actions": total_steps,
+                    "max_api_actions_per_segment": segment_limit,
+                    "steps": total_completed,
+                    "completed_steps": total_completed,
+                    "completed_steps_total": total_completed,
+                    "message": "split bounded pose movement completed",
+                }
+            )
+            return last_result
         return result if isinstance(result, dict) else {"ok": True, "message": "movement completed"}
 
     def _api_action_limit_failure(
@@ -1623,6 +1772,13 @@ class UniVTACFrankaCompatApi(ApiBase):
             return requested
         return min(requested, self.max_gripper_servo_steps)
 
+    def _limit_open_gripper_servo_steps(self, requested_max_steps: int) -> int:
+        """Apply the configured release floor without exceeding the global cap."""
+        bounded = self._limit_gripper_servo_steps(requested_max_steps)
+        if self.min_open_gripper_servo_steps is None:
+            return bounded
+        return max(bounded, self.min_open_gripper_servo_steps)
+
     @staticmethod
     def _annotate_servo_limit(
         result: dict[str, Any],
@@ -1683,12 +1839,25 @@ class UniVTACFrankaCompatApi(ApiBase):
         return str(name).strip().lower().replace(" ", "_")
 
     def _estimate_extent_from_pose_name(self, key: str) -> np.ndarray:
-        if "pad" in key:
+        normalized = self._normalize_name(key)
+        if "pad" in normalized or "slot" in normalized or "target" in normalized:
             return np.array([0.10, 0.10, 0.03], dtype=np.float32)
-        if key == "can":
+        if normalized == "can":
             return np.array([0.06, 0.06, 0.12], dtype=np.float32)
-        if key in {"object_a", "object_b", "current_object"}:
-            return np.array([0.04, 0.04, 0.08], dtype=np.float32)
+        if normalized in {
+            "object_a",
+            "object_b",
+            "current_object",
+            "reference",
+            "reference_object",
+            "candidate_left",
+            "candidate_right",
+            "left_candidate",
+            "right_candidate",
+            "candidate_1",
+            "candidate_2",
+        }:
+            return np.array([0.04, 0.04, 0.12], dtype=np.float32)
         return np.array([0.03, 0.03, 0.03], dtype=np.float32)
 
     def _public_landmarks(self) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -1835,7 +2004,22 @@ class UniVTACFrankaCompatApi(ApiBase):
         candidate_keys = [
             key
             for key in self._public_landmarks()
-            if key in {"prism", "can", "object_a", "object_b", "current_object"}
+            if key
+            in {
+                "prism",
+                "can",
+                "object_a",
+                "object_b",
+                "current_object",
+                "reference",
+                "reference_object",
+                "candidate_left",
+                "candidate_right",
+                "left_candidate",
+                "right_candidate",
+                "candidate_1",
+                "candidate_2",
+            }
         ]
         for key in candidate_keys:
             sampled = self._public_grasp_pose(key)

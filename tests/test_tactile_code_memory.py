@@ -496,3 +496,9 @@ def test_normalize_extracted_code_removes_model_block_marker_and_dedents() -> No
     content = "# Code block 2\n    lift_height = 0.15\n    print(lift_height)"
 
     assert _normalize_extracted_code(content) == "lift_height = 0.15\nprint(lift_height)"
+
+
+def test_normalize_extracted_code_removes_unmatched_fence_lines() -> None:
+    content = "```python\ndef solve():\n    return 1\n"
+
+    assert _normalize_extracted_code(content) == "def solve():\n    return 1"

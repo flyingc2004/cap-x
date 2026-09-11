@@ -236,6 +236,10 @@ def _empty_hand_metrics() -> dict[str, Any]:
         "depth_min_mm": None,
         "depth_far_plane_mm": None,
         "shear_magnitude": 0.0,
+        # Keep legacy normalized motion fields below, but expose the raw
+        # GelSight marker-coordinate measurement separately for matching.
+        "marker_displacement_px": 0.0,
+        "marker_coherence": 0.0,
         "marker_mean_displacement": 0.0,
         "marker_max_displacement": 0.0,
         "marker_centroid_displacement": 0.0,
@@ -262,6 +266,8 @@ def _hand_metrics(
     )
     depth_delta = depth_stats["depth_delta_mm"]
     marker_mean, marker_max = _marker_displacement(marker)
+    marker_displacement_px, _ = _marker_displacement_px(marker)
+    marker_coherence = _marker_coherence(marker)
     marker_centroid_displacement = _marker_centroid_displacement(marker, baseline_marker)
     contact_area = depth_stats["contact_area"]
     force_scale = max(float(force_full_scale_mm), 1e-6)
@@ -291,6 +297,8 @@ def _hand_metrics(
             "depth_min_mm": depth_stats["depth_min_mm"],
             "depth_far_plane_mm": depth_stats["depth_far_plane_mm"],
             "shear_magnitude": shear,
+            "marker_displacement_px": float(marker_displacement_px),
+            "marker_coherence": float(marker_coherence),
             "marker_mean_displacement": float(marker_mean),
             "marker_max_displacement": float(marker_max),
             "marker_centroid_displacement": float(marker_centroid_displacement),
@@ -347,20 +355,8 @@ def _depth_metrics(
 
 
 def _marker_displacement(marker: np.ndarray | None) -> tuple[float, float]:
-    if marker is None or marker.size == 0:
-        return 0.0, 0.0
-    arr = np.asarray(marker, dtype=np.float64)
-    if arr.shape[-1] < 2:
-        return 0.0, 0.0
-    # UniVTAC removes the environment dimension before exposing marker data,
-    # leaving [initial/current, num_markers, xy]. Synthetic grids may retain
-    # one extra marker-grid dimension, so both 3-D and 4-D layouts use axis 0.
-    if arr.ndim >= 3 and arr.shape[0] >= 2:
-        disp = arr[-1, ..., :2] - arr[0, ..., :2]
-    else:
-        disp = arr[..., :2]
-    mag = np.linalg.norm(disp.reshape(-1, 2), axis=1)
-    mag = mag[np.isfinite(mag)]
+    """Return the legacy normalized displacement values."""
+    mag = _marker_magnitudes(marker)
     if mag.size == 0:
         return 0.0, 0.0
     # UniVTAC marker_motion is pixel-like in live observations; normalize large
@@ -369,6 +365,52 @@ def _marker_displacement(marker: np.ndarray | None) -> tuple[float, float]:
     if float(np.nanmax(mag)) > 10.0:
         mag = mag / 320.0
     return float(np.mean(mag)), float(np.max(mag))
+
+
+def _marker_displacement_px(marker: np.ndarray | None) -> tuple[float, float]:
+    """Return raw mean/max marker displacement in native pixel coordinates."""
+    mag = _marker_magnitudes(marker)
+    if mag.size == 0:
+        return 0.0, 0.0
+    return float(np.mean(mag)), float(np.max(mag))
+
+
+def _marker_coherence(marker: np.ndarray | None) -> float:
+    """Measure directional agreement of marker flow in the range [0, 1]."""
+    flow = _marker_flow(marker)
+    if flow is None or flow.size == 0:
+        return 0.0
+    valid = flow[np.all(np.isfinite(flow), axis=1)]
+    if valid.size == 0:
+        return 0.0
+    denominator = float(np.linalg.norm(valid, axis=1).mean())
+    if denominator <= 1e-12:
+        return 0.0
+    return float(np.clip(np.linalg.norm(valid.mean(axis=0)) / denominator, 0.0, 1.0))
+
+
+def _marker_magnitudes(marker: np.ndarray | None) -> np.ndarray:
+    flow = _marker_flow(marker)
+    if flow is None or flow.size == 0:
+        return np.asarray([], dtype=np.float64)
+    mag = np.linalg.norm(flow, axis=1)
+    return mag[np.isfinite(mag)]
+
+
+def _marker_flow(marker: np.ndarray | None) -> np.ndarray | None:
+    if marker is None or marker.size == 0:
+        return None
+    arr = np.asarray(marker, dtype=np.float64)
+    if arr.shape[-1] < 2:
+        return None
+    # UniVTAC removes the environment dimension before exposing marker data,
+    # leaving [initial/current, num_markers, xy]. Synthetic grids may retain
+    # one extra marker-grid dimension, so both 3-D and 4-D layouts use axis 0.
+    if arr.ndim >= 3 and arr.shape[0] >= 2:
+        flow = arr[-1, ..., :2] - arr[0, ..., :2]
+    else:
+        flow = arr[..., :2]
+    return flow.reshape(-1, 2)
 
 
 def _marker_centroid_displacement(

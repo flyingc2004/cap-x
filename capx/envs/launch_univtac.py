@@ -85,6 +85,12 @@ def main() -> None:
     try:
         _run_headless_trials(args, env_factory, config, start_time)
         run_ok = True
+    except KeyboardInterrupt:
+        print(
+            "[capx-univtac] interrupted by user after partial artifact save",
+            flush=True,
+        )
+        raise SystemExit(130)
     finally:
         _stop_api_servers(server_procs)
         if app is not None:
