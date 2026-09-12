@@ -187,9 +187,11 @@ def test_measurement_protocol_is_public_config_and_not_task_state() -> None:
         _TactileEnv(
             {
                 "tactile_measurement_protocol": {
-                    "capture_window": 11,
-                    "settle_steps": 7,
-                    "probe_lift_m": 0.012,
+                "capture_window": 11,
+                "settle_steps": 7,
+                "close_target_force": 0.72,
+                "close_max_steps": 101,
+                "probe_lift_m": 0.012,
                     "probe_hold_steps": 5,
                     "max_attempts_per_object": 2,
                     "adaptive_close": True,
@@ -204,6 +206,8 @@ def test_measurement_protocol_is_public_config_and_not_task_state() -> None:
         "schema_version": "tactile_measurement_protocol.v1",
         "capture_window": 11,
         "settle_steps": 7,
+        "close_target_force": 0.72,
+        "close_max_steps": 101,
         "probe_lift_m": 0.012,
         "probe_hold_steps": 5,
         "max_attempts_per_object": 2,
@@ -576,6 +580,10 @@ def test_memory_match_configs_use_agent_owned_memory_and_only_differ_in_pose_sou
         assert "protocol-permitted attempt" in cfg["prompt"]
         assert "retry exactly once" not in cfg["prompt"]
         assert "probe_spec" in cfg["prompt"]
+        assert "close_target_force" in cfg["prompt"]
+        assert "close_max_steps" in cfg["prompt"]
+        assert "side grasp on the cylinder body" in cfg["prompt"]
+        assert "Compute weighted distances" in cfg["prompt"]
         assert "answer only executable python" in cfg["prompt"].lower()
         assert "StaticCodeError" in cfg["multi_turn_prompt"]
         assert "remaining one symmetric remeasurement" in cfg["multi_turn_prompt"]
@@ -593,6 +601,12 @@ def test_memory_match_configs_use_agent_owned_memory_and_only_differ_in_pose_sou
     assert easy_franka["public_anchor_pose_enabled"] is True
     assert hard_franka["public_anchor_pose_enabled"] is False
     assert easy_protocol == hard_protocol
+    assert easy_protocol["close_target_force"] == 0.82
+    assert easy_protocol["close_max_steps"] == 120
+    assert "object_pose_names" in easy_franka
+    assert "object_pose_names" in hard_franka
+    assert "object_pose_names" not in easy_protocol
+    assert "object_pose_names" not in hard_protocol
     assert easy_protocol["max_attempts_per_object"] == 2
     assert easy_protocol["adaptive_close"] is True
     assert 'source="anchor"' in configs["easy"]["env"]["cfg"]["prompt"]

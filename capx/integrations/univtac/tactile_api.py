@@ -26,6 +26,8 @@ _TACTILE_MEASUREMENT_PROTOCOL_SCHEMA = "tactile_measurement_protocol.v1"
 _DEFAULT_TACTILE_MEASUREMENT_PROTOCOL = {
     "capture_window": 20,
     "settle_steps": 10,
+    "close_target_force": 0.82,
+    "close_max_steps": 120,
     "probe_lift_m": 0.018,
     "probe_hold_steps": 10,
     "max_attempts_per_object": 2,
@@ -287,7 +289,8 @@ class UniVTACTactileApi(ApiBase):
         """Return the public task-neutral calibration for one tactile probe.
 
         The caller must persist this dictionary as its ``probe_spec`` and reuse
-        it unchanged for the reference and both candidates. It intentionally
+        its close target force, close limit, capture window, lift, and hold
+        unchanged for the reference and both candidates. It intentionally
         contains no object pose, identity, physical label, or task outcome.
         """
         protocol = _tactile_measurement_protocol(self._env)
@@ -500,6 +503,10 @@ def _tactile_measurement_protocol(env: BaseEnv) -> dict[str, Any]:
             "schema_version": _TACTILE_MEASUREMENT_PROTOCOL_SCHEMA,
             "capture_window": max(1, int(protocol["capture_window"])),
             "settle_steps": max(0, int(protocol["settle_steps"])),
+            "close_target_force": float(
+                np.clip(float(protocol["close_target_force"]), 0.0, 1.0)
+            ),
+            "close_max_steps": max(1, int(protocol["close_max_steps"])),
             "probe_lift_m": max(0.0, float(protocol["probe_lift_m"])),
             "probe_hold_steps": max(0, int(protocol["probe_hold_steps"])),
             "max_attempts_per_object": max(1, int(protocol["max_attempts_per_object"])),
