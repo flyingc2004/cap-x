@@ -638,9 +638,14 @@ def test_easy_gt_memory_match_config_is_pose_private_and_sam_free() -> None:
         "normalized RMS static distance",
         "score_margin",
         'source="anchor"',
-            "clearance, horizontal transport, and vertical descent",
+        "probe_lift_m",
+        "expert side-grasp approach",
+        "expert-aligned clearance lift, horizontal transport, and vertical descent",
+        "Do not synthesize a hover coordinate, use home_pose()",
     ):
         assert required in prompt
+    assert "short_lift" not in prompt
+    assert 'protocol.get("hold_steps"' not in prompt
     for forbidden in ("metadata", "density", "friction", "hardness", "reward", "success"):
         assert f"read {forbidden}" in prompt or f"{forbidden}," in prompt
 
