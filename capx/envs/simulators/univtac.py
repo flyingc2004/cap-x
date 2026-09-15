@@ -111,6 +111,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._pre_move_tactile_last_error: str | None = None
         self._perception_artifacts: list[dict[str, Any]] = []
         self._public_pose_cache: dict[str, dict[str, Any]] = {}
+        self._active_public_grasp_object_name: str | None = None
         self._official_task_protocol = False
         self._protocol_stopped = False
         self._protocol_stop_reason: str | None = None
@@ -160,6 +161,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._pre_move_tactile_last_error = None
         self._perception_artifacts.clear()
         self._public_pose_cache.clear()
+        self._active_public_grasp_object_name = None
         self._protocol_stopped = False
         self._protocol_stop_reason = None
         self.clear_trial_deadline()
@@ -259,6 +261,66 @@ class UniVTACLowLevelEnv(BaseEnv):
         }
         self._last_action_result = result
         return result
+
+    def _task_native_safe_placement_enabled(self) -> bool:
+        cfg = self.api_configs.get("franka_control_api", {})
+        return bool(cfg.get("task_native_safe_placement", False)) if isinstance(cfg, dict) else False
+
+    def _place_actor_with_safe_transport(
+        self,
+        actor: Any,
+        target_pose: Any,
+        *,
+        target_name: str,
+        time_dilation_factor: float | None,
+    ) -> bool:
+        """Place through clearance, horizontal transport, then vertical descent."""
+        place_pose = self._task.atom.get_place_pose(actor, target_pose=target_pose, pre_dis=0.0)
+        if place_pose is None:
+            return False
+
+        robot = self._task._robot_manager
+        current_gripper = robot.get_gripper_center_pose()
+        safe_z = max(
+            float(current_gripper.p[2]),
+            float(getattr(self._task, "safe_gripper_z", current_gripper.p[2])),
+        )
+        if safe_z - float(current_gripper.p[2]) >= 0.005:
+            clearance_gripper = type(current_gripper)(
+                [current_gripper.p[0], current_gripper.p[1], safe_z],
+                current_gripper.q,
+            )
+            clearance_ee = robot.gripper_center_to_ee(clearance_gripper)
+            if not self._task.move(
+                self._task.atom.move_to_pose(clearance_ee),
+                tag=f"capx_place_{target_name}_clearance",
+                time_dilation_factor=time_dilation_factor,
+            ):
+                return False
+            self._task.delay(8, is_save=True, force=True)
+
+        place_gripper = robot.ee_to_gripper_center(place_pose)
+        current_gripper = robot.get_gripper_center_pose()
+        hover_gripper = type(current_gripper)(
+            [place_gripper.p[0], place_gripper.p[1], max(float(current_gripper.p[2]), safe_z)],
+            place_gripper.q,
+        )
+        hover_ee = robot.gripper_center_to_ee(hover_gripper)
+        if not self._task.move(
+            self._task.atom.move_to_pose(hover_ee),
+            tag=f"capx_place_{target_name}_horizontal",
+            time_dilation_factor=time_dilation_factor,
+        ):
+            return False
+        self._task.delay(8, is_save=True, force=True)
+        if not self._task.move(
+            self._task.atom.move_to_pose(place_pose),
+            tag=f"capx_place_{target_name}_descend",
+            time_dilation_factor=time_dilation_factor,
+        ):
+            return False
+        self._task.delay(8, is_save=True, force=True)
+        return True
 
     def get_rgbd_frame(self, camera_name: str = "head"):
         """Return one calibrated RGB-D frame without actor or task metadata."""
@@ -557,7 +619,15 @@ class UniVTACLowLevelEnv(BaseEnv):
             self._last_action_result = result
             return result
 
-        actor = getattr(self._task, "prism", None)
+        actor = None
+        active_name = self._active_public_grasp_object_name
+        if active_name:
+            try:
+                actor = self._public_grasp_actor(active_name)
+            except Exception:
+                actor = None
+        if actor is None:
+            actor = getattr(self._task, "prism", None)
         if actor is None:
             result = {
                 "ok": False,
@@ -575,24 +645,35 @@ class UniVTACLowLevelEnv(BaseEnv):
         quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         target_pose = Pose(pos.tolist(), quat.tolist())
 
+        stages: list[str] = []
         try:
-            actions = self._task.atom.place_actor(
-                actor,
-                target_pose=target_pose,
-                pre_dis=float(pre_dis),
-                dis=float(dis),
-                is_open=False,
-            )
-            if not actions:
-                exec_success = False
-            else:
-                exec_success = bool(
-                    self._task.move(
-                        actions,
-                        tag=f"capx_place_{target_name}",
-                        time_dilation_factor=time_dilation_factor,
-                    )
+            if self._task_native_safe_placement_enabled():
+                exec_success = self._place_actor_with_safe_transport(
+                    actor,
+                    target_pose,
+                    target_name=str(target_name),
+                    time_dilation_factor=time_dilation_factor,
                 )
+                stages = ["clearance", "horizontal", "descend"]
+            else:
+                actions = self._task.atom.place_actor(
+                    actor,
+                    target_pose=target_pose,
+                    pre_dis=float(pre_dis),
+                    dis=float(dis),
+                    is_open=False,
+                )
+                if not actions:
+                    exec_success = False
+                else:
+                    exec_success = bool(
+                        self._task.move(
+                            actions,
+                            tag=f"capx_place_{target_name}",
+                            time_dilation_factor=time_dilation_factor,
+                        )
+                    )
+                stages = ["direct"]
         except Exception as exc:
             exec_success = False
             message = f"native placement failed: {exc!r}"
@@ -606,6 +687,7 @@ class UniVTACLowLevelEnv(BaseEnv):
             "step": self.get_step_count(),
             "action_count": self.get_action_count(),
             "message": message,
+            "placement_stages": stages,
         }
         self._last_action_result = result
         return result
@@ -655,6 +737,8 @@ class UniVTACLowLevelEnv(BaseEnv):
                 **result,
             }
             self._last_action_result = result
+            if bool(result.get("ok", False)):
+                self._active_public_grasp_object_name = str(object_name)
             return result
 
         actor = self._public_grasp_actor(object_name)
@@ -712,6 +796,8 @@ class UniVTACLowLevelEnv(BaseEnv):
             "message": message,
         }
         self._last_action_result = result
+        if bool(result.get("ok", False)):
+            self._active_public_grasp_object_name = str(object_name)
         return result
 
     def get_public_grasp_pose(
@@ -1353,7 +1439,14 @@ class UniVTACLowLevelEnv(BaseEnv):
         task_config_file = self._task_config_path()
         with open(task_config_file, encoding="utf-8") as f:
             self._task_config = yaml.safe_load(f) or {}
+        config_task_overrides = dict(self._task_config.get("task_cfg_overrides", {}) or {})
+        runtime_task_overrides = dict(self.task_config_overrides.get("task_cfg_overrides", {}) or {})
         self._task_config.update(self.task_config_overrides)
+        if config_task_overrides or runtime_task_overrides:
+            self._task_config["task_cfg_overrides"] = {
+                **config_task_overrides,
+                **runtime_task_overrides,
+            }
 
         task_module = importlib.import_module(f"envs.{self.task_name}")
         env_cfg = task_module.TaskCfg()
@@ -1380,6 +1473,13 @@ class UniVTACLowLevelEnv(BaseEnv):
             "planner_time_dilation_factor",
             env_cfg.planner_time_dilation_factor,
         )
+        for key, value in dict(self._task_config.get("task_cfg_overrides", {}) or {}).items():
+            if not hasattr(env_cfg, key):
+                raise ValueError(
+                    f"task_cfg_overrides contains undeclared TaskCfg field {key!r} "
+                    f"for task {self.task_name!r}"
+                )
+            setattr(env_cfg, key, value)
         env_cfg.scene.num_envs = 1
         if self.device_override:
             env_cfg.sim.device = self.device_override

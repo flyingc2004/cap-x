@@ -39,6 +39,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         home_lift_delta_z: float = 0.10,
         preserve_landmark_orientation: bool = True,
         use_task_place_actor_for_landmarks: bool = False,
+        task_place_landmark_names: list[str] | tuple[str, ...] | None = None,
         placement_xy_tolerance: float = 0.08,
         placement_time_dilation_factor: float = 0.5,
         placement_pre_dis: float = 0.0,
@@ -175,6 +176,14 @@ class UniVTACFrankaCompatApi(ApiBase):
             "match slot": "match_slot",
             "match_slot": "match_slot",
         }
+        configured_place_landmarks = cfg.get(
+            "task_place_landmark_names",
+            task_place_landmark_names,
+        )
+        self.task_place_landmark_names = self._optional_normalized_object_set(
+            configured_place_landmarks,
+            object_pose_names=self.object_pose_names,
+        )
         self.rgbd_perception_enabled = bool(
             cfg.get("rgbd_perception_enabled", rgbd_perception_enabled)
         )
@@ -550,19 +559,22 @@ class UniVTACFrankaCompatApi(ApiBase):
 
         active_tactile_monitor = bool(monitor_tactile or self._holding_with_tactile)
         approach = max(0.0, float(z_approach))
-        if not active_tactile_monitor and approach <= 0.0:
+        if not active_tactile_monitor:
             # A sampled grasp pose is a semantic task target, not a generic
             # end-effector pose. Resolve it through the task atom first so
             # UniVTAC applies its object geometry, pre-displacement, and
-            # grasp-height convention. The same rule applies to public slot
-            # landmarks when the task provides a native placement atom.
+            # grasp-height convention. This intentionally retains the legacy
+            # behavior for callers that supplied a positive approach offset.
             grasp_result = self._try_approach_public_grasp(pos)
             if grasp_result is not None:
                 return grasp_result
 
-            place_result = self._try_place_on_public_landmark(pos, quat)
-            if place_result is not None:
-                return place_result
+        # A configured public placement landmark remains meaningful while
+        # tactile holding is active. The task bridge performs the safe
+        # clearance/horizontal/descent chain internally.
+        place_result = self._try_place_on_public_landmark(pos, quat)
+        if place_result is not None:
+            return place_result
 
         if self.use_native_pose_planner and not active_tactile_monitor:
             return self._goto_pose_native(pos, quat, z_approach=float(z_approach))
@@ -2074,6 +2086,11 @@ class UniVTACFrankaCompatApi(ApiBase):
         if nearest is None:
             return None
         key, landmark_pos = nearest
+        if (
+            self.task_place_landmark_names is not None
+            and self._normalize_name(key) not in self.task_place_landmark_names
+        ):
+            return None
         place_fn = getattr(self._env, "place_grasped_actor", None)
         if not callable(place_fn):
             return None

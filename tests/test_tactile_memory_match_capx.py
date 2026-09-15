@@ -529,90 +529,120 @@ def test_low_level_native_move_clamps_converted_ee_target(monkeypatch) -> None:
     assert actions[0][2] == pytest.approx(0.035)
 
 
-def test_memory_match_configs_use_agent_owned_memory_and_only_differ_in_pose_source() -> None:
-    root = Path(__file__).resolve().parents[1]
-    configs = {
-        "easy": yaml.safe_load(
-            (root / "env_configs/univtac/tactile_memory_match_easy_sam_gt.yaml").read_text()
+def test_task_native_placement_uses_active_public_actor_and_safe_stages(monkeypatch) -> None:
+    class _Pose:
+        def __init__(self, p, q) -> None:
+            self.p = np.asarray(p, dtype=np.float32)
+            self.q = np.asarray(q, dtype=np.float32)
+
+    transforms = types.ModuleType("envs.utils.transforms")
+    transforms.Pose = _Pose
+    utils = types.ModuleType("envs.utils")
+    utils.transforms = transforms
+    envs = types.ModuleType("envs")
+    envs.utils = utils
+    monkeypatch.setitem(sys.modules, "envs", envs)
+    monkeypatch.setitem(sys.modules, "envs.utils", utils)
+    monkeypatch.setitem(sys.modules, "envs.utils.transforms", transforms)
+
+    class _Robot:
+        def get_gripper_center_pose(self):
+            return _Pose([0.60, 0.0, 0.10], [1.0, 0.0, 0.0, 0.0])
+
+        def gripper_center_to_ee(self, pose):
+            return pose
+
+        def ee_to_gripper_center(self, pose):
+            return pose
+
+    active_actor = object()
+    placed_actors: list[object] = []
+    moves: list[str] = []
+
+    def _get_place_pose(actor, target_pose, pre_dis):
+        placed_actors.append(actor)
+        return _Pose([target_pose.p[0], target_pose.p[1], 0.04], target_pose.q)
+
+    task = types.SimpleNamespace(
+        safe_gripper_z=0.16,
+        _robot_manager=_Robot(),
+        atom=types.SimpleNamespace(
+            get_place_pose=_get_place_pose,
+            move_to_pose=lambda pose: pose,
         ),
-        "hard": yaml.safe_load(
-            (root / "env_configs/univtac/tactile_memory_match_hard_sam.yaml").read_text()
-        ),
-        "easy_compat": yaml.safe_load(
-            (root / "env_configs/univtac/tactile_memory_match_easy_sam_gt_memory.yaml").read_text()
-        ),
-        "hard_compat": yaml.safe_load(
-            (root / "env_configs/univtac/tactile_memory_match_hard_sam_memory.yaml").read_text()
-        ),
-    }
-    legacy_names = (
-        "remember_tactile_signature",
-        "get_tactile_grasp_profile",
-        "compare_tactile_signatures",
+        move=lambda _actions, tag, **_kwargs: moves.append(tag) or True,
+        delay=lambda *_args, **_kwargs: None,
+    )
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env.api_configs = {"franka_control_api": {"task_native_safe_placement": True}}
+    env._task = task
+    env._active_public_grasp_object_name = "candidate_right"
+    env._public_grasp_actor = lambda name: active_actor if name == "candidate_right" else None
+    env.get_step_count = lambda: 7
+    env.get_action_count = lambda: 3
+    env._last_action_result = {}
+    env._update_after_action = lambda: None
+    env._append_debug_record = lambda _label: {}
+
+    result = env.place_grasped_actor(
+        target_name="match_slot",
+        target_position=[0.42, 0.08, 0.02],
+        target_quaternion_wxyz=[1.0, 0.0, 0.0, 0.0],
     )
 
-    for config in configs.values():
-        cfg = config["env"]["cfg"]
-        low_level = cfg["low_level"]
-        assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
-        assert cfg["stream_user_code_output"] is False
-        assert low_level["expose_actor_pose"] is False
-        assert low_level["privileged"] is False
-        assert config["tactile_memory"] == {
-            "trial": {"enabled": True, "include_in_multiturn": True, "max_context_chars": 4000},
-            "persistent": {"enabled": False},
-        }
-        assert "tactile_code_memory" not in config
-        assert "tactile_strategy_memory" not in config
-        assert "include_trial_memory_in_multiturn" not in config
-        assert low_level["api_configs"]["franka_control_api"]["native_min_ee_z"] == 0.035
-        assert "capture_tactile_observation" in cfg["prompt"]
-        assert "get_tactile_measurement_protocol" in cfg["prompt"]
-        assert "write_trial_memory" in cfg["prompt"]
-        assert "sample_grasp_pose(name)" in cfg["prompt"]
-        assert "never a direct gripper contact target" in cfg["prompt"]
-        assert 'capture["tactile"]["left_depth_mm"]' in cfg["prompt"]
-        assert 'capture["marker_motion"]["left_marker_displacement_px"]' in cfg["prompt"]
-        assert 'capture["marker_motion"]["left_marker_coherence"]' in cfg["prompt"]
-        assert "trial_memory.v1" in cfg["prompt"]
-        assert "score_margin" in cfg["prompt"]
-        assert "probe(object_name)" in cfg["prompt"]
-        assert "protocol-permitted attempt" in cfg["prompt"]
-        assert "retry exactly once" not in cfg["prompt"]
-        assert "probe_spec" in cfg["prompt"]
-        assert "close_target_force" in cfg["prompt"]
-        assert "close_max_steps" in cfg["prompt"]
-        assert "side grasp on the cylinder body" in cfg["prompt"]
-        assert "Compute weighted distances" in cfg["prompt"]
-        assert "answer only executable python" in cfg["prompt"].lower()
-        assert "StaticCodeError" in cfg["multi_turn_prompt"]
-        assert "remaining one symmetric remeasurement" in cfg["multi_turn_prompt"]
-        assert "fixed formula" not in cfg["prompt"].lower()
-        assert "read-only tactile code memory" not in cfg["prompt"]
-        for legacy_name in legacy_names:
-            assert legacy_name not in cfg["prompt"]
-            assert legacy_name not in cfg["multi_turn_prompt"]
-        assert config["regenerate_full_chain_on_static_failure"] is True
+    assert result["ok"] is True
+    assert result["placement_stages"] == ["clearance", "horizontal", "descend"]
+    assert placed_actors == [active_actor]
+    assert moves == [
+        "capx_place_match_slot_clearance",
+        "capx_place_match_slot_horizontal",
+        "capx_place_match_slot_descend",
+    ]
 
-    easy_franka = configs["easy"]["env"]["cfg"]["low_level"]["api_configs"]["franka_control_api"]
-    hard_franka = configs["hard"]["env"]["cfg"]["low_level"]["api_configs"]["franka_control_api"]
-    easy_protocol = configs["easy"]["env"]["cfg"]["low_level"]["api_configs"]["tactile_measurement_protocol"]
-    hard_protocol = configs["hard"]["env"]["cfg"]["low_level"]["api_configs"]["tactile_measurement_protocol"]
-    assert easy_franka["public_anchor_pose_enabled"] is True
-    assert hard_franka["public_anchor_pose_enabled"] is False
-    assert easy_protocol == hard_protocol
-    assert easy_protocol["close_target_force"] == 0.82
-    assert easy_protocol["close_max_steps"] == 120
-    assert "object_pose_names" in easy_franka
-    assert "object_pose_names" in hard_franka
-    assert "object_pose_names" not in easy_protocol
-    assert "object_pose_names" not in hard_protocol
-    assert easy_protocol["max_attempts_per_object"] == 2
-    assert easy_protocol["adaptive_close"] is True
-    assert 'source="anchor"' in configs["easy"]["env"]["cfg"]["prompt"]
-    assert 'source="rgbd"' in configs["hard"]["env"]["cfg"]["prompt"]
-    for prefix in ("easy", "hard"):
-        assert configs[prefix]["env"]["cfg"]["prompt"] == configs[f"{prefix}_compat"]["env"]["cfg"]["prompt"]
+
+def test_easy_gt_memory_match_config_is_pose_private_and_sam_free() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load(
+        (root / "env_configs/univtac/tactile_memory_match_easy_sam_gt.yaml").read_text()
+    )
+    cfg = config["env"]["cfg"]
+    low_level = cfg["low_level"]
+    franka = low_level["api_configs"]["franka_control_api"]
+    protocol = low_level["api_configs"]["tactile_measurement_protocol"]
+
+    assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
+    assert cfg["stream_user_code_output"] is False
+    assert low_level["task_name"] == "tactile_memory_match"
+    assert low_level["task_config"] == "tactile_memory_match_demo"
+    assert low_level["seed_base"] == 4001
+    assert low_level["expose_actor_pose"] is False
+    assert low_level["privileged"] is False
+    assert low_level["task_config_overrides"]["task_cfg_overrides"]["capx_easy_gt_enabled"] is True
+    assert "api_servers" not in config
+    assert franka["rgbd_perception_enabled"] is False
+    assert franka["public_anchor_pose_enabled"] is True
+    assert franka["task_place_landmark_names"] == ["match_slot"]
+    assert franka["task_native_safe_placement"] is True
+    assert protocol["max_attempts_per_object"] == 1
+    assert config["tactile_memory"]["persistent"]["enabled"] is False
+    assert "tactile_code_memory" not in config
+    assert "tactile_strategy_memory" not in config
+
+    prompt = cfg["prompt"]
+    for required in (
+        "probe(object_name)",
+        "capture_tactile_observation",
+        "trial_memory.v1",
+        "static 6D vector",
+        "dynamic 6D vector",
+        "normalized RMS static distance",
+        "score_margin",
+        'source="anchor"',
+            "clearance, horizontal transport, and vertical descent",
+    ):
+        assert required in prompt
+    for forbidden in ("metadata", "density", "friction", "hardness", "reward", "success"):
+        assert f"read {forbidden}" in prompt or f"{forbidden}," in prompt
 
 
 def test_failure_only_multiturn_skips_clean_intermediate_blocks() -> None:
