@@ -935,9 +935,18 @@ class UniVTACLowLevelEnv(BaseEnv):
         )
         sim_cfg = getattr(getattr(self._task, "cfg", None), "sim", None)
         sim_dt = float(getattr(sim_cfg, "dt", 1.0 / 60.0))
-        velocity = (position - current_qpos) / max(sim_dt, 1e-8)
+        # Match UniVTAC's native ``plan_gripper`` semantics.  In particular,
+        # its articulation path clamps finger velocity and immediately writes
+        # the joint position to PhysX.  Leaving this as a target-only command
+        # lets the velocity drive run far faster than the official expert and
+        # can desynchronise the visible finger meshes from the gripper body.
+        velocity = torch.clamp(
+            (position - current_qpos) / max(sim_dt, 1e-8),
+            min=-0.0001,
+            max=0.0001,
+        )
         action_count_before = self.get_action_count()
-        robot_manager.set_gripper(position, velocity, force=False)
+        robot_manager.set_gripper(position, velocity, force=True)
         for _ in range(max(1, int(settle_steps))):
             self._task._step(is_save=True)
 

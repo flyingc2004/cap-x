@@ -461,7 +461,7 @@ def test_lift_can_ablation_configs_isolate_tactile_access() -> None:
     assert "tactile" not in no_tactile["prompt"].lower()
 
 
-def test_univtac_gripper_hook_uses_force_false_without_action_count_change() -> None:
+def test_univtac_gripper_hook_matches_native_force_write_without_action_count_change() -> None:
     class RobotManager:
         device = "cpu"
         gripper_max_qpos = 0.039
@@ -497,9 +497,10 @@ def test_univtac_gripper_hook_uses_force_false_without_action_count_change() -> 
 
     result = env.command_gripper_width_step(0.50, settle_steps=2)
 
-    position, _velocity, force = env._task._robot_manager.calls[-1]
-    assert force is False
+    position, velocity, force = env._task._robot_manager.calls[-1]
+    assert force is True
     assert float(position[0]) == pytest.approx(0.50 * 0.039)
+    assert float(velocity[0]) == pytest.approx(-0.0001)
     assert result["action_count"] == 4
     assert env._task.take_action_cnt == 4
     assert env._task.step_count == 12
@@ -556,7 +557,7 @@ def test_lift_can_prompt_and_controller_do_not_use_univtac_adaptive_helper() -> 
     hook_source = inspect.getsource(UniVTACLowLevelEnv.command_gripper_width_step)
     assert "adaptive_set_gripper" not in source
     assert "adaptive_set_gripper" not in hook_source
-    assert "force=False" in hook_source
+    assert "force=True" in hook_source
 
 
 def test_code_execution_treats_zero_system_exit_as_normal_completion() -> None:
