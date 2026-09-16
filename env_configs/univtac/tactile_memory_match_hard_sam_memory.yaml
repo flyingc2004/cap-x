@@ -11,7 +11,7 @@ env:
       seed_base: 0
       device: cuda:0
       live_preview_enabled: true
-      live_preview_path: /mnt/sdc/ljz/t-cap/capx-runs/latest_preview.jpg
+      live_preview_path: ${oc.env:CAPX_LIVE_PREVIEW_PATH,/tmp/capx_latest_preview.jpg}
       live_preview_stride: 5
       live_preview_jpeg_quality: 80
       task_config_overrides:
