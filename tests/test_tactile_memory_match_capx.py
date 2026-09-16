@@ -600,17 +600,77 @@ def test_task_native_placement_uses_active_public_actor_and_safe_stages(monkeypa
     ]
 
 
-def test_easy_gt_memory_match_config_is_pose_private_and_sam_free() -> None:
+def _load_memory_match_config(name: str) -> dict:
     root = Path(__file__).resolve().parents[1]
-    config = yaml.safe_load(
-        (root / "env_configs/univtac/tactile_memory_match_easy_sam_gt.yaml").read_text()
-    )
+    return yaml.safe_load((root / "env_configs/univtac" / name).read_text())
+
+
+def test_memory_match_configs_expose_only_bounded_api_surface() -> None:
+    expected_franka = {
+        "get_object_pose",
+        "sample_grasp_pose",
+        "goto_pose",
+        "move_delta",
+        "rotate_gripper",
+        "open_gripper",
+        "close_gripper",
+        "wait_steps",
+    }
+    expected_tactile = {
+        "get_tactile_measurement_protocol",
+        "capture_tactile_observation",
+        "is_contacting",
+        "is_slipping",
+        "is_grasp_stable",
+        "write_trial_memory",
+        "read_trial_memory",
+    }
+
+    for name in (
+        "tactile_memory_match_easy_sam_gt.yaml",
+        "tactile_memory_match_hard_sam.yaml",
+    ):
+        config = _load_memory_match_config(name)
+        cfg = config["env"]["cfg"]
+        low_level = cfg["low_level"]
+        api_configs = low_level["api_configs"]
+        franka = api_configs["franka_control_api"]
+        tactile = api_configs["univtac_tactile_api"]
+
+        assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
+        assert set(franka["llm_visible_functions"]) == expected_franka
+        assert set(tactile["llm_visible_functions"]) == expected_tactile
+        assert franka["llm_api_profile"] == "tactile_memory_match"
+        assert low_level["expose_actor_pose"] is False
+        assert low_level["privileged"] is False
+        assert config["tactile_memory"]["persistent"]["enabled"] is False
+        assert "tactile_code_memory" not in config
+        assert "tactile_strategy_memory" not in config
+
+        prompt = cfg["prompt"]
+        for required in (
+            "get_tactile_measurement_protocol()",
+            "probe(object_name)",
+            "capture_tactile_observation",
+            "trial_memory.v1",
+            "move_delta(dz=probe_lift_m)",
+            'close_gripper(mode="probe")',
+            'close_gripper(mode="transport")',
+            "horizontal transport",
+        ):
+            assert required in prompt
+        # The prompt can explicitly forbid a hidden API by name; the actual
+        # executable namespace is enforced above by the YAML white lists.
+        assert "raw tactile image" not in prompt.lower()
+
+
+def test_easy_gt_memory_match_config_is_pose_private_and_sam_free() -> None:
+    config = _load_memory_match_config("tactile_memory_match_easy_sam_gt.yaml")
     cfg = config["env"]["cfg"]
     low_level = cfg["low_level"]
     franka = low_level["api_configs"]["franka_control_api"]
     protocol = low_level["api_configs"]["tactile_measurement_protocol"]
 
-    assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
     assert cfg["stream_user_code_output"] is False
     assert low_level["task_name"] == "tactile_memory_match"
     assert low_level["task_config"] == "tactile_memory_match_demo"
@@ -627,27 +687,126 @@ def test_easy_gt_memory_match_config_is_pose_private_and_sam_free() -> None:
     assert config["tactile_memory"]["persistent"]["enabled"] is False
     assert "tactile_code_memory" not in config
     assert "tactile_strategy_memory" not in config
+    assert franka["rgbd_perception_enabled"] is False
 
-    prompt = cfg["prompt"]
-    for required in (
-        "probe(object_name)",
+
+class _MemoryMatchMotionEnv:
+    def __init__(self) -> None:
+        self.api_configs = {
+            "franka_control_api": {
+                "llm_api_profile": "tactile_memory_match",
+                "llm_visible_functions": [
+                    "get_object_pose",
+                    "sample_grasp_pose",
+                    "goto_pose",
+                    "move_delta",
+                    "rotate_gripper",
+                    "open_gripper",
+                    "close_gripper",
+                    "wait_steps",
+                ],
+                "min_safe_z": 0.035,
+                "local_delta_max_m": 0.01,
+                "local_delta_segment_m": 0.002,
+                "local_yaw_max_rad": 0.12,
+                "local_yaw_segment_rad": 0.04,
+                "local_wait_max_steps": 5,
+            },
+            "tactile_measurement_protocol": {
+                "close_target_force": 0.82,
+                "close_max_steps": 120,
+                "adaptive_close": True,
+            },
+        }
+        self.actions: list[np.ndarray] = []
+
+    def get_robot_state(self) -> dict:
+        return {
+            "ee_pos": [0.45, 0.0, 0.12],
+            "ee_quat": [1.0, 0.0, 0.0, 0.0],
+            "joint": [0.0] * 8,
+        }
+
+    def take_action(self, action, *, action_type: str) -> dict:
+        assert action_type == "delta_ee"
+        self.actions.append(np.asarray(action, dtype=np.float32))
+        return {"ok": True}
+
+
+def test_memory_match_franka_facade_hides_raw_state_and_segments_local_motion() -> None:
+    env = _MemoryMatchMotionEnv()
+    api = UniVTACFrankaCompatApi(env)
+
+    assert set(api.functions()) == {
+        "get_object_pose",
+        "sample_grasp_pose",
+        "goto_pose",
+        "move_delta",
+        "rotate_gripper",
+        "open_gripper",
+        "close_gripper",
+        "wait_steps",
+    }
+
+    result = api.functions()["move_delta"](dz=0.006)
+
+    assert result["ok"] is True
+    assert result["operation"] == "move_delta"
+    assert result["steps"] == 3
+    assert len(env.actions) == 3
+    assert all(float(np.linalg.norm(action[:3])) <= 0.00201 for action in env.actions)
+    assert all(np.allclose(action[3:6], 0.0) for action in env.actions)
+
+    over_limit = api.functions()["move_delta"](dx=0.02)
+    assert over_limit["ok"] is False
+    assert over_limit["reason"] == "local_delta_limit"
+
+
+def test_memory_match_rotate_is_tool_axis_yaw_only_and_bounded() -> None:
+    env = _MemoryMatchMotionEnv()
+    api = UniVTACFrankaCompatApi(env)
+
+    result = api.functions()["rotate_gripper"](0.08)
+
+    assert result["ok"] is True
+    assert result["operation"] == "rotate_gripper"
+    assert result["steps"] == 2
+    assert len(env.actions) == 2
+    assert all(np.allclose(action[:3], 0.0) for action in env.actions)
+    assert all(abs(float(action[5])) <= 0.04001 for action in env.actions)
+    assert all(abs(float(action[3])) <= 1e-6 and abs(float(action[4])) <= 1e-6 for action in env.actions)
+
+    over_limit = api.functions()["rotate_gripper"](0.2)
+    assert over_limit["ok"] is False
+    assert over_limit["reason"] == "local_yaw_limit"
+
+
+def test_memory_match_tactile_surface_hides_raw_frames_and_event_history() -> None:
+    env = _TactileEnv(
+        {
+            "univtac_tactile_api": {
+                "llm_visible_functions": [
+                    "get_tactile_measurement_protocol",
+                    "capture_tactile_observation",
+                    "is_contacting",
+                    "is_slipping",
+                    "is_grasp_stable",
+                    "write_trial_memory",
+                    "read_trial_memory",
+                ]
+            }
+        }
+    )
+
+    assert set(UniVTACTactileApi(env).functions()) == {
+        "get_tactile_measurement_protocol",
         "capture_tactile_observation",
-        "trial_memory.v1",
-        "static 6D vector",
-        "dynamic 6D vector",
-        "normalized RMS static distance",
-        "score_margin",
-        'source="anchor"',
-        "probe_lift_m",
-        "expert side-grasp approach",
-        "expert-aligned clearance lift, horizontal transport, and vertical descent",
-        "Do not synthesize a hover coordinate, use home_pose()",
-    ):
-        assert required in prompt
-    assert "short_lift" not in prompt
-    assert 'protocol.get("hold_steps"' not in prompt
-    for forbidden in ("metadata", "density", "friction", "hardness", "reward", "success"):
-        assert f"read {forbidden}" in prompt or f"{forbidden}," in prompt
+        "is_contacting",
+        "is_slipping",
+        "is_grasp_stable",
+        "write_trial_memory",
+        "read_trial_memory",
+    }
 
 
 def test_failure_only_multiturn_skips_clean_intermediate_blocks() -> None:

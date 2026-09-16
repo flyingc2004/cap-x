@@ -23,6 +23,17 @@ env:
         video_frame_stride: 4
       api_configs:
         franka_control_api:
+          llm_api_profile: tactile_memory_match
+          llm_visible_functions: [get_object_pose, sample_grasp_pose, goto_pose, move_delta, rotate_gripper, open_gripper, close_gripper, wait_steps]
+          local_delta_max_m: 0.02
+          local_delta_segment_m: 0.002
+          local_yaw_max_rad: 0.18
+          local_yaw_segment_rad: 0.09
+          local_wait_max_steps: 20
+          profile_open_width: 1.0
+          profile_open_max_steps: 120
+          transport_close_target_force: 0.82
+          transport_close_max_steps: 120
           min_safe_z: 0.035
           native_min_ee_z: 0.035
           max_delta_xyz: 0.012
@@ -82,6 +93,8 @@ env:
             match_slot: match_slot
             target_slot: match_slot
             slot: match_slot
+        univtac_tactile_api:
+          llm_visible_functions: [get_tactile_measurement_protocol, capture_tactile_observation, is_contacting, is_slipping, is_grasp_stable, write_trial_memory, read_trial_memory]
         tactile_measurement_protocol:
           capture_window: 20
           settle_steps: 10
@@ -97,13 +110,15 @@ env:
     privileged: false
     apis: [FrankaControlApi, UniVTACTactileApi]
     prompt: |
-      You control the fixed-seed UniVTAC tactile_memory_match Easy-GT smoke. Use reset anchors only to localize reference_object, candidate_left, candidate_right, and match_slot. The hidden matching identity must be decided only from tactile measurements; never read metadata, labels, density, friction, hardness, reward, success, or private task state. Vision may only check grasp following, rotation, drop, and release.
+      You control the fixed-seed UniVTAC tactile_memory_match Easy-GT smoke. get_object_pose(name) uses only the configured public reset anchor. The hidden matching identity must be decided only from tactile measurements; never read metadata, labels, density, friction, hardness, reward, success, private task state, or low-level environment objects. Vision may only validate grasp following, rotation, drop, and release.
 
-      Call get_tactile_measurement_protocol() once and write the unchanged dictionary as trial_memory.v1 state record probe_spec. Use exactly its canonical keys: capture_window, settle_steps, close_target_force, close_max_steps, probe_lift_m, probe_hold_steps, adaptive_close. Do not invent fallback values or alternate key names. Define one reusable probe(object_name) helper and call it exactly in this order: reference_object, candidate_left, candidate_right. For each object: open the gripper; call sample_grasp_pose(object_name), then goto_pose on that gripper-compatible pose. This routes internally to the task's expert side-grasp approach using the object's current physical pose. Call close_gripper with the unchanged protocol adaptive-close mode, close_target_force, and close_max_steps; wait for protocol settle_steps; require bilateral stable tactile contact; capture the static reading with capture_tactile_observation(capture_window); save robot state; make only the protocol probe_lift_m vertical lift, hold for probe_hold_steps, capture the dynamic reading while held, then return to the saved pre-lift pose. Open, verify release, and let the next sampled grasp pose perform the safe clearance and approach. Any empty or shallow close, loss of bilateral contact, or dropped object invalidates that object evidence: print CAPX_FAILURE reason=insufficient_tactile_evidence and stop without guessing.
+      Call get_tactile_measurement_protocol() once. Save the unchanged record as trial_memory.v1 state key probe_spec. Define one reusable probe(object_name) helper and call it exactly in order: reference_object, candidate_left, candidate_right. For every object use the same chain: open_gripper(); sample_grasp_pose(object_name); goto_pose(sampled_position, sampled_quaternion); close_gripper(mode="probe"); wait for the protocol settling duration; require is_grasp_stable(); call capture_tactile_observation() for static evidence; move_delta(dz=probe_lift_m); wait for the protocol hold duration; require stable non-slipping contact; call capture_tactile_observation() for dynamic evidence; move_delta(dz=-probe_lift_m); open_gripper(); verify release with is_contacting(). Do not use get_robot_state, global coordinates, direct environment access, or low-level motion APIs. The sampled next grasp pose supplies clearance before each new object.
 
-      For every valid probe, write a trial_memory.v1 evidence record. Its static 6D vector is left/right depth_mm, marker_displacement_px, and marker_coherence. Its dynamic 6D vector is the same fields at lift minus static. Include capture IDs, the unchanged probe_spec, validity, and provenance. After all probes, read the three evidence records. For every feature use scale=max(abs(left-reference), abs(right-reference), epsilon), compute each candidate's normalized RMS static distance and normalized RMS dynamic distance, then fuse them with equal weight. Pick the lower fused score only. Write one trial_memory.v1 decision record named selection containing selected_candidate, score_left, score_right, score_margin, chosen_features, weights_or_rule, rationale, confidence, and provenance.
+      Write one valid trial_memory.v1 evidence record per object. Static evidence is bilateral depth_mm, marker_displacement_px, and marker_coherence. Dynamic evidence is the same bilateral values at lift minus static, with capture IDs, the unchanged probe_spec, validity, and provenance. If close, lift, or release is invalid, print CAPX_FAILURE reason=insufficient_tactile_evidence and stop without guessing.
 
-      Final transport is a separate regrasp: sample_grasp_pose only for the selected candidate, goto_pose it, close adaptively, and require a new stable bilateral tactile grasp. Then call get_object_pose("match_slot", source="anchor") followed immediately by goto_pose(slot_position, slot_quaternion, monitor_tactile=True). Do not synthesize a hover coordinate, use home_pose(), or make any generic motion while holding the final candidate. For this public slot the adapter exclusively executes the expert-aligned clearance lift, horizontal transport, and vertical descent. Only after that call returns may the code open_gripper(), wait for release verification, and finish. If final contact weakens, slips, rotates, or drops, print CAPX_FAILURE and stop; do not transport a weak probe grasp. Print CAPX_SUCCESS only after verified final release. Return concise executable Python only; use no hard-coded world coordinates or low-level motion APIs.
+      After all evidence exists, read the known reference_object, candidate_left, and candidate_right records. Compute normalized static and dynamic RMS distances with each feature scaled by the two candidate-reference differences, fuse them equally, select only the lower-score candidate, and write a selection decision containing both scores, margin, features, rule, confidence, rationale, and provenance.
+
+      Final transport is independent: sample_grasp_pose(selected); goto_pose; close_gripper(mode="transport"); require is_grasp_stable(); get_object_pose("match_slot"); goto_pose(slot_position, slot_quaternion); open_gripper(); verify release; print CAPX_SUCCESS. The adapter exclusively executes the expert-aligned clearance lift, horizontal transport, and vertical descent for the public slot. Use move_delta only for local probe lift/return, clearance, or tactile adjustment. If transport contact weakens, slips, rotates, or drops, print CAPX_FAILURE and stop. Return concise executable Python only.
     multi_turn_prompt: |
       Executed code:
       {executed_code}
@@ -114,7 +129,7 @@ env:
       Console stderr:
       {console_stderr}
 
-      This is failure-only recovery. Preserve state and read list_trial_memory() before acting. Keep completed evidence and probe_spec unchanged. If an object has invalid evidence, print CAPX_FAILURE reason=insufficient_tactile_evidence and stop. If final transport lost contact, regenerate only a concise regrasp-or-stop continuation using sample_grasp_pose followed by goto_pose; never use home_pose() or synthesize a global waypoint. Do not replay completed probes, recompute from private data, or use a hidden label. After verified final release, print CAPX_SUCCESS and finish without extra motion.
+      This is failure-only recovery. Preserve simulator state and the injected public trial-memory snapshot. Read only known keys probe_spec, evidence_reference_object, evidence_candidate_left, evidence_candidate_right, and selection as needed. Never replay valid probes, invent a new protocol, use private data, or call hidden APIs. If final transport lost contact, regenerate only a concise transport-mode regrasp-or-stop continuation using sample_grasp_pose, goto_pose, close_gripper(mode="transport"), get_object_pose("match_slot"), and goto_pose. After verified final release, print CAPX_SUCCESS and finish without extra motion.
 trials: 1
 num_workers: 1
 record_video: true

@@ -43,9 +43,18 @@ class UniVTACTactileApi(ApiBase):
         self._trial_memory: dict[str, dict[str, Any]] = {}
         self._working_memory_trace: list[dict[str, Any]] = []
         self._capture_count = 0
+        cfg = self._runtime_config()
+        visible_functions = cfg.get("llm_visible_functions")
+        if visible_functions is not None and not isinstance(visible_functions, (list, tuple)):
+            raise ValueError("llm_visible_functions must be a list when configured")
+        self.llm_visible_functions = (
+            {str(name).strip() for name in visible_functions}
+            if visible_functions is not None
+            else None
+        )
 
     def functions(self) -> dict[str, Any]:
-        return {
+        full = {
             "get_tactile_summary": self.get_tactile_summary,
             "is_contacting": self.is_contacting,
             "is_slipping": self.is_slipping,
@@ -62,6 +71,16 @@ class UniVTACTactileApi(ApiBase):
             "list_trial_memory": self.list_trial_memory,
             "clear_trial_memory": self.clear_trial_memory,
         }
+        visible_functions = getattr(self, "llm_visible_functions", None)
+        if visible_functions is None:
+            return full
+        unknown = visible_functions.difference(full)
+        if unknown:
+            raise ValueError(
+                "llm_visible_functions contains unsupported UniVTACTactileApi functions: "
+                f"{sorted(unknown)}"
+            )
+        return {name: full[name] for name in full if name in visible_functions}
 
     def reset_episode(self) -> None:
         """Clear native tactile and agent-owned memory at the start of a trial."""
@@ -429,6 +448,13 @@ class UniVTACTactileApi(ApiBase):
             sort_keys=True,
             separators=(",", ":"),
         )
+
+    def _runtime_config(self) -> dict[str, Any]:
+        configs = getattr(self._env, "api_configs", None)
+        if not isinstance(configs, dict):
+            return {}
+        config = configs.get("univtac_tactile_api", {})
+        return config if isinstance(config, dict) else {}
 
     def _safe_robot_state(self) -> dict[str, Any]:
         state_fn = getattr(self._env, "get_robot_state", None)

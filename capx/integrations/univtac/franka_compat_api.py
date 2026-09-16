@@ -322,6 +322,44 @@ class UniVTACFrankaCompatApi(ApiBase):
                 goto_pose_tactile_guard_slip_threshold,
             )
         )
+        self.llm_api_profile = str(cfg.get("llm_api_profile", "")).strip().lower()
+        visible_functions = cfg.get("llm_visible_functions")
+        if visible_functions is not None and not isinstance(visible_functions, (list, tuple)):
+            raise ValueError("llm_visible_functions must be a list when configured")
+        self.llm_visible_functions = (
+            {str(name).strip() for name in visible_functions}
+            if visible_functions is not None
+            else None
+        )
+        self.local_delta_max_m = float(cfg.get("local_delta_max_m", 0.02))
+        self.local_delta_segment_m = float(cfg.get("local_delta_segment_m", 0.002))
+        self.local_yaw_max_rad = float(cfg.get("local_yaw_max_rad", 0.18))
+        self.local_yaw_segment_rad = float(cfg.get("local_yaw_segment_rad", 0.09))
+        self.local_wait_max_steps = int(cfg.get("local_wait_max_steps", 20))
+        self.profile_open_width = float(cfg.get("profile_open_width", self.open_gripper_width))
+        self.profile_open_max_steps = int(
+            cfg.get("profile_open_max_steps", self.max_gripper_servo_steps or 120)
+        )
+        self.transport_close_target_force = float(
+            cfg.get("transport_close_target_force", 0.82)
+        )
+        self.transport_close_max_steps = int(
+            cfg.get("transport_close_max_steps", self.max_gripper_servo_steps or 120)
+        )
+        for name, value in (
+            ("local_delta_max_m", self.local_delta_max_m),
+            ("local_delta_segment_m", self.local_delta_segment_m),
+            ("local_yaw_max_rad", self.local_yaw_max_rad),
+            ("local_yaw_segment_rad", self.local_yaw_segment_rad),
+        ):
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be a positive finite value")
+        if self.local_delta_segment_m > self.local_delta_max_m:
+            raise ValueError("local_delta_segment_m cannot exceed local_delta_max_m")
+        if self.local_yaw_segment_rad > self.local_yaw_max_rad:
+            raise ValueError("local_yaw_segment_rad cannot exceed local_yaw_max_rad")
+        if self.local_wait_max_steps < 1:
+            raise ValueError("local_wait_max_steps must be positive")
         self._perception_diagnostic_reset_serial: int | None = None
         self._rgbd_perception = UniVTACRgbdPerception(
             sam3_url=str(cfg.get("sam3_service_url", sam3_service_url)),
@@ -338,7 +376,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         )
 
     def functions(self) -> dict[str, Any]:
-        return {
+        full = {
             "get_object_pose": self.get_object_pose,
             "sample_grasp_pose": self.sample_grasp_pose,
             "goto_pose": self.goto_pose,
@@ -349,6 +387,240 @@ class UniVTACFrankaCompatApi(ApiBase):
             "get_step_status": self.get_step_status,
             "wait_steps": self.wait_steps,
         }
+        if self.llm_api_profile == "tactile_memory_match":
+            full = {
+                "get_object_pose": self._memory_match_get_object_pose,
+                "sample_grasp_pose": self.sample_grasp_pose,
+                "goto_pose": self._memory_match_goto_pose,
+                "move_delta": self._memory_match_move_delta,
+                "rotate_gripper": self._memory_match_rotate_gripper,
+                "open_gripper": self._memory_match_open_gripper,
+                "close_gripper": self._memory_match_close_gripper,
+                "wait_steps": self._memory_match_wait_steps,
+            }
+        return self._filter_llm_visible_functions(full)
+
+    def _filter_llm_visible_functions(self, functions: dict[str, Any]) -> dict[str, Any]:
+        if self.llm_visible_functions is None:
+            return functions
+        unknown = self.llm_visible_functions.difference(functions)
+        if unknown:
+            raise ValueError(
+                "llm_visible_functions contains unsupported FrankaControlApi functions: "
+                f"{sorted(unknown)}"
+            )
+        return {name: functions[name] for name in functions if name in self.llm_visible_functions}
+
+    def _memory_match_get_object_pose(
+        self,
+        object_name: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return the configured public pose route for one named object or slot.
+
+        Easy-GT and Hard-SAM choose their source in YAML. Generated code cannot
+        override that route or request extra geometry.
+        """
+        return self.get_object_pose(object_name, source="auto")
+
+    def _memory_match_goto_pose(
+        self,
+        position: np.ndarray,
+        quaternion_wxyz: np.ndarray,
+    ) -> dict[str, Any]:
+        """Move to a semantic grasp, slot, or locally derived target pose.
+
+        The adapter keeps tactile transport guarding active whenever it owns a
+        stable grasp. Public task landmarks retain their native staged motion.
+        """
+        return self.goto_pose(position, quaternion_wxyz)
+
+    def _memory_match_move_delta(
+        self,
+        dx: float = 0.0,
+        dy: float = 0.0,
+        dz: float = 0.0,
+    ) -> dict[str, Any]:
+        """Apply one bounded local translation in world coordinates.
+
+        The requested displacement is limited by the configured local motion
+        budget and split into short protected UniVTAC actions. It cannot move
+        below the configured gripper-center safety height.
+        """
+        requested = np.asarray([dx, dy, dz], dtype=np.float32)
+        if not np.all(np.isfinite(requested)):
+            raise ValueError("move_delta requires finite dx, dy, dz")
+        distance = float(np.linalg.norm(requested))
+        if distance > self.local_delta_max_m + 1e-8:
+            return {
+                "ok": False,
+                "reason": "local_delta_limit",
+                "requested_distance_m": distance,
+                "max_distance_m": self.local_delta_max_m,
+            }
+        current_pos, current_quat = self._current_tool_pose()
+        target_pos = current_pos + requested
+        target_pos[2] = max(float(target_pos[2]), self.min_safe_z)
+        return self._memory_match_execute_relative_pose(
+            target_pos,
+            current_quat,
+            translation_segment_m=self.local_delta_segment_m,
+            yaw_segment_rad=self.local_yaw_segment_rad,
+            operation="move_delta",
+        )
+
+    def _memory_match_rotate_gripper(self, yaw_rad: float) -> dict[str, Any]:
+        """Apply a bounded yaw about the current local gripper tool axis.
+
+        Roll and pitch are intentionally unavailable in the tactile-memory
+        profile to prevent a local correction from tilting into the table.
+        """
+        yaw = float(yaw_rad)
+        if not np.isfinite(yaw):
+            raise ValueError("yaw_rad must be finite")
+        if abs(yaw) > self.local_yaw_max_rad + 1e-8:
+            return {
+                "ok": False,
+                "reason": "local_yaw_limit",
+                "requested_yaw_rad": yaw,
+                "max_yaw_rad": self.local_yaw_max_rad,
+            }
+        current_pos, current_quat = self._current_tool_pose()
+        current_rotation = SciRotation.from_quat(self._wxyz_to_xyzw(current_quat))
+        local_yaw = SciRotation.from_rotvec([0.0, 0.0, yaw])
+        target_xyzw = (current_rotation * local_yaw).as_quat()
+        target_quat = self._normalize_quat(
+            np.asarray(
+                [target_xyzw[3], target_xyzw[0], target_xyzw[1], target_xyzw[2]],
+                dtype=np.float32,
+            )
+        )
+        return self._memory_match_execute_relative_pose(
+            current_pos,
+            target_quat,
+            translation_segment_m=self.local_delta_segment_m,
+            yaw_segment_rad=self.local_yaw_segment_rad,
+            operation="rotate_gripper",
+        )
+
+    def _memory_match_open_gripper(self) -> dict[str, Any]:
+        """Release using the task-profile opening width and servo budget."""
+        return self.open_gripper(
+            adaptive=True,
+            target_width=self.profile_open_width,
+            max_steps=self.profile_open_max_steps,
+        )
+
+    def _memory_match_close_gripper(self, mode: str = "probe") -> dict[str, Any]:
+        """Close using the configured ``probe`` or ``transport`` policy.
+
+        ``probe`` reuses the public measurement protocol so reference and
+        candidates receive identical excitation. ``transport`` uses the
+        independently configured final-grasp policy.
+        """
+        normalized_mode = str(mode).strip().lower()
+        if normalized_mode not in {"probe", "transport"}:
+            raise ValueError("close_gripper mode must be 'probe' or 'transport'")
+        protocol = self._memory_match_protocol()
+        if normalized_mode == "probe":
+            target_force = float(protocol["close_target_force"])
+            max_steps = int(protocol["close_max_steps"])
+            adaptive = bool(protocol["adaptive_close"])
+        else:
+            target_force = self.transport_close_target_force
+            max_steps = self.transport_close_max_steps
+            adaptive = True
+        result = self.close_gripper(
+            adaptive=adaptive,
+            target_force=target_force,
+            max_steps=max_steps,
+        )
+        result["mode"] = normalized_mode
+        return result
+
+    def _memory_match_wait_steps(self, n: int = 1) -> dict[str, Any]:
+        """Advance a bounded number of simulation steps without new motion."""
+        steps = int(n)
+        if steps < 1 or steps > self.local_wait_max_steps:
+            raise ValueError(
+                f"wait_steps must be in [1, {self.local_wait_max_steps}] for this task"
+            )
+        return self.wait_steps(steps)
+
+    def _memory_match_protocol(self) -> dict[str, Any]:
+        configs = getattr(self._env, "api_configs", {})
+        source = configs.get("tactile_measurement_protocol", {}) if isinstance(configs, dict) else {}
+        if not isinstance(source, dict):
+            source = {}
+        return {
+            "close_target_force": float(np.clip(source.get("close_target_force", 0.82), 0.0, 1.0)),
+            "close_max_steps": max(1, int(source.get("close_max_steps", 120))),
+            "adaptive_close": bool(source.get("adaptive_close", True)),
+        }
+
+    def _memory_match_execute_relative_pose(
+        self,
+        target_pos: np.ndarray,
+        target_quat: np.ndarray,
+        *,
+        translation_segment_m: float,
+        yaw_segment_rad: float,
+        operation: str,
+    ) -> dict[str, Any]:
+        start_pos, start_quat = self._current_tool_pose()
+        target_pos = np.asarray(target_pos, dtype=np.float32).reshape(3)
+        target_quat = self._normalize_quat(np.asarray(target_quat, dtype=np.float32).reshape(4))
+        translation = float(np.linalg.norm(target_pos - start_pos))
+        rotation = self._rotation_angle(start_quat, target_quat)
+        # Remove numerical dust before ceil so an exact 6 mm command with a
+        # 2 mm segment budget does not gain a fourth, unnecessary action.
+        # The action vectors are float32, so allow a tiny relative tolerance
+        # at an exact segment boundary rather than emitting an extra command.
+        segment_tolerance = 1e-5
+        translation_steps = int(
+            np.ceil(
+                max(0.0, translation / max(translation_segment_m, 1e-6) - segment_tolerance)
+            )
+        )
+        rotation_steps = int(
+            np.ceil(
+                max(0.0, rotation / max(yaw_segment_rad, 1e-6) - segment_tolerance)
+            )
+        )
+        steps = max(1, translation_steps, rotation_steps)
+        points = [start_pos + ((target_pos - start_pos) * (idx / steps)) for idx in range(1, steps + 1)]
+        # The generic path includes its start pose; local commands must emit
+        # exactly ``steps`` non-noop increments.
+        quaternions = self._slerp_quaternion_path(start_quat, target_quat, steps + 1)[1:]
+        monitor_tactile = bool(self._holding_with_tactile)
+        last_result: dict[str, Any] = {"ok": True, "operation": operation, "steps": steps}
+        previous_pos = start_pos
+        previous_quat = start_quat
+        for index, (position, quaternion) in enumerate(zip(points, quaternions, strict=True), start=1):
+            delta_xyz = np.asarray(position - previous_pos, dtype=np.float32)
+            delta_rpy = self._quaternion_delta_to_rpy(previous_quat, quaternion)
+            result = self._env.take_action(
+                np.concatenate([delta_xyz, delta_rpy, [0.0]]),
+                action_type="delta_ee",
+            )
+            last_result = {**result, "operation": operation, "steps": steps, "completed_steps": index}
+            if not bool(result.get("ok", False)):
+                last_result.setdefault("reason", "local_motion_failed")
+                return last_result
+            if monitor_tactile:
+                guard_failure = self._tactile_guard_failure(
+                    abort_on_contact_loss=True,
+                    tactile_force_threshold=None,
+                    slip_threshold=None,
+                )
+                if guard_failure is not None:
+                    return {
+                        **last_result,
+                        **guard_failure,
+                        "tactile_monitoring": True,
+                    }
+            previous_pos = position
+            previous_quat = quaternion
+        return last_result
 
     def get_object_pose(
         self,
