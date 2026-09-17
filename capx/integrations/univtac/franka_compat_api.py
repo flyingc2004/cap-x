@@ -547,6 +547,25 @@ class UniVTACFrankaCompatApi(ApiBase):
         return self.wait_steps(steps)
 
     def _memory_match_protocol(self) -> dict[str, Any]:
+        task_spec_getter = getattr(self._env, "get_public_probe_spec", None)
+        if callable(task_spec_getter):
+            try:
+                task_spec = task_spec_getter()
+            except Exception:
+                task_spec = None
+            if (
+                isinstance(task_spec, dict)
+                and task_spec.get("schema_version") == "public_probe_spec.v1"
+                and "close_target_force" in task_spec
+                and "close_max_steps" in task_spec
+            ):
+                return {
+                    "close_target_force": float(
+                        np.clip(task_spec["close_target_force"], 0.0, 1.0)
+                    ),
+                    "close_max_steps": max(1, int(task_spec["close_max_steps"])),
+                    "adaptive_close": bool(task_spec.get("adaptive_close", True)),
+                }
         configs = getattr(self._env, "api_configs", {})
         source = configs.get("tactile_measurement_protocol", {}) if isinstance(configs, dict) else {}
         if not isinstance(source, dict):

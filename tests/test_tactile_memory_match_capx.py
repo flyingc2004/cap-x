@@ -309,6 +309,12 @@ def test_public_functions_expose_neutral_agent_owned_memory_only() -> None:
     assert {
         "capture_tactile_observation",
         "get_tactile_measurement_protocol",
+        "get_public_probe_spec",
+        "begin_public_probe_capture",
+        "begin_public_probe_segment",
+        "end_public_probe_segment",
+        "finalize_public_probe_capture",
+        "get_provisional_slot_expression",
         "write_trial_memory",
         "read_trial_memory",
         "list_trial_memory",
@@ -403,6 +409,117 @@ def test_config_loader_maps_trial_memory_and_disables_persistent_injection() -> 
     assert "Tactile code memory (compact skill cards):" not in env_factory["cfg"]["prompt"]
 
 
+def test_composable_demo_config_is_easy_gt_and_public_only() -> None:
+    root = Path(__file__).resolve().parents[1]
+    env_factory, config, _ = _load_config(
+        LaunchArgs(
+            config_path=str(root / "env_configs/univtac/tactile_memory_match_composable_demo.yaml")
+        )
+    )
+
+    low_level = env_factory["cfg"]["low_level"]
+    tactile_api = low_level["api_configs"]["univtac_tactile_api"]
+    franka_api = low_level["api_configs"]["franka_control_api"]
+    expression = low_level["api_configs"]["tactile_slot_expression"]
+
+    assert low_level["task_config"] == "tactile_memory_match_composable_capx_demo"
+    assert low_level["memory_overlay_enabled"] is True
+    assert low_level["expose_actor_pose"] is False
+    assert low_level["privileged"] is False
+    assert franka_api["rgbd_perception_enabled"] is False
+    assert franka_api["public_anchor_pose_enabled"] is True
+    assert env_factory["cfg"]["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
+    assert config["tactile_memory"]["persistent"]["enabled"] is False
+    assert set(tactile_api["llm_visible_functions"]) >= {
+        "get_public_probe_spec",
+        "begin_public_probe_capture",
+        "begin_public_probe_segment",
+        "end_public_probe_segment",
+        "finalize_public_probe_capture",
+        "get_provisional_slot_expression",
+        "write_trial_memory",
+        "read_trial_memory",
+    }
+    assert expression["schema_version"] == "provisional_slot_expression.v0"
+    assert set(expression["slots"]) == {"weight", "roughness", "hardness"}
+    serialized = yaml.safe_dump(expression).lower()
+    for private_name in ("pose", "label", "density", "friction", "reward", "success"):
+        assert private_name not in serialized
+    assert "get_public_probe_spec" in env_factory["cfg"]["prompt"]
+    assert "tactile_probe.v3" in env_factory["cfg"]["prompt"]
+    assert "fused_distance" in env_factory["cfg"]["prompt"]
+
+
+def test_public_probe_recorder_uses_task_v3_reducer_without_identity_logic() -> None:
+    class _Task:
+        def get_public_probe_spec(self):
+            return {
+                "schema_version": "public_probe_spec.v1",
+                "protocol_id": "expert.v3",
+                "preload_steps": 2,
+                "lift_height": 0.01,
+                "hold_steps": 1,
+            }
+
+        def capture_public_probe_frame(self):
+            return {"public_frame": True, "step": state["step"]}
+
+        def aggregate_public_probe_window(self, frames):
+            return {"frame_count": len(frames), "steps": [frame["step"] for frame in frames]}
+
+        def build_public_probe_record(self, object_name, preload, lift_motion, hold, **execution):
+            assert object_name == "reference_object"
+            assert preload["frame_count"] == 2
+            assert lift_motion["frame_count"] == 1
+            assert hold["frame_count"] == 1
+            assert all(execution.values())
+            return {
+                "schema_version": "tactile_probe.v3",
+                "object_name": "reference",
+                "quality": {"valid": True},
+                "preload": preload,
+                "lift_motion": lift_motion,
+                "hold": hold,
+            }
+
+    state = {"step": 0}
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._task = _Task()
+    env._public_probe_sessions = {}
+    env._public_probe_records = {}
+    env._public_probe_serial = 0
+    env.get_step_count = lambda: state["step"]
+
+    capture = env.begin_public_probe_capture("reference_object")
+    for segment, steps in (("preload", 2), ("lift_motion", 1), ("hold", 1)):
+        env.begin_public_probe_segment(capture["capture_id"], segment)
+        for _ in range(steps):
+            state["step"] += 1
+            env._record_active_public_probe_frame()
+        env.end_public_probe_segment(capture["capture_id"], segment)
+
+    record = env.finalize_public_probe_capture(
+        capture["capture_id"],
+        {
+            "approach_ok": True,
+            "close_ok": True,
+            "bilateral_gate": True,
+            "lift_ok": True,
+            "lower_ok": True,
+            "release_ok": True,
+            "clearance_ok": True,
+        },
+    )
+
+    assert record["schema_version"] == "capx_public_probe_record.v1"
+    assert record["probe"]["schema_version"] == "tactile_probe.v3"
+    assert record["frame_counts"] == {"preload": 2, "lift_motion": 1, "hold": 1}
+    assert env.get_public_probe_records()[capture["capture_id"]] == record
+    serialized = repr(record).lower()
+    for private_name in ("label", "density", "friction", "reward", "success", "match"):
+        assert private_name not in serialized
+
+
 def test_native_goto_pose_clamps_target_below_safe_z() -> None:
     class _NativeEnv:
         api_configs = {
@@ -433,6 +550,27 @@ def test_native_goto_pose_clamps_target_below_safe_z() -> None:
     assert result["ok"] is True
     assert len(env.targets) == 1
     assert env.targets[0][2] == pytest.approx(0.035)
+
+
+def test_memory_match_probe_close_uses_task_public_spec_when_available() -> None:
+    class _Env:
+        api_configs = {"franka_control_api": {"llm_api_profile": "tactile_memory_match"}}
+
+        def get_public_probe_spec(self):
+            return {
+                "schema_version": "public_probe_spec.v1",
+                "adaptive_close": True,
+                "close_target_force": 0.73,
+                "close_max_steps": 77,
+            }
+
+    api = UniVTACFrankaCompatApi(_Env())
+
+    assert api._memory_match_protocol() == {
+        "close_target_force": pytest.approx(0.73),
+        "close_max_steps": 77,
+        "adaptive_close": True,
+    }
 
 
 def test_native_planner_resolves_sampled_object_pose_through_task_grasp_atom() -> None:

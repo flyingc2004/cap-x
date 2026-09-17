@@ -65,6 +65,12 @@ class UniVTACTactileApi(ApiBase):
             "get_marker_motion_summary": self.get_marker_motion_summary,
             "get_recent_tactile_events": self.get_recent_tactile_events,
             "get_tactile_measurement_protocol": self.get_tactile_measurement_protocol,
+            "get_public_probe_spec": self.get_public_probe_spec,
+            "begin_public_probe_capture": self.begin_public_probe_capture,
+            "begin_public_probe_segment": self.begin_public_probe_segment,
+            "end_public_probe_segment": self.end_public_probe_segment,
+            "finalize_public_probe_capture": self.finalize_public_probe_capture,
+            "get_provisional_slot_expression": self.get_provisional_slot_expression,
             "capture_tactile_observation": self.capture_tactile_observation,
             "write_trial_memory": self.write_trial_memory,
             "read_trial_memory": self.read_trial_memory,
@@ -315,6 +321,87 @@ class UniVTACTactileApi(ApiBase):
         protocol = _tactile_measurement_protocol(self._env)
         self._append_working_memory_trace("protocol", {"protocol": protocol})
         return protocol
+
+    def get_public_probe_spec(self) -> dict:
+        """Return the benchmark-owned standard tactile probe specification.
+
+        This is the public action protocol shared by the official expert and
+        external agents. It contains only measurement timing and quality gates;
+        it contains no pose, hidden physical class, reward, or match identity.
+        Call it once and reuse the unchanged result for reference and both
+        candidates.
+        """
+        getter = getattr(self._env, "get_public_probe_spec", None)
+        if not callable(getter):
+            raise RuntimeError("the active environment does not expose a public probe spec")
+        spec = getter()
+        if not isinstance(spec, dict) or spec.get("schema_version") != "public_probe_spec.v1":
+            raise RuntimeError("environment returned an invalid public_probe_spec.v1 record")
+        normalized = _jsonable(spec)
+        self._append_working_memory_trace("public_probe_spec", {"spec": normalized})
+        return normalized
+
+    def begin_public_probe_capture(self, object_name: str) -> dict:
+        """Start recording one externally executed standard probe.
+
+        This function does not move the robot. Use
+        :meth:`begin_public_probe_segment` and
+        :meth:`end_public_probe_segment` around the public protocol's preload,
+        lift-motion, and hold actions; then call
+        :meth:`finalize_public_probe_capture`.
+        """
+        begin = getattr(self._env, "begin_public_probe_capture", None)
+        if not callable(begin):
+            raise RuntimeError("the active environment does not support public probe recording")
+        result = _jsonable(begin(object_name))
+        self._append_working_memory_trace("public_probe_begin", {"record": result})
+        return result
+
+    def begin_public_probe_segment(self, capture_id: str, segment: str) -> dict:
+        """Begin recording a public ``preload``, ``lift_motion``, or ``hold`` segment."""
+        begin = getattr(self._env, "begin_public_probe_segment", None)
+        if not callable(begin):
+            raise RuntimeError("the active environment does not support public probe segments")
+        result = _jsonable(begin(capture_id, segment))
+        self._append_working_memory_trace("public_probe_segment_begin", {"record": result})
+        return result
+
+    def end_public_probe_segment(self, capture_id: str, segment: str) -> dict:
+        """Stop and aggregate a public probe segment using the expert v3 reducer."""
+        end = getattr(self._env, "end_public_probe_segment", None)
+        if not callable(end):
+            raise RuntimeError("the active environment does not support public probe segments")
+        result = _jsonable(end(capture_id, segment))
+        self._append_working_memory_trace("public_probe_segment_end", {"record": result})
+        return result
+
+    def finalize_public_probe_capture(self, capture_id: str, execution: dict) -> dict:
+        """Build a public ``tactile_probe.v3`` record from agent-owned motion.
+
+        ``execution`` reports only public action outcomes: ``approach_ok``,
+        ``close_ok``, ``bilateral_gate``, ``lift_ok``, ``lower_ok``,
+        ``release_ok``, and ``clearance_ok``. The environment aggregates raw
+        tactile frames but does not construct an identity score or choice.
+        """
+        finalize = getattr(self._env, "finalize_public_probe_capture", None)
+        if not callable(finalize):
+            raise RuntimeError("the active environment does not support public probe finalization")
+        result = _jsonable(finalize(capture_id, execution))
+        self._append_working_memory_trace("public_probe_finalize", {"record": result})
+        return result
+
+    def get_provisional_slot_expression(self) -> dict:
+        """Return the read-only public feature rule for the engineering demo.
+
+        It only names paths in ``tactile_probe.v3`` and confidence inputs. The
+        caller computes vectors, distances, fusion, and the candidate choice.
+        """
+        source = self._runtime_config().get("tactile_slot_expression", {})
+        if not isinstance(source, dict) or source.get("schema_version") != "provisional_slot_expression.v0":
+            raise RuntimeError("no provisional_slot_expression.v0 is configured")
+        expression = _jsonable(source)
+        self._append_working_memory_trace("slot_expression", {"expression": expression})
+        return expression
 
     def capture_tactile_observation(self, window: int = 20) -> dict:
         """Capture one canonical public tactile observation for this trial.

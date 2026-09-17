@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 import torch
 import yaml
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from capx.envs.base import BaseEnv
 from capx.envs.tasks.exceptions import HardStopTrial, RecoverableTaskFailure
@@ -51,6 +51,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         ),
         live_preview_stride: int = 5,
         live_preview_jpeg_quality: int = 80,
+        memory_overlay_enabled: bool = False,
         tactile_buffer_size: int = 500,
         lift_success_height_delta: float = 0.10,
         lift_success_require_contact: bool = True,
@@ -77,6 +78,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self.live_preview_jpeg_quality = int(
             np.clip(int(live_preview_jpeg_quality), 1, 95)
         )
+        self.memory_overlay_enabled = bool(memory_overlay_enabled)
         self._record_action_frames = True
         self._video_frame_stride = 1
         self._record_pre_move_frames = True
@@ -107,6 +109,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._primitive_trace: list[dict[str, Any]] = []
         self._tactile_working_memory_trace: list[dict[str, Any]] = []
         self._tactile_trial_memory_snapshot: dict[str, Any] = {}
+        self._public_probe_sessions: dict[str, dict[str, Any]] = {}
+        self._public_probe_records: dict[str, dict[str, Any]] = {}
+        self._public_probe_serial = 0
         self._pre_move_tactile_timeline: list[dict[str, Any]] = []
         self._pre_move_tactile_last_error: str | None = None
         self._perception_artifacts: list[dict[str, Any]] = []
@@ -157,6 +162,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._primitive_trace.clear()
         self._tactile_working_memory_trace.clear()
         self._tactile_trial_memory_snapshot.clear()
+        self._public_probe_sessions.clear()
+        self._public_probe_records.clear()
+        self._public_probe_serial = 0
         self._pre_move_tactile_timeline.clear()
         self._pre_move_tactile_last_error = None
         self._perception_artifacts.clear()
@@ -1011,6 +1019,189 @@ class UniVTACLowLevelEnv(BaseEnv):
         """Return the current public trial-memory snapshot for audit only."""
         return _jsonable(getattr(self, "_tactile_trial_memory_snapshot", {}))
 
+    def get_public_probe_spec(self) -> dict[str, Any]:
+        """Return the task-declared, label-free tactile probe protocol."""
+        getter = getattr(self._task, "get_public_probe_spec", None)
+        if not callable(getter):
+            raise RuntimeError(
+                f"task {self.task_name!r} does not expose a public tactile probe specification"
+            )
+        spec = getter()
+        if not isinstance(spec, dict) or spec.get("schema_version") != "public_probe_spec.v1":
+            raise RuntimeError("task returned an invalid public_probe_spec.v1 record")
+        return _jsonable(spec)
+
+    def begin_public_probe_capture(self, object_name: str) -> dict[str, Any]:
+        """Open a recorder while CaP-X executes one public standard probe.
+
+        This method performs no physical motion and does not consult task
+        metadata.  The caller must mark the preload, lift-motion, and hold
+        segments around its own FrankaControlApi actions.
+        """
+        key = self._normalize_public_probe_object_name(object_name)
+        self._public_probe_serial += 1
+        capture_id = f"probe_{self._public_probe_serial:03d}_{key}"
+        self._public_probe_sessions[capture_id] = {
+            "schema_version": "capx_public_probe_capture.v1",
+            "capture_id": capture_id,
+            "object_name": key,
+            "protocol": self.get_public_probe_spec(),
+            "segments": {"preload": [], "lift_motion": [], "hold": []},
+            "aggregates": {},
+            "active_segment": None,
+            "start_step": self.get_step_count(),
+        }
+        return {
+            "schema_version": "capx_public_probe_capture.v1",
+            "capture_id": capture_id,
+            "object_name": key,
+            "protocol": self.get_public_probe_spec(),
+        }
+
+    def begin_public_probe_segment(self, capture_id: str, segment: str) -> dict[str, Any]:
+        """Begin recording one public probe segment during caller-owned motion."""
+        session = self._public_probe_session(capture_id)
+        normalized = self._normalize_public_probe_segment(segment)
+        if session["active_segment"] is not None:
+            raise RuntimeError(
+                f"probe capture {capture_id!r} already records {session['active_segment']!r}"
+            )
+        if session["segments"][normalized]:
+            raise RuntimeError(f"probe segment {normalized!r} was already recorded")
+        session["active_segment"] = normalized
+        return {
+            "ok": True,
+            "capture_id": str(capture_id),
+            "segment": normalized,
+            "start_step": self.get_step_count(),
+        }
+
+    def end_public_probe_segment(self, capture_id: str, segment: str) -> dict[str, Any]:
+        """Stop one segment and aggregate it with the expert's v3 reducer."""
+        session = self._public_probe_session(capture_id)
+        normalized = self._normalize_public_probe_segment(segment)
+        if session["active_segment"] != normalized:
+            raise RuntimeError(
+                f"probe capture {capture_id!r} is not recording {normalized!r}"
+            )
+        session["active_segment"] = None
+        aggregator = getattr(self._task, "aggregate_public_probe_window", None)
+        if not callable(aggregator):
+            raise RuntimeError("task does not expose public tactile probe aggregation")
+        frames = session["segments"][normalized]
+        aggregate = aggregator(frames) if frames else _empty_public_probe_window()
+        session["aggregates"][normalized] = _jsonable(aggregate)
+        return {
+            "ok": bool(frames),
+            "capture_id": str(capture_id),
+            "segment": normalized,
+            "frame_count": len(frames),
+            "aggregate": _jsonable(aggregate),
+        }
+
+    def finalize_public_probe_capture(
+        self,
+        capture_id: str,
+        execution: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return a canonical public ``tactile_probe.v3`` record.
+
+        ``execution`` must report the caller's own approach, close, lift,
+        lower, release, and clearance outcomes.  It changes probe quality but
+        cannot introduce labels or select a candidate.
+        """
+        session = self._public_probe_session(capture_id)
+        if session["active_segment"] is not None:
+            raise RuntimeError(
+                f"probe capture {capture_id!r} still records {session['active_segment']!r}"
+            )
+        missing = [name for name in ("preload", "lift_motion", "hold") if name not in session["aggregates"]]
+        if missing:
+            raise RuntimeError(f"probe capture {capture_id!r} is missing segments: {missing}")
+        if not isinstance(execution, dict):
+            raise TypeError("probe execution must be a dictionary")
+        required = {
+            "approach_ok",
+            "close_ok",
+            "bilateral_gate",
+            "lift_ok",
+            "lower_ok",
+            "release_ok",
+            "clearance_ok",
+        }
+        missing_execution = sorted(required.difference(execution))
+        if missing_execution:
+            raise ValueError(f"probe execution is missing fields: {missing_execution}")
+        builder = getattr(self._task, "build_public_probe_record", None)
+        if not callable(builder):
+            raise RuntimeError("task does not expose public tactile probe construction")
+        probe = builder(
+            session["object_name"],
+            session["aggregates"]["preload"],
+            session["aggregates"]["lift_motion"],
+            session["aggregates"]["hold"],
+            **{key: bool(execution[key]) for key in required},
+        )
+        record = {
+            "schema_version": "capx_public_probe_record.v1",
+            "capture_id": str(capture_id),
+            "object_name": session["object_name"],
+            "protocol": session["protocol"],
+            "probe": _jsonable(probe),
+            "segments": _jsonable(session["aggregates"]),
+            "frame_counts": {
+                name: len(session["segments"][name])
+                for name in ("preload", "lift_motion", "hold")
+            },
+            "execution": {key: bool(execution[key]) for key in required},
+            "start_step": int(session["start_step"]),
+            "end_step": self.get_step_count(),
+        }
+        self._public_probe_records[str(capture_id)] = record
+        self._public_probe_sessions.pop(str(capture_id), None)
+        return _jsonable(record)
+
+    def get_public_probe_records(self) -> dict[str, Any]:
+        """Return public probe artifacts for output writing, never for LLM context."""
+        return _jsonable(getattr(self, "_public_probe_records", {}))
+
+    def _record_active_public_probe_frame(self) -> None:
+        active = [
+            session
+            for session in self._public_probe_sessions.values()
+            if session.get("active_segment") is not None
+        ]
+        if not active:
+            return
+        capture = getattr(self._task, "capture_public_probe_frame", None)
+        if not callable(capture):
+            raise RuntimeError("task does not expose public tactile probe frames")
+        frame = _jsonable(capture())
+        for session in active:
+            session["segments"][session["active_segment"]].append(frame)
+
+    @staticmethod
+    def _normalize_public_probe_object_name(object_name: str) -> str:
+        normalized = str(object_name).strip().lower()
+        aliases = {"reference": "reference_object", "reference_object": "reference_object"}
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in {"reference_object", "candidate_left", "candidate_right"}:
+            raise KeyError(f"unknown public probe object: {object_name!r}")
+        return normalized
+
+    @staticmethod
+    def _normalize_public_probe_segment(segment: str) -> str:
+        normalized = str(segment).strip().lower()
+        if normalized not in {"preload", "lift_motion", "hold"}:
+            raise ValueError("probe segment must be preload, lift_motion, or hold")
+        return normalized
+
+    def _public_probe_session(self, capture_id: str) -> dict[str, Any]:
+        session = self._public_probe_sessions.get(str(capture_id))
+        if session is None:
+            raise KeyError(f"unknown active probe capture: {capture_id!r}")
+        return session
+
     def wait_steps(self, n: int = 1) -> dict[str, Any]:
         steps = max(0, int(n))
         for _ in range(steps):
@@ -1280,12 +1471,14 @@ class UniVTACLowLevelEnv(BaseEnv):
         primitive_trace = getattr(self, "_primitive_trace", [])
         working_memory_trace = getattr(self, "_tactile_working_memory_trace", [])
         trial_memory_snapshot = getattr(self, "_tactile_trial_memory_snapshot", {})
+        public_probe_records = getattr(self, "_public_probe_records", {})
         if (
             not self._debug_records
             and not self._tactile_gripper_trace
             and not primitive_trace
             and not working_memory_trace
             and not trial_memory_snapshot
+            and not public_probe_records
             and not self._perception_artifacts
         ):
             return None
@@ -1336,6 +1529,17 @@ class UniVTACLowLevelEnv(BaseEnv):
                 f"to {trial_memory_path}",
                 flush=True,
             )
+        probe_records_path = None
+        if public_probe_records:
+            probe_records_path = output_path / "tactile_probe_records.json"
+            with open(probe_records_path, "w", encoding="utf-8") as f:
+                json.dump(public_probe_records, f, indent=2, sort_keys=True)
+            print(
+                f"[capx-univtac] saved public probe records to {probe_records_path}",
+                flush=True,
+            )
+        selection_path = self._export_selection_summary(output_path, trial_memory_snapshot)
+        audit_path = self._export_oracle_audit(output_path, trial_memory_snapshot)
         perception_path = self._export_perception_artifacts(output_path)
         self._export_pre_move_tactile_timeline(output_path)
         if self._debug_records:
@@ -1348,7 +1552,70 @@ class UniVTACLowLevelEnv(BaseEnv):
             return str(working_memory_path)
         if trial_memory_path is not None:
             return str(trial_memory_path)
+        if probe_records_path is not None:
+            return str(probe_records_path)
+        if selection_path is not None:
+            return str(selection_path)
+        if audit_path is not None:
+            return str(audit_path)
         return str(perception_path) if perception_path is not None else None
+
+    def _export_selection_summary(
+        self,
+        output_path: Path,
+        trial_memory_snapshot: dict[str, Any],
+    ) -> Path | None:
+        records = (
+            trial_memory_snapshot.get("records", {})
+            if isinstance(trial_memory_snapshot, dict)
+            else {}
+        )
+        selection = records.get("selection") if isinstance(records, dict) else None
+        if not isinstance(selection, dict):
+            return None
+        path = output_path / "selection_summary.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(_jsonable(selection), f, indent=2, sort_keys=True)
+        print(f"[capx-univtac] saved selection summary to {path}", flush=True)
+        return path
+
+    def _export_oracle_audit(
+        self,
+        output_path: Path,
+        trial_memory_snapshot: dict[str, Any],
+    ) -> Path | None:
+        """Persist the hidden-label result only after code execution ends."""
+        if self.task_name != "tactile_memory_match":
+            return None
+        records = (
+            trial_memory_snapshot.get("records", {})
+            if isinstance(trial_memory_snapshot, dict)
+            else {}
+        )
+        selection = records.get("selection") if isinstance(records, dict) else None
+        selected = None
+        if isinstance(selection, dict) and isinstance(selection.get("data"), dict):
+            selected = selection["data"].get("selected_candidate")
+        true_match = getattr(self._task, "match_candidate_public_name", None)
+        if selected is None:
+            return None
+        try:
+            task_completed = bool(self._task.check_success())
+        except Exception:
+            task_completed = False
+        audit = {
+            "schema_version": "capx_tactile_memory_oracle_audit.v1",
+            "audit_stage": "post_execution_only",
+            "selected_candidate": selected,
+            "true_match_candidate": true_match,
+            "selection_correct": bool(selected is not None and selected == true_match),
+            "task_completed": task_completed,
+        }
+        path = output_path / "oracle_audit.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(_jsonable(audit), f, indent=2, sort_keys=True)
+        print(f"[capx-univtac] saved post-execution oracle audit to {path}", flush=True)
+        return path
 
     def _export_perception_artifacts(self, output_path: Path) -> Path | None:
         artifacts = getattr(self, "_perception_artifacts", [])
@@ -1539,6 +1806,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         def _capx_step(*args, **kwargs):
             result = original_step(*args, **kwargs)
             self._record_pre_move_tactile_step()
+            # Read the post-step tactile frame so externally executed probes
+            # are reduced by the same v3 schema as the task-side expert.
+            self._record_active_public_probe_frame()
             self._record_frame_after_task_step()
             return result
 
@@ -2433,7 +2703,119 @@ class UniVTACLowLevelEnv(BaseEnv):
         frame[:, 480:960, :] = wrist_rgb
         frame[:160, 960:1120, :] = left_rgb
         frame[160:320, 960:1120, :] = right_rgb
+        if self.memory_overlay_enabled:
+            frame = self._render_tactile_memory_overlay(frame)
         return np.ascontiguousarray(frame)
+
+    def _render_tactile_memory_overlay(self, frame: np.ndarray) -> np.ndarray:
+        """Render agent-authored public memory beside the normal video panel."""
+        panel_width = 460
+        panel = Image.new("RGB", (panel_width, frame.shape[0]), (18, 24, 35))
+        draw = ImageDraw.Draw(panel)
+        font = ImageFont.load_default()
+        y = 7
+        for text, color in self._tactile_memory_overlay_lines():
+            draw.text((8, y), text[:76], fill=color, font=font)
+            y += 12
+            if y >= frame.shape[0] - 10:
+                break
+        return np.concatenate([frame, np.asarray(panel, dtype=np.uint8)], axis=1)
+
+    def _tactile_memory_overlay_lines(self) -> list[tuple[str, tuple[int, int, int]]]:
+        lines: list[tuple[str, tuple[int, int, int]]] = [
+            ("TACTILE MEMORY | provisional composable-slot v0", (225, 235, 255)),
+        ]
+        active = [
+            session
+            for session in self._public_probe_sessions.values()
+            if session.get("active_segment") is not None
+        ]
+        if active:
+            session = active[0]
+            lines.append(
+                (
+                    f"PHASE: {session['object_name']} / {session['active_segment']}",
+                    (255, 210, 105),
+                )
+            )
+        else:
+            lines.append(("PHASE: memory / transport", (175, 210, 245)))
+
+        snapshot = self.get_tactile_trial_memory_snapshot()
+        records = snapshot.get("records", {}) if isinstance(snapshot, dict) else {}
+        aliases = {
+            "reference": "evidence_reference",
+            "left": "evidence_candidate_left",
+            "right": "evidence_candidate_right",
+        }
+        for label, key in aliases.items():
+            record = records.get(key) if isinstance(records, dict) else None
+            data = record.get("data", {}) if isinstance(record, dict) else {}
+            probe = data.get("probe", {}) if isinstance(data, dict) else {}
+            quality = probe.get("quality", {}) if isinstance(probe, dict) else {}
+            if not probe:
+                lines.append((f"{label.upper()}: pending", (145, 155, 170)))
+                continue
+            valid = bool(quality.get("valid", False))
+            ratio = min(
+                _safe_overlay_float(quality.get("preload_bilateral_contact_ratio")),
+                _safe_overlay_float(quality.get("lift_motion_bilateral_contact_ratio")),
+            )
+            status = "valid" if valid else "invalid"
+            lines.append(
+                (f"{label.upper()}: {status} bilateral={ratio:.2f}", (115, 230, 150) if valid else (255, 140, 130))
+            )
+            slots = data.get("slot_vectors", {}) if isinstance(data, dict) else {}
+            for slot in ("weight", "roughness", "hardness"):
+                vector = slots.get(slot) if isinstance(slots, dict) else None
+                if isinstance(vector, dict):
+                    values = vector.get("values", [])
+                    confidence = _safe_overlay_float(vector.get("confidence"))
+                    compact = ",".join(f"{_safe_overlay_float(value):+.3f}" for value in values[:2])
+                    lines.append((f"  {slot[:1].upper()}: [{compact}] q={confidence:.2f}", (195, 205, 218)))
+
+        selection = records.get("selection") if isinstance(records, dict) else None
+        selection_data = selection.get("data", {}) if isinstance(selection, dict) else {}
+        if isinstance(selection_data, dict) and selection_data:
+            lines.append(("SELECTION", (225, 235, 255)))
+            slot_scores = selection_data.get("slot_scores", {})
+            if isinstance(slot_scores, dict):
+                for slot in ("weight", "roughness", "hardness"):
+                    score = slot_scores.get(slot)
+                    if isinstance(score, dict):
+                        lines.append(
+                            (
+                                f"  {slot[:1].upper()}: L={_safe_overlay_float(score.get('candidate_left')):.3f} "
+                                f"R={_safe_overlay_float(score.get('candidate_right')):.3f} "
+                                f"q={_safe_overlay_float(score.get('confidence')):.2f}",
+                                (205, 215, 230),
+                            )
+                        )
+            lines.append(
+                (
+                    f"  fused L={_safe_overlay_float(selection_data.get('score_left')):.3f} "
+                    f"R={_safe_overlay_float(selection_data.get('score_right')):.3f} "
+                    f"margin={_safe_overlay_float(selection_data.get('score_margin')):.3f}",
+                    (255, 224, 130),
+                )
+            )
+            lines.append(
+                (f"  selected: {selection_data.get('selected_candidate', 'pending')}", (255, 224, 130))
+            )
+            # This is deliberately a post-transport visual audit. It is not
+            # part of the public API, prompt, or generated code context.
+            try:
+                completed = bool(self._task.check_success())
+            except Exception:
+                completed = False
+            if completed:
+                selected = selection_data.get("selected_candidate")
+                true_match = getattr(self._task, "match_candidate_public_name", None)
+                correct = bool(selected == true_match)
+                lines.append(
+                    (f"ORACLE AUDIT: {'correct' if correct else 'incorrect'}", (110, 235, 145) if correct else (255, 130, 125))
+                )
+        return lines
 
     def _public_observation(self, obs: dict[str, Any]) -> dict[str, Any]:
         public = {
@@ -2572,6 +2954,36 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+def _safe_overlay_float(value: Any) -> float:
+    """Format optional public memory values without breaking video rendering."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return numeric if np.isfinite(numeric) else 0.0
+
+
+def _empty_public_probe_window() -> dict[str, Any]:
+    """Fallback v3-compatible aggregate for an interrupted empty segment."""
+    fields = ("depth_mm", "marker_displacement_px", "marker_coherence", "contact_area")
+    return {
+        "frame_count": 0,
+        "start_step": None,
+        "end_step": None,
+        "bilateral_contact_ratio": 0.0,
+        "left": {field: 0.0 for field in fields},
+        "right": {field: 0.0 for field in fields},
+        "noise": {
+            hand: {
+                field: {"value": 0.0, "mad": 0.0, "snr": 0.0}
+                for field in fields
+            }
+            for hand in ("left", "right")
+        },
+        "gripper_qpos": 0.0,
+    }
 
 
 def _as_uint8_rgb(value: Any) -> np.ndarray:
