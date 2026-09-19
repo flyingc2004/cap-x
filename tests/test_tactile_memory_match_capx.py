@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 import types
@@ -315,6 +316,7 @@ def test_public_functions_expose_neutral_agent_owned_memory_only() -> None:
         "end_public_probe_segment",
         "finalize_public_probe_capture",
         "get_provisional_slot_expression",
+        "get_tactile_response_expression",
         "write_trial_memory",
         "read_trial_memory",
         "list_trial_memory",
@@ -329,6 +331,108 @@ def test_public_functions_expose_neutral_agent_owned_memory_only() -> None:
     ):
         assert legacy_name not in functions
         assert not hasattr(api, legacy_name)
+
+
+def test_response_expression_loads_only_public_v4_contract(tmp_path: Path) -> None:
+    expression_path = tmp_path / "task_config" / "tactile_response_expression.v1.json"
+    expression_path.parent.mkdir()
+    expression_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tactile_response_expression.v1",
+                "scope": "development_calibrated_public_response",
+                "public_probe_schema_version": "tactile_probe.v4",
+                "protocol_id": "expert.v4",
+                "response_blocks": [
+                    {
+                        "name": "normal_static",
+                        "fields": [
+                            {
+                                "path": "preload.left.depth_mm",
+                                "transform": "identity",
+                                "snr_paths": ["preload.noise.left.depth_mm.snr"],
+                            }
+                        ],
+                        "scaler": {"median": [0.0], "iqr": [1.0]},
+                    }
+                ],
+                "quality_rule": {"snr_cap": 10.0},
+                "comparison_rule": {"version": "quality_weighted_block_rms.v1"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = _TactileEnv(
+        {
+            "univtac_tactile_api": {
+                "tactile_response_expression_path": "task_config/tactile_response_expression.v1.json"
+            }
+        }
+    )
+    env.univtac_root = tmp_path
+    expression = UniVTACTactileApi(env).get_tactile_response_expression()
+
+    assert expression["schema_version"] == "tactile_response_expression.v1"
+    assert expression["response_blocks"][0]["name"] == "normal_static"
+    serialized = repr(expression).lower()
+    for private_name in ("label", "density", "friction", "reward", "success", "pose"):
+        assert private_name not in serialized
+    assert env.trace[-1]["event"] == "response_expression"
+
+
+def test_response_expression_rejects_private_paths() -> None:
+    expression = {
+        "schema_version": "tactile_response_expression.v1",
+        "public_probe_schema_version": "tactile_probe.v4",
+        "response_blocks": [
+            {
+                "name": "invalid",
+                "fields": [
+                    {
+                        "path": "preload.left.density",
+                        "transform": "identity",
+                        "snr_paths": ["preload.noise.left.depth_mm.snr"],
+                    }
+                ],
+                "scaler": {"median": [0.0], "iqr": [1.0]},
+            }
+        ],
+    }
+    env = _TactileEnv({"univtac_tactile_api": {"tactile_response_expression": expression}})
+
+    with pytest.raises(RuntimeError, match="private field path"):
+        UniVTACTactileApi(env).get_tactile_response_expression()
+
+
+def test_selection_only_oracle_audit_reports_memory_correctness(tmp_path: Path) -> None:
+    class _Task:
+        match_candidate_public_name = "candidate_right"
+
+        @staticmethod
+        def check_success() -> bool:
+            return False
+
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env.task_name = "tactile_memory_match"
+    env._task = _Task()
+    env.selection_only_audit = True
+    snapshot = {
+        "schema_version": "trial_memory_snapshot.v1",
+        "records": {
+            "selection": _record(
+                kind="decision",
+                phase="selection",
+                data={"selected_candidate": "candidate_right"},
+            )
+        },
+    }
+
+    audit_path = env._export_oracle_audit(tmp_path, snapshot)
+    assert audit_path is not None
+    audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
+    assert audit["evaluation_mode"] == "selection_only"
+    assert audit["selection_correct"] is True
+    assert audit["task_completed"] is False
 
 
 def test_runtime_memory_context_is_bounded_and_used_only_when_enabled() -> None:
@@ -420,7 +524,6 @@ def test_composable_demo_config_is_easy_gt_and_public_only() -> None:
     low_level = env_factory["cfg"]["low_level"]
     tactile_api = low_level["api_configs"]["univtac_tactile_api"]
     franka_api = low_level["api_configs"]["franka_control_api"]
-    expression = low_level["api_configs"]["tactile_slot_expression"]
 
     assert low_level["task_config"] == "tactile_memory_match_composable_capx_demo"
     assert low_level["memory_overlay_enabled"] is True
@@ -436,26 +539,28 @@ def test_composable_demo_config_is_easy_gt_and_public_only() -> None:
         "begin_public_probe_segment",
         "end_public_probe_segment",
         "finalize_public_probe_capture",
-        "get_provisional_slot_expression",
+        "get_tactile_response_expression",
         "write_trial_memory",
         "read_trial_memory",
     }
-    assert expression["schema_version"] == "provisional_slot_expression.v0"
-    assert set(expression["slots"]) == {"weight", "roughness", "hardness"}
-    serialized = yaml.safe_dump(expression).lower()
+    assert tactile_api["tactile_response_expression_path"].endswith(
+        "task_config/tactile_response_expression.v1.json"
+    )
+    serialized = yaml.safe_dump(tactile_api).lower()
     for private_name in ("pose", "label", "density", "friction", "reward", "success"):
         assert private_name not in serialized
     assert "get_public_probe_spec" in env_factory["cfg"]["prompt"]
-    assert "tactile_probe.v3" in env_factory["cfg"]["prompt"]
-    assert "fused_distance" in env_factory["cfg"]["prompt"]
+    assert "tactile_probe.v4" in env_factory["cfg"]["prompt"]
+    assert "quality-weighted block rms" in env_factory["cfg"]["prompt"].lower()
+    assert "never transport" in env_factory["cfg"]["prompt"].lower()
 
 
-def test_public_probe_recorder_uses_task_v3_reducer_without_identity_logic() -> None:
+def test_public_probe_recorder_uses_task_v4_reducer_without_identity_logic() -> None:
     class _Task:
         def get_public_probe_spec(self):
             return {
-                "schema_version": "public_probe_spec.v1",
-                "protocol_id": "expert.v3",
+                "schema_version": "public_probe_spec.v2",
+                "protocol_id": "expert.v4",
                 "preload_steps": 2,
                 "lift_height": 0.01,
                 "hold_steps": 1,
@@ -474,7 +579,7 @@ def test_public_probe_recorder_uses_task_v3_reducer_without_identity_logic() -> 
             assert hold["frame_count"] == 1
             assert all(execution.values())
             return {
-                "schema_version": "tactile_probe.v3",
+                "schema_version": "tactile_probe.v4",
                 "object_name": "reference",
                 "quality": {"valid": True},
                 "preload": preload,
@@ -512,7 +617,7 @@ def test_public_probe_recorder_uses_task_v3_reducer_without_identity_logic() -> 
     )
 
     assert record["schema_version"] == "capx_public_probe_record.v1"
-    assert record["probe"]["schema_version"] == "tactile_probe.v3"
+    assert record["probe"]["schema_version"] == "tactile_probe.v4"
     assert record["frame_counts"] == {"preload": 2, "lift_motion": 1, "hold": 1}
     assert env.get_public_probe_records()[capture["capture_id"]] == record
     serialized = repr(record).lower()
@@ -558,7 +663,7 @@ def test_memory_match_probe_close_uses_task_public_spec_when_available() -> None
 
         def get_public_probe_spec(self):
             return {
-                "schema_version": "public_probe_spec.v1",
+                "schema_version": "public_probe_spec.v2",
                 "adaptive_close": True,
                 "close_target_force": 0.73,
                 "close_max_steps": 77,
@@ -744,7 +849,7 @@ def _load_memory_match_config(name: str) -> dict:
 
 
 def test_memory_match_configs_expose_only_bounded_api_surface() -> None:
-    expected_franka = {
+    historical_franka = {
         "get_object_pose",
         "sample_grasp_pose",
         "goto_pose",
@@ -754,7 +859,7 @@ def test_memory_match_configs_expose_only_bounded_api_surface() -> None:
         "close_gripper",
         "wait_steps",
     }
-    expected_tactile = {
+    historical_tactile = {
         "get_tactile_measurement_protocol",
         "capture_tactile_observation",
         "is_contacting",
@@ -776,8 +881,33 @@ def test_memory_match_configs_expose_only_bounded_api_surface() -> None:
         tactile = api_configs["univtac_tactile_api"]
 
         assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
-        assert set(franka["llm_visible_functions"]) == expected_franka
-        assert set(tactile["llm_visible_functions"]) == expected_tactile
+        if name == "tactile_memory_match_easy_sam_gt.yaml":
+            assert set(franka["llm_visible_functions"]) == {
+                "get_object_pose",
+                "sample_grasp_pose",
+                "goto_pose",
+                "move_delta",
+                "open_gripper",
+                "close_gripper",
+                "wait_steps",
+            }
+            assert set(tactile["llm_visible_functions"]) == {
+                "get_public_probe_spec",
+                "begin_public_probe_capture",
+                "begin_public_probe_segment",
+                "end_public_probe_segment",
+                "finalize_public_probe_capture",
+                "get_tactile_response_expression",
+                "is_contacting",
+                "is_slipping",
+                "is_grasp_stable",
+                "write_trial_memory",
+                "read_trial_memory",
+                "list_trial_memory",
+            }
+        else:
+            assert set(franka["llm_visible_functions"]) == historical_franka
+            assert set(tactile["llm_visible_functions"]) == historical_tactile
         assert franka["llm_api_profile"] == "tactile_memory_match"
         assert low_level["expose_actor_pose"] is False
         assert low_level["privileged"] is False
@@ -786,17 +916,30 @@ def test_memory_match_configs_expose_only_bounded_api_surface() -> None:
         assert "tactile_strategy_memory" not in config
 
         prompt = cfg["prompt"]
-        for required in (
-            "get_tactile_measurement_protocol()",
-            "probe(object_name)",
-            "capture_tactile_observation",
-            "trial_memory.v1",
-            "move_delta(dz=probe_lift_m)",
-            'close_gripper(mode="probe")',
-            'close_gripper(mode="transport")',
-            "horizontal transport",
-        ):
-            assert required in prompt
+        if name == "tactile_memory_match_easy_sam_gt.yaml":
+            for required in (
+                "get_public_probe_spec()",
+                "get_tactile_response_expression()",
+                "probe(object_name)",
+                "tactile_probe.v4",
+                "trial_memory.v1",
+                'close_gripper(mode="probe")',
+                "CAPX_SELECTION",
+            ):
+                assert required in prompt
+            assert "do not transport" in prompt.lower()
+        else:
+            for required in (
+                "get_tactile_measurement_protocol()",
+                "probe(object_name)",
+                "capture_tactile_observation",
+                "trial_memory.v1",
+                "move_delta(dz=probe_lift_m)",
+                'close_gripper(mode="probe")',
+                'close_gripper(mode="transport")',
+                "horizontal transport",
+            ):
+                assert required in prompt
         # The prompt can explicitly forbid a hidden API by name; the actual
         # executable namespace is enforced above by the YAML white lists.
         assert "raw tactile image" not in prompt.lower()
@@ -807,21 +950,20 @@ def test_easy_gt_memory_match_config_is_pose_private_and_sam_free() -> None:
     cfg = config["env"]["cfg"]
     low_level = cfg["low_level"]
     franka = low_level["api_configs"]["franka_control_api"]
-    protocol = low_level["api_configs"]["tactile_measurement_protocol"]
+    tactile = low_level["api_configs"]["univtac_tactile_api"]
 
     assert cfg["stream_user_code_output"] is False
     assert low_level["task_name"] == "tactile_memory_match"
-    assert low_level["task_config"] == "tactile_memory_match_demo"
+    assert low_level["task_config"] == "tactile_memory_match_composable_capx_demo"
     assert low_level["seed_base"] == 4001
     assert low_level["expose_actor_pose"] is False
     assert low_level["privileged"] is False
-    assert low_level["task_config_overrides"]["task_cfg_overrides"]["capx_easy_gt_enabled"] is True
     assert "api_servers" not in config
     assert franka["rgbd_perception_enabled"] is False
     assert franka["public_anchor_pose_enabled"] is True
-    assert franka["task_place_landmark_names"] == ["match_slot"]
-    assert franka["task_native_safe_placement"] is True
-    assert protocol["max_attempts_per_object"] == 1
+    assert "task_config/tactile_response_expression.v1.json" in tactile[
+        "tactile_response_expression_path"
+    ]
     assert config["tactile_memory"]["persistent"]["enabled"] is False
     assert "tactile_code_memory" not in config
     assert "tactile_strategy_memory" not in config

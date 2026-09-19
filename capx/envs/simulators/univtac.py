@@ -52,6 +52,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         live_preview_stride: int = 5,
         live_preview_jpeg_quality: int = 80,
         memory_overlay_enabled: bool = False,
+        selection_only_audit: bool = False,
         tactile_buffer_size: int = 500,
         lift_success_height_delta: float = 0.10,
         lift_success_require_contact: bool = True,
@@ -79,6 +80,7 @@ class UniVTACLowLevelEnv(BaseEnv):
             np.clip(int(live_preview_jpeg_quality), 1, 95)
         )
         self.memory_overlay_enabled = bool(memory_overlay_enabled)
+        self.selection_only_audit = bool(selection_only_audit)
         self._record_action_frames = True
         self._video_frame_stride = 1
         self._record_pre_move_frames = True
@@ -1027,8 +1029,8 @@ class UniVTACLowLevelEnv(BaseEnv):
                 f"task {self.task_name!r} does not expose a public tactile probe specification"
             )
         spec = getter()
-        if not isinstance(spec, dict) or spec.get("schema_version") != "public_probe_spec.v1":
-            raise RuntimeError("task returned an invalid public_probe_spec.v1 record")
+        if not isinstance(spec, dict) or spec.get("schema_version") != "public_probe_spec.v2":
+            raise RuntimeError("task returned an invalid public_probe_spec.v2 record")
         return _jsonable(spec)
 
     def begin_public_probe_capture(self, object_name: str) -> dict[str, Any]:
@@ -1077,7 +1079,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         }
 
     def end_public_probe_segment(self, capture_id: str, segment: str) -> dict[str, Any]:
-        """Stop one segment and aggregate it with the expert's v3 reducer."""
+        """Stop one segment and aggregate it with the expert's v4 reducer."""
         session = self._public_probe_session(capture_id)
         normalized = self._normalize_public_probe_segment(segment)
         if session["active_segment"] != normalized:
@@ -1104,7 +1106,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         capture_id: str,
         execution: dict[str, Any],
     ) -> dict[str, Any]:
-        """Return a canonical public ``tactile_probe.v3`` record.
+        """Return a canonical public ``tactile_probe.v4`` record.
 
         ``execution`` must report the caller's own approach, close, lift,
         lower, release, and clearance outcomes.  It changes probe quality but
@@ -1606,6 +1608,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         audit = {
             "schema_version": "capx_tactile_memory_oracle_audit.v1",
             "audit_stage": "post_execution_only",
+            "evaluation_mode": "selection_only" if self.selection_only_audit else "task_completion",
             "selected_candidate": selected,
             "true_match_candidate": true_match,
             "selection_correct": bool(selected is not None and selected == true_match),

@@ -1,3 +1,6 @@
+# Selection-only Easy-GT engineering smoke.  It validates that CaP-X can
+# execute the public probe, write trial memory and select a match.  Transport
+# is deliberately out of scope for this first response-memory integration.
 env:
   _target_: capx.envs.tasks.base.CodeExecutionEnvBase
   cfg:
@@ -5,54 +8,37 @@ env:
     stream_user_code_output: false
     low_level:
       _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
-      univtac_root: /mnt/sdc/ljz/UniVTAC
+      univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/sdc/ljz/UniVTAC}
       task_name: tactile_memory_match
-      task_config: tactile_memory_match_demo
-      # trial.py seeds trial 1 with 1, so this produces the fixed demo seed 4002.
+      task_config: tactile_memory_match_composable_capx_demo
+      # Trial 1 maps to the expert-verified fixed demo seed 4002. The class
+      # pair and left/right match assignment are never supplied to generated code.
       seed_base: 4001
       device: cuda:0
       live_preview_enabled: true
-      live_preview_path: ${oc.env:CAPX_LIVE_PREVIEW_PATH,/tmp/capx_latest_preview.jpg}
+      live_preview_path: ${oc.env:CAPX_LIVE_PREVIEW_PATH,/tmp/capx_tactile_response_preview.jpg}
       live_preview_stride: 5
-      live_preview_jpeg_quality: 80
+      live_preview_jpeg_quality: 85
+      memory_overlay_enabled: true
+      selection_only_audit: true
       task_config_overrides:
-        task_cfg_overrides:
-          capx_easy_gt_enabled: true
         record_video_during_reset: true
         record_action_frames: true
         video_frame_stride: 4
       api_configs:
         franka_control_api:
           llm_api_profile: tactile_memory_match
-          llm_visible_functions: [get_object_pose, sample_grasp_pose, goto_pose, move_delta, rotate_gripper, open_gripper, close_gripper, wait_steps]
+          llm_visible_functions: [get_object_pose, sample_grasp_pose, goto_pose, move_delta, open_gripper, close_gripper, wait_steps]
           local_delta_max_m: 0.02
           local_delta_segment_m: 0.002
-          local_yaw_max_rad: 0.18
-          local_yaw_segment_rad: 0.09
           local_wait_max_steps: 20
           profile_open_width: 1.0
           profile_open_max_steps: 120
-          transport_close_target_force: 0.82
-          transport_close_max_steps: 120
           min_safe_z: 0.035
           native_min_ee_z: 0.035
-          max_delta_xyz: 0.012
-          max_delta_rpy: 0.25
-          max_delta_gripper: 0.02
-          default_z_approach: 0.04
           gripper_settle_steps: 10
           use_native_pose_planner: true
           use_task_grasp_actor_for_objects: true
-          use_task_place_actor_for_landmarks: true
-          task_place_landmark_names: [match_slot]
-          task_native_safe_placement: true
-          grasp_xy_tolerance: 0.08
-          grasp_z_tolerance: 0.04
-          grasp_pre_dis: 0.04
-          grasp_dis: 0.0
-          grasp_height: 0.04
-          placement_xy_tolerance: 0.08
-          placement_time_dilation_factor: 0.5
           public_anchor_pose_enabled: true
           public_grasp_anchor_objects: [reference_object, candidate_left, candidate_right]
           public_pose_fallback_objects: [reference_object, candidate_left, candidate_right, match_slot]
@@ -61,13 +47,10 @@ env:
           rgbd_pose_enabled: false
           rgbd_grasp_enabled: false
           max_goto_pose_actions: 90
-          max_home_pose_actions: 20
           max_native_pose_actions: 2
           max_gripper_servo_steps: 120
           min_open_gripper_servo_steps: 80
           max_gripper_settle_steps: 20
-          goto_pose_tactile_guard_force_threshold: 0.45
-          goto_pose_tactile_guard_slip_threshold: 0.45
           tactile_adaptive_gripper_enabled: true
           adaptive_gripper:
             coarse_qpos_step: 0.0005
@@ -86,39 +69,32 @@ env:
             post_squeeze_steps: 4
             hold_steps: 8
           object_pose_names:
-            reference: reference_object
             reference_object: reference_object
             candidate_left: candidate_left
             candidate_right: candidate_right
             match_slot: match_slot
-            target_slot: match_slot
-            slot: match_slot
         univtac_tactile_api:
-          llm_visible_functions: [get_tactile_measurement_protocol, capture_tactile_observation, is_contacting, is_slipping, is_grasp_stable, write_trial_memory, read_trial_memory]
-        tactile_measurement_protocol:
-          capture_window: 20
-          settle_steps: 10
-          close_target_force: 0.82
-          close_max_steps: 120
-          probe_lift_m: 0.018
-          probe_hold_steps: 10
-          max_attempts_per_object: 1
-          adaptive_close: true
+          llm_visible_functions: [get_public_probe_spec, begin_public_probe_capture, begin_public_probe_segment, end_public_probe_segment, finalize_public_probe_capture, get_tactile_response_expression, is_contacting, is_slipping, is_grasp_stable, write_trial_memory, read_trial_memory, list_trial_memory]
+          # Generate this file with UniVTAC/tools/build_tactile_response_expression.py
+          # from public v4 development trajectories before launching CaP-X.
+          tactile_response_expression_path: ${oc.env:CAPX_TACTILE_RESPONSE_EXPRESSION,task_config/tactile_response_expression.v1.json}
       expose_actor_pose: false
       privileged: false
       enable_render: true
     privileged: false
     apis: [FrankaControlApi, UniVTACTactileApi]
     prompt: |
-      You control the fixed-seed UniVTAC tactile_memory_match Easy-GT smoke. get_object_pose(name) uses only the configured public reset anchor. The hidden matching identity must be decided only from tactile measurements; never read metadata, labels, density, friction, hardness, reward, success, private task state, or low-level environment objects. Vision may only validate grasp following, rotation, drop, and release.
+      You control a UniVTAC tactile-memory response selection smoke. Public reset anchors are allowed only for coarse side-grasp motion. The hidden matching identity must be decided only from public tactile_probe.v4 records and the read-only tactile_response_expression.v1. Never read metadata, labels, density, friction, hardness, reward, success, actor state, private task fields, or direct environment objects. This is an engineering selection demo, not a cross-task generalization claim.
 
-      Call get_tactile_measurement_protocol() once. Save the unchanged record as trial_memory.v1 state key probe_spec. Define one reusable probe(object_name) helper and call it exactly in order: reference_object, candidate_left, candidate_right. For every object use the same chain: open_gripper(); sample_grasp_pose(object_name); goto_pose(sampled_position, sampled_quaternion); close_gripper(mode="probe"); wait for the protocol settling duration; require is_grasp_stable(); call capture_tactile_observation() for static evidence; move_delta(dz=probe_lift_m); wait for the protocol hold duration; require stable non-slipping contact; call capture_tactile_observation() for dynamic evidence; move_delta(dz=-probe_lift_m); open_gripper(); verify release with is_contacting(). Do not use get_robot_state, global coordinates, direct environment access, or low-level motion APIs. The sampled next grasp pose supplies clearance before each new object.
+      Call get_public_probe_spec() and get_tactile_response_expression() once. Save both unchanged as trial_memory.v1 state records named probe_spec and response_expression. The public probe spec owns all action/timing/quality values. Define exactly one probe(object_name) helper and call it in this order: reference_object, candidate_left, candidate_right. Reuse the unchanged spec for every object.
 
-      Write one valid trial_memory.v1 evidence record per object. Static evidence is bilateral depth_mm, marker_displacement_px, and marker_coherence. Dynamic evidence is the same bilateral values at lift minus static, with capture IDs, the unchanged probe_spec, validity, and provenance. If close, lift, or release is invalid, print CAPX_FAILURE reason=insufficient_tactile_evidence and stop without guessing.
+      Each probe must execute the standard public chain itself: open_gripper; sample_grasp_pose(object_name); goto_pose the sampled pose; begin_public_probe_capture(object_name); close_gripper(mode="probe"); require stable bilateral tactile contact. Record preload by beginning its segment, waiting exactly probe_spec preload_steps, and ending it. Record lift_motion by beginning its segment, moving exactly probe_spec lift_height, and ending it. Record hold by beginning its segment, waiting exactly probe_spec hold_steps, and ending it. Require stable non-slipping bilateral contact through lift and hold. Lower by the exact negative lift height, wait exactly lower_settle_steps, open, verify release, and let the next sampled side-grasp route provide clearance. Finalize with all public execution flags. If any action or quality gate fails, print CAPX_FAILURE reason=insufficient_tactile_evidence and stop without guessing.
 
-      After all evidence exists, read the known reference_object, candidate_left, and candidate_right records. Compute normalized static and dynamic RMS distances with each feature scaled by the two candidate-reference differences, fuse them equally, select only the lower-score candidate, and write a selection decision containing both scores, margin, features, rule, confidence, rationale, and provenance.
+      For each valid probe, write trial_memory.v1 evidence under evidence_reference, evidence_candidate_left, or evidence_candidate_right. Store the complete tactile_probe.v4, response block vectors extracted only from response_expression fields, block quality, capture provenance, and validity. Apply each declared field transform before comparing; expression scalers are fixed Median/IQR values and must not be refit from this trial.
 
-      Final transport is independent: sample_grasp_pose(selected); goto_pose; close_gripper(mode="transport"); require is_grasp_stable(); get_object_pose("match_slot"); goto_pose(slot_position, slot_quaternion); open_gripper(); verify release; print CAPX_SUCCESS. The adapter exclusively executes the expert-aligned clearance lift, horizontal transport, and vertical descent for the public slot. Use move_delta only for local probe lift/return, clearance, or tactile adjustment. If transport contact weakens, slips, rotates, or drops, print CAPX_FAILURE and stop. Return concise executable Python only.
+      Read all three evidence records and calculate the fixed response comparison in code. For each response block, use RMS((reference-candidate)/iqr). Derive each object block confidence from the declared bilateral-contact sections and declared public SNR paths; candidate confidence is the minimum of reference and candidate block confidence. Fuse only positive-confidence blocks with the expression's quality-weighted block-RMS rule. Write a trial_memory.v1 decision record named selection containing per-block left/right distances and confidence, fused score_left, score_right, score_margin, selected_candidate, rule version, and rationale. Select the lower fused score, print CAPX_SELECTION, and finish immediately.
+
+      Do not transport a candidate, do not call get_object_pose("match_slot"), and do not print CAPX_SUCCESS. This run measures public probe execution and trial-local memory selection only. Return concise executable Python only.
     multi_turn_prompt: |
       Executed code:
       {executed_code}
@@ -129,14 +105,14 @@ env:
       Console stderr:
       {console_stderr}
 
-      This is failure-only recovery. Preserve simulator state and the injected public trial-memory snapshot. Read only known keys probe_spec, evidence_reference_object, evidence_candidate_left, evidence_candidate_right, and selection as needed. Never replay valid probes, invent a new protocol, use private data, or call hidden APIs. If final transport lost contact, regenerate only a concise transport-mode regrasp-or-stop continuation using sample_grasp_pose, goto_pose, close_gripper(mode="transport"), get_object_pose("match_slot"), and goto_pose. After verified final release, print CAPX_SUCCESS and finish without extra motion.
+      This is failure-only recovery. Preserve simulator state and the injected agent-authored trial memory. Do not replay a valid probe, change the response expression, use private data, or add transport. Continue only with the first incomplete public probe, or print CAPX_FAILURE and finish.
 trials: 1
 num_workers: 1
 record_video: true
-output_dir: ./outputs/univtac_tactile_memory_match_easy_gt
-trial_timeout_seconds: 1500
+output_dir: ./outputs/univtac_tactile_response_selection
+trial_timeout_seconds: 1200
 max_trial_retries: 1
-max_regenerations: 2
+max_regenerations: 1
 save_multiturn_prompts: true
 split_code_blocks_on_breakpoint: true
 multi_turn_on_failure_only: true

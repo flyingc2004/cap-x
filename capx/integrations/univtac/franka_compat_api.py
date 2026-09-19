@@ -555,7 +555,7 @@ class UniVTACFrankaCompatApi(ApiBase):
                 task_spec = None
             if (
                 isinstance(task_spec, dict)
-                and task_spec.get("schema_version") == "public_probe_spec.v1"
+                and task_spec.get("schema_version") == "public_probe_spec.v2"
                 and "close_target_force" in task_spec
                 and "close_max_steps" in task_spec
             ):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -71,6 +72,7 @@ class UniVTACTactileApi(ApiBase):
             "end_public_probe_segment": self.end_public_probe_segment,
             "finalize_public_probe_capture": self.finalize_public_probe_capture,
             "get_provisional_slot_expression": self.get_provisional_slot_expression,
+            "get_tactile_response_expression": self.get_tactile_response_expression,
             "capture_tactile_observation": self.capture_tactile_observation,
             "write_trial_memory": self.write_trial_memory,
             "read_trial_memory": self.read_trial_memory,
@@ -335,8 +337,8 @@ class UniVTACTactileApi(ApiBase):
         if not callable(getter):
             raise RuntimeError("the active environment does not expose a public probe spec")
         spec = getter()
-        if not isinstance(spec, dict) or spec.get("schema_version") != "public_probe_spec.v1":
-            raise RuntimeError("environment returned an invalid public_probe_spec.v1 record")
+        if not isinstance(spec, dict) or spec.get("schema_version") != "public_probe_spec.v2":
+            raise RuntimeError("environment returned an invalid public_probe_spec.v2 record")
         normalized = _jsonable(spec)
         self._append_working_memory_trace("public_probe_spec", {"spec": normalized})
         return normalized
@@ -367,7 +369,7 @@ class UniVTACTactileApi(ApiBase):
         return result
 
     def end_public_probe_segment(self, capture_id: str, segment: str) -> dict:
-        """Stop and aggregate a public probe segment using the expert v3 reducer."""
+        """Stop and aggregate a public probe segment using the expert v4 reducer."""
         end = getattr(self._env, "end_public_probe_segment", None)
         if not callable(end):
             raise RuntimeError("the active environment does not support public probe segments")
@@ -376,7 +378,7 @@ class UniVTACTactileApi(ApiBase):
         return result
 
     def finalize_public_probe_capture(self, capture_id: str, execution: dict) -> dict:
-        """Build a public ``tactile_probe.v3`` record from agent-owned motion.
+        """Build a public ``tactile_probe.v4`` record from agent-owned motion.
 
         ``execution`` reports only public action outcomes: ``approach_ok``,
         ``close_ok``, ``bilateral_gate``, ``lift_ok``, ``lower_ok``,
@@ -401,6 +403,52 @@ class UniVTACTactileApi(ApiBase):
             raise RuntimeError("no provisional_slot_expression.v0 is configured")
         expression = _jsonable(source)
         self._append_working_memory_trace("slot_expression", {"expression": expression})
+        return expression
+
+    def get_tactile_response_expression(self) -> dict:
+        """Return the read-only public tactile response expression.
+
+        The expression is a frozen protocol/sensor-local normalizer.  It names
+        public ``tactile_probe.v4`` feature paths, their transforms and Median/
+        IQR scales, plus a fixed quality-weighted block-RMS comparison rule.
+        It does not create a memory record, compute a distance, choose a
+        candidate, or contain hidden object properties.
+
+        Configure either ``tactile_response_expression`` directly or
+        ``tactile_response_expression_path``.  Relative paths are resolved
+        against the configured UniVTAC root so the same public sidecar can be
+        loaded by other model integrations.
+        """
+        source = self._runtime_config().get("tactile_response_expression")
+        path_value = self._runtime_config().get("tactile_response_expression_path")
+        if source is None and isinstance(path_value, str) and path_value.strip():
+            path = Path(path_value).expanduser()
+            if not path.is_absolute():
+                root = Path(getattr(self._env, "univtac_root", Path.cwd()))
+                path = root / path
+            try:
+                source = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"could not load tactile response expression from {path}: {exc}") from exc
+        if not isinstance(source, dict) or source.get("schema_version") != "tactile_response_expression.v1":
+            raise RuntimeError("no tactile_response_expression.v1 is configured")
+        if source.get("public_probe_schema_version") != "tactile_probe.v4":
+            raise RuntimeError("tactile response expression must target tactile_probe.v4")
+        _validate_tactile_response_expression(source)
+        protocol_id = source.get("protocol_id")
+        if not isinstance(protocol_id, str) or not protocol_id:
+            raise RuntimeError("tactile response expression is missing its public probe protocol_id")
+        get_probe_spec = getattr(self._env, "get_public_probe_spec", None)
+        if callable(get_probe_spec):
+            active_spec = get_probe_spec()
+            if isinstance(active_spec, dict):
+                active_protocol_id = active_spec.get("protocol_id")
+                if isinstance(active_protocol_id, str) and active_protocol_id != protocol_id:
+                    raise RuntimeError(
+                        "tactile response expression protocol_id does not match the active public probe"
+                    )
+        expression = _jsonable(source)
+        self._append_working_memory_trace("response_expression", {"expression": expression})
         return expression
 
     def capture_tactile_observation(self, window: int = 20) -> dict:
@@ -856,6 +904,56 @@ def _compact_marker_motion(marker_motion: dict[str, Any]) -> dict[str, Any]:
         "right_marker_coherence",
     ]
     return _jsonable({key: marker_motion.get(key) for key in fields if key in marker_motion})
+
+
+def _validate_tactile_response_expression(source: dict[str, Any]) -> None:
+    """Reject malformed or non-public fields before exposing an expression."""
+    blocks = source.get("response_blocks")
+    if not isinstance(blocks, list) or not blocks:
+        raise RuntimeError("tactile response expression must contain response_blocks")
+    forbidden = {
+        "actor",
+        "class",
+        "density",
+        "friction",
+        "hardness",
+        "label",
+        "metadata",
+        "pose",
+        "reward",
+        "success",
+    }
+    valid_prefixes = ("preload.", "lift_motion.", "lift_minus_preload.")
+    for block in blocks:
+        if not isinstance(block, dict) or not isinstance(block.get("name"), str):
+            raise RuntimeError("each tactile response block must have a string name")
+        fields = block.get("fields")
+        if not isinstance(fields, list) or not fields:
+            raise RuntimeError(f"response block {block.get('name')!r} must contain fields")
+        scaler = block.get("scaler")
+        if not isinstance(scaler, dict):
+            raise RuntimeError(f"response block {block['name']!r} is missing a scaler")
+        median, iqr = scaler.get("median"), scaler.get("iqr")
+        if not isinstance(median, list) or not isinstance(iqr, list) or len(median) != len(fields) or len(iqr) != len(fields):
+            raise RuntimeError(f"response block {block['name']!r} has incompatible scaler dimensions")
+        if not np.isfinite(np.asarray(median, dtype=np.float64)).all() or np.any(np.asarray(iqr, dtype=np.float64) <= 0.0):
+            raise RuntimeError(f"response block {block['name']!r} has an invalid scaler")
+        for field in fields:
+            if not isinstance(field, dict):
+                raise RuntimeError(f"response block {block['name']!r} has a non-object field")
+            path = field.get("path")
+            if not isinstance(path, str) or not path.startswith(valid_prefixes):
+                raise RuntimeError(f"response block {block['name']!r} has a non-public field path")
+            if forbidden.intersection(path.lower().split(".")):
+                raise RuntimeError(f"response block {block['name']!r} contains a private field path")
+            if field.get("transform", "identity") not in {"identity", "log"}:
+                raise RuntimeError(f"response block {block['name']!r} has an unsupported field transform")
+            snr_paths = field.get("snr_paths")
+            if not isinstance(snr_paths, list) or not snr_paths or not all(
+                isinstance(item, str) and item.startswith(("preload.noise.", "lift_motion.noise."))
+                for item in snr_paths
+            ):
+                raise RuntimeError(f"response block {block['name']!r} has invalid public SNR paths")
 
 
 def _jsonable(value: Any) -> Any:
