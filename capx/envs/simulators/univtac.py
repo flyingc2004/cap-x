@@ -41,6 +41,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         seed_base: int = 0,
         device: str | None = None,
         task_config_overrides: dict[str, Any] | None = None,
+        task_cfg_overrides: dict[str, Any] | None = None,
+        public_entities: dict[str, Any] | None = None,
         api_configs: dict[str, Any] | None = None,
         expose_actor_pose: bool = True,
         max_steps: int | None = None,
@@ -65,6 +67,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         self.seed_base = int(seed_base)
         self.device_override = device
         self.task_config_overrides = dict(task_config_overrides or {})
+        self.task_cfg_overrides = dict(task_cfg_overrides or {})
+        self.public_entities = self._normalize_public_entities(public_entities)
         self.api_configs = api_configs or {}
         self.expose_actor_pose = bool(expose_actor_pose)
         self.max_steps = int(max_steps) if max_steps is not None else 999999
@@ -729,6 +733,13 @@ class UniVTACLowLevelEnv(BaseEnv):
                 np.asarray(quat, dtype=np.float32).reshape(4),
             )
 
+        configured = self._configured_public_grasp_pose(
+            object_name,
+            grasp_height=float(grasp_height),
+        )
+        if configured is not None:
+            return configured
+
         actor = self._public_grasp_actor(object_name)
         if actor is None:
             raise KeyError(f"public grasp object '{object_name}' is not available")
@@ -1357,6 +1368,7 @@ class UniVTACLowLevelEnv(BaseEnv):
 
         task_module = importlib.import_module(f"envs.{self.task_name}")
         env_cfg = task_module.TaskCfg()
+        self._apply_task_cfg_overrides(env_cfg)
         env_cfg.save_dir = (
             Path(self._task_config.get("save_dir", "./data"))
             / self.task_name
@@ -1394,6 +1406,24 @@ class UniVTACLowLevelEnv(BaseEnv):
             self._task_config.get("official_task_protocol", False)
         )
         self._install_task_runtime_patches()
+
+    def _apply_task_cfg_overrides(self, env_cfg: Any) -> None:
+        """Apply explicit task settings without accepting arbitrary task state.
+
+        ``task_config_overrides`` changes the shared collection YAML.  This
+        separate mapping is deliberately narrower: it can only update declared
+        ``TaskCfg`` attributes such as randomized layout switches.  It cannot
+        add private task fields or monkeypatch task behavior.
+        """
+        for name, value in self.task_cfg_overrides.items():
+            if not isinstance(name, str) or not name or name.startswith("_"):
+                raise ValueError("task_cfg_overrides keys must be public TaskCfg attribute names")
+            if not hasattr(env_cfg, name):
+                raise ValueError(
+                    f"task_cfg_overrides contains unknown TaskCfg field {name!r} "
+                    f"for task {self.task_name!r}"
+                )
+            setattr(env_cfg, name, value)
 
     def _task_config_path(self) -> Path:
         path = Path(self.task_config_name)
@@ -1862,6 +1892,164 @@ class UniVTACLowLevelEnv(BaseEnv):
                     flush=True,
                 )
 
+    @staticmethod
+    def _normalize_public_entities(raw: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+        """Normalize YAML-declared public entities without consulting task state."""
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise ValueError("public_entities must be a mapping of public names to specs")
+
+        entities: dict[str, dict[str, Any]] = {}
+        for name, spec in raw.items():
+            normalized = str(name).strip().lower().replace(" ", "_")
+            if not normalized:
+                raise ValueError("public_entities names must not be empty")
+            if not isinstance(spec, dict):
+                raise ValueError(f"public entity {name!r} must be a mapping")
+            entities[normalized] = dict(spec)
+        return entities
+
+    def _public_entity_spec(self, name: str) -> dict[str, Any] | None:
+        key = str(name).strip().lower().replace(" ", "_")
+        return self.public_entities.get(key)
+
+    def _task_actor_from_path(self, path: str) -> Any | None:
+        """Resolve a YAML actor path internally for an explicitly Easy anchor.
+
+        This helper is intentionally not part of the LLM API.  Hard
+        configurations declare static regions or RGB-D routes instead, so they
+        never use a live actor pose through this path.
+        """
+        current: Any = self._task
+        for part in str(path).split("."):
+            if not part:
+                return None
+            if isinstance(current, dict):
+                current = current.get(part)
+            else:
+                current = getattr(current, part, None)
+            if current is None:
+                return None
+        return current if callable(getattr(current, "get_pose", None)) else None
+
+    def _public_entity_actor(self, name: str) -> Any | None:
+        spec = self._public_entity_spec(name)
+        if spec is None:
+            return None
+
+        raw_paths = spec.get("actor_paths", spec.get("actors"))
+        if raw_paths is None:
+            raw_paths = [spec.get("actor_path", spec.get("actor"))]
+        elif isinstance(raw_paths, str):
+            raw_paths = [raw_paths]
+        if not isinstance(raw_paths, (list, tuple)):
+            return None
+
+        candidates: list[tuple[str, Any]] = []
+        for raw_path in raw_paths:
+            if not isinstance(raw_path, str) or not raw_path:
+                continue
+            actor = self._task_actor_from_path(raw_path)
+            if actor is not None:
+                candidates.append((raw_path, actor))
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0][1]
+
+        axis_name = str(spec.get("selector_axis", "y")).lower()
+        axis = {"x": 0, "y": 1, "z": 2}.get(axis_name)
+        if axis is None:
+            raise ValueError(f"public entity {name!r} selector_axis must be x, y, or z")
+        ranked: list[tuple[float, Any]] = []
+        for _path, actor in candidates:
+            try:
+                coordinate = float(np.asarray(actor.get_pose().p, dtype=np.float32).reshape(3)[axis])
+            except Exception:
+                continue
+            ranked.append((coordinate, actor))
+        if not ranked:
+            return None
+        order = str(spec.get("selector_order", "min")).lower()
+        if order not in {"min", "max"}:
+            raise ValueError(f"public entity {name!r} selector_order must be min or max")
+        return sorted(ranked, key=lambda item: item[0], reverse=order == "max")[0][1]
+
+    def _public_entity_pose_record(
+        self,
+        name: str,
+        spec: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        source = str(spec.get("source", "public_entity"))
+        static_position = spec.get("position")
+        if static_position is not None:
+            return self._public_pose_entry_to_record(
+                {
+                    "position": static_position,
+                    "quaternion_wxyz": spec.get("quaternion_wxyz", [1.0, 0.0, 0.0, 0.0]),
+                    "extent": spec.get("extent"),
+                    "source": source,
+                },
+                name=name,
+                source="public_static_region",
+            )
+
+        actor = self._public_entity_actor(name)
+        if actor is None:
+            return None
+        try:
+            pose = actor.get_pose()
+        except Exception:
+            return None
+        extent = np.asarray(
+            spec.get("extent", self._estimate_extent_from_public_pose_name(name)),
+            dtype=np.float32,
+        ).reshape(3)
+        return self._pose_to_public_record(
+            pose,
+            extent=extent,
+            source=source,
+        )
+
+    def _configured_public_grasp_pose(
+        self,
+        name: str,
+        *,
+        grasp_height: float,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        spec = self._public_entity_spec(name)
+        if spec is None:
+            return None
+
+        raw_pose = spec.get("grasp_pose")
+        if isinstance(raw_pose, dict):
+            raw_position = raw_pose.get("position")
+            raw_quaternion = raw_pose.get("quaternion_wxyz", raw_pose.get("quaternion"))
+        elif isinstance(raw_pose, (list, tuple)) and len(raw_pose) >= 2:
+            raw_position, raw_quaternion = raw_pose[0], raw_pose[1]
+        else:
+            raw_position = raw_quaternion = None
+        if raw_position is not None and raw_quaternion is not None:
+            try:
+                position = np.asarray(raw_position, dtype=np.float32).reshape(3)
+                quaternion = np.asarray(raw_quaternion, dtype=np.float32).reshape(4)
+            except Exception as exc:
+                raise ValueError(f"public entity {name!r} has invalid grasp_pose") from exc
+            if np.all(np.isfinite(position)) and np.all(np.isfinite(quaternion)):
+                return position, quaternion
+            raise ValueError(f"public entity {name!r} grasp_pose must be finite")
+
+        actor = self._public_entity_actor(name)
+        if actor is None:
+            return None
+        configured_height = float(spec.get("grasp_height", grasp_height))
+        pose = self._make_public_grasp_pose(name, actor, grasp_height=configured_height)
+        return (
+            np.asarray(pose.p, dtype=np.float32).reshape(3),
+            np.asarray(pose.q, dtype=np.float32).reshape(4),
+        )
+
     def _refresh_public_pose_cache(self) -> None:
         """Cache only task-declared public anchors and slots for LLM APIs."""
         self._public_pose_cache.clear()
@@ -1941,6 +2129,14 @@ class UniVTACLowLevelEnv(BaseEnv):
                 )
                 if parsed is not None:
                     self._public_pose_cache[role] = parsed
+
+        # Explicit YAML entities are the only adapter-owned anchors.  They
+        # support engineering Easy configurations and fixed public search
+        # regions, while Hard configurations simply omit live actor entries.
+        for name, spec in self.public_entities.items():
+            parsed = self._public_entity_pose_record(name, spec)
+            if parsed is not None:
+                self._public_pose_cache[name] = parsed
 
         self._install_public_pose_aliases()
 
@@ -2251,6 +2447,10 @@ class UniVTACLowLevelEnv(BaseEnv):
             )
 
     def _public_grasp_actor(self, object_name: str):
+        configured = self._public_entity_actor(object_name)
+        if configured is not None:
+            return configured
+
         task_actor = getattr(self._task, "get_public_grasp_actor", None)
         if callable(task_actor):
             actor = task_actor(object_name)

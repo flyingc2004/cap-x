@@ -1,0 +1,114 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/ViTaForge
+      task_name: can_empty_select
+      task_config: gelsight.yml
+      seed_base: 0
+      device: cuda:0
+      task_cfg_overrides:
+        empty_can: random
+      task_config_overrides:
+        observations:
+          camera: [rgb, depth]
+          tactile: [rgb, rgb_marker, marker, depth, pose]
+          embodiment: [joint, ee]
+          actor: false
+        reset_time_limit: 900
+        step_lim: 400
+        record_action_frames: true
+        record_pre_move_frames: true
+      public_entities:
+        basket_drop:
+          source: public_task_target
+          position: [0.50, -0.20, 0.172]
+          quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+          extent: [0.13, 0.13, 0.18]
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.10
+          default_z_approach: 0.08
+          release_hover_height: 0.10
+          preserve_landmark_orientation: true
+          use_task_grasp_actor_for_objects: false
+          use_task_place_actor_for_landmarks: false
+          public_anchor_pose_enabled: true
+          public_grasp_anchor_objects: []
+          rgbd_perception_enabled: true
+          rgbd_pose_enabled: true
+          rgbd_grasp_enabled: true
+          rgbd_pose_objects: [can_near, can_far]
+          rgbd_grasp_objects: [can_near, can_far]
+          perception_camera: head
+          perception_prompt_map:
+            can_near: [aluminum beverage can]
+            can_far: [aluminum beverage can]
+          perception_prompt_fallbacks:
+            can_near: [can]
+            can_far: [can]
+          perception_selector_map:
+            can_near: world_y_min
+            can_far: world_y_max
+          perception_retry_attempts: 1
+          sam3_service_url: http://127.0.0.1:8114
+          graspnet_service_url: http://127.0.0.1:8115
+          adaptive_gripper:
+            contact_force_threshold: 0.08
+            contact_balance_threshold: 0.45
+            depth_contact_margin_mm: 0.5
+            target_depth_delta_mm: 4.0
+            min_stable_contact_area: 0.006
+            post_squeeze_qpos: 0.0001
+            post_squeeze_steps: 3
+            hold_steps: 6
+          object_pose_names:
+            near can: can_near
+            can_near: can_near
+            far can: can_far
+            can_far: can_far
+            basket: basket_drop
+            basket_drop: basket_drop
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis: [FrankaControlApi, UniVTACTactileApi]
+    prompt: |
+      You control a Franka robot in VitaForge. Identify the empty beverage can by touch and place only it in the basket.
+
+      This is the non-privileged Hard-SAM configuration. Locate can_near and can_far with get_object_pose(..., source="rgbd") and sample_grasp_pose(...); their names refer only to world-y order. The basket_drop landmark is public task geometry. Do not use actor anchors, brand names, metadata, reward, success, density, friction, or private task fields.
+
+      Call get_tactile_measurement_protocol once and persist it unchanged as probe_spec. Probe can_near then can_far with exactly the same adaptive close, bilateral static capture, short lift/hold dynamic capture, lower, release, and clearance procedure. Invalid bilateral evidence may use one identical retry only; otherwise stop without guessing.
+
+      Use agent-owned trial memory to select the empty/light can from bilateral depth, marker displacement, marker coherence, and dynamic changes. Write a decision containing the selected candidate, feature rule, scores, margin, rationale, and provenance. RGB-D can locate a can or verify a drop, but cannot decide which can is empty.
+
+      Independently regrasp only the selected can, require fresh stable bilateral tactile contact, transport horizontally above basket_drop, descend, release, verify release, and retreat.
+    multi_turn_prompt: |
+      This is failure-only recovery. Preserve all valid trial memory and regenerate only the unfinished bounded stage. Never replace a failed RGB-D estimate with an actor anchor or turn incomplete evidence into a guessed selection.
+api_servers:
+  - _target_: capx.serving.launch_sam3_server.main
+    device: cuda
+    port: 8114
+    host: 127.0.0.1
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/vitaforge_can_empty_select_hard_sam
+trial_timeout_seconds: 900
+max_trial_retries: 1
+max_regenerations: 6
+split_code_blocks_on_breakpoint: true
+multi_turn_on_failure_only: true
+filter_multiturn_console: true
+multiturn_console_max_lines: 30
+multiturn_console_max_chars: 4000
+tactile_memory:
+  trial:
+    enabled: true
+    include_in_multiturn: true
+    max_context_chars: 4000
+  persistent:
+    enabled: false

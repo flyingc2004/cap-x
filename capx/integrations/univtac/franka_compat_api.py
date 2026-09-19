@@ -2001,25 +2001,27 @@ class UniVTACFrankaCompatApi(ApiBase):
         pos = np.asarray(position, dtype=np.float32).reshape(3)
         best: tuple[str, np.ndarray] | None = None
         best_dist = float("inf")
+        legacy_keys = {
+            "prism",
+            "can",
+            "object_a",
+            "object_b",
+            "current_object",
+            "reference",
+            "reference_object",
+            "candidate_left",
+            "candidate_right",
+            "left_candidate",
+            "right_candidate",
+            "candidate_1",
+            "candidate_2",
+        }
+        configured_keys = self.public_grasp_anchor_objects
         candidate_keys = [
             key
             for key in self._public_landmarks()
-            if key
-            in {
-                "prism",
-                "can",
-                "object_a",
-                "object_b",
-                "current_object",
-                "reference",
-                "reference_object",
-                "candidate_left",
-                "candidate_right",
-                "left_candidate",
-                "right_candidate",
-                "candidate_1",
-                "candidate_2",
-            }
+            if key in legacy_keys
+            or (configured_keys is not None and key in configured_keys)
         ]
         for key in candidate_keys:
             sampled = self._public_grasp_pose(key)

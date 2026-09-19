@@ -1,0 +1,88 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/ViTaForge
+      task_name: place_cube_on_colored_area
+      task_config: gelsight.yml
+      seed_base: 0
+      device: cuda:0
+      task_config_overrides:
+        observations:
+          camera: [rgb, depth]
+          tactile: [rgb, rgb_marker, marker, depth, pose]
+          embodiment: [joint, ee]
+          actor: false
+        reset_time_limit: 900
+        step_lim: 300
+        record_action_frames: true
+        record_pre_move_frames: true
+      public_entities:
+        cube:
+          source: easy_actor_anchor
+          actor: wooden_cube
+          extent: [0.03, 0.03, 0.03]
+          grasp_height: 0.015
+        target_area:
+          source: easy_actor_anchor
+          actor: target_area
+          extent: [0.09, 0.09, 0.01]
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.08
+          default_z_approach: 0.06
+          release_hover_height: 0.08
+          preserve_landmark_orientation: true
+          use_task_grasp_actor_for_objects: true
+          use_task_place_actor_for_landmarks: false
+          public_anchor_pose_enabled: true
+          public_grasp_anchor_objects: [cube]
+          rgbd_perception_enabled: false
+          adaptive_gripper:
+            contact_force_threshold: 0.08
+            contact_balance_threshold: 0.45
+            depth_contact_margin_mm: 0.5
+            target_depth_delta_mm: 4.0
+            min_stable_contact_area: 0.006
+            post_squeeze_qpos: 0.0001
+            post_squeeze_steps: 3
+            hold_steps: 6
+          object_pose_names:
+            cube: cube
+            red cube: cube
+            target area: target_area
+            target_area: target_area
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis: [FrankaControlApi, UniVTACTactileApi]
+    prompt: |
+      You control a Franka robot in VitaForge. Place the red cube on the instructed colored target area.
+
+      This is an Easy-GT engineering configuration. Use get_object_pose("cube", source="anchor") and get_object_pose("target_area", source="anchor") only for public coarse geometry. Use sample_grasp_pose("cube") before the approach. Do not read actor state, task metadata, reward, success, or private task fields.
+
+      Use a short bounded chain: approach the cube, adaptive close, confirm bilateral tactile contact and low slip, lift only to safe clearance, transport horizontally above target_area, descend, open, verify tactile release, and retreat. If stable bilateral contact is absent after one bounded retry, stop rather than searching indefinitely. Vision may verify that the cube follows the gripper and is released, but not replace tactile grasp validation.
+
+      Use only FrankaControlApi and UniVTACTactileApi. Do not call low-level motion functions or task policies. Print CAPX_FAILURE before a failed return and CAPX_SUCCESS only after release verification.
+    multi_turn_prompt: |
+      This is failure-only recovery. Read the latest CAPX_FAILURE and retain a completed stable grasp or confirmed release. Regenerate only the unfinished bounded stage. Do not retry a completed placement or use private state.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/vitaforge_place_cube_on_colored_area_easy_gt
+trial_timeout_seconds: 600
+max_trial_retries: 1
+max_regenerations: 4
+filter_multiturn_console: true
+multiturn_console_max_lines: 25
+multiturn_console_max_chars: 3500
+tactile_memory:
+  trial:
+    enabled: false
+    include_in_multiturn: false
+    max_context_chars: 0
+  persistent:
+    enabled: false

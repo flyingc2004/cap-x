@@ -1,0 +1,106 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/ViTaForge
+      task_name: can_empty_select
+      task_config: gelsight.yml
+      seed_base: 0
+      device: cuda:0
+      task_cfg_overrides:
+        empty_can: random
+      task_config_overrides:
+        observations:
+          camera: [rgb, depth]
+          tactile: [rgb, rgb_marker, marker, depth, pose]
+          embodiment: [joint, ee]
+          actor: false
+        reset_time_limit: 900
+        step_lim: 400
+        record_action_frames: true
+        record_pre_move_frames: true
+      public_entities:
+        can_near:
+          source: easy_actor_anchor
+          actor_paths: [active_cans.fanta, active_cans.pepsi]
+          selector_axis: y
+          selector_order: min
+          extent: [0.07, 0.07, 0.13]
+          grasp_height: 0.083
+        can_far:
+          source: easy_actor_anchor
+          actor_paths: [active_cans.fanta, active_cans.pepsi]
+          selector_axis: y
+          selector_order: max
+          extent: [0.07, 0.07, 0.13]
+          grasp_height: 0.083
+        basket_drop:
+          source: public_task_target
+          position: [0.50, -0.20, 0.172]
+          quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+          extent: [0.13, 0.13, 0.18]
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.10
+          default_z_approach: 0.08
+          release_hover_height: 0.10
+          preserve_landmark_orientation: true
+          use_task_grasp_actor_for_objects: true
+          use_task_place_actor_for_landmarks: false
+          public_anchor_pose_enabled: true
+          public_grasp_anchor_objects: [can_near, can_far]
+          rgbd_perception_enabled: false
+          adaptive_gripper:
+            contact_force_threshold: 0.08
+            contact_balance_threshold: 0.45
+            depth_contact_margin_mm: 0.5
+            target_depth_delta_mm: 4.0
+            min_stable_contact_area: 0.006
+            post_squeeze_qpos: 0.0001
+            post_squeeze_steps: 3
+            hold_steps: 6
+          object_pose_names:
+            near can: can_near
+            can_near: can_near
+            far can: can_far
+            can_far: can_far
+            basket: basket_drop
+            basket_drop: basket_drop
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis: [FrankaControlApi, UniVTACTactileApi]
+    prompt: |
+      You control a Franka robot in VitaForge. Identify the empty beverage can by touch and place only it in the basket.
+
+      This is an Easy-GT engineering configuration. can_near and can_far are public coarse anchors only. Their names describe workspace order, not mass or identity. Use source="anchor" to approach them and basket_drop. Do not read actor state, brand names, metadata, reward, success, density, friction, or private task fields.
+
+      Call get_tactile_measurement_protocol() once and persist its exact dictionary as a trial_memory.v1 state record named probe_spec. Define one probe(object_name) helper and apply it once to can_near then can_far. Reuse the unchanged protocol for adaptive close, bilateral stable tactile validation, static capture, short lift/hold dynamic capture, lower, release verification, and table clearance. Empty, shallow, one-sided, dropped, or otherwise invalid captures invalidate the complete attempt; repeat exactly once, then print CAPX_FAILURE reason=insufficient_tactile_evidence and stop.
+
+      Store static and dynamic trial_memory.v1 evidence for both cans. In code, choose the can whose tactile dynamic response best supports an empty/light can, and write a decision with selected candidate, features, rule or weights, scores, margin, rationale, and capture provenance. The API never returns an empty-can label or a comparison result.
+
+      Regrasp only the selected can independently. Require fresh bilateral tactile stability, lift to safe clearance, transport horizontally over basket_drop, descend, release, verify release, and retreat. Probe contact does not prove a final transport grasp is safe. Use only FrankaControlApi and UniVTACTactileApi.
+    multi_turn_prompt: |
+      This is failure-only recovery. Read list_trial_memory() before acting, preserve probe_spec and valid evidence, and regenerate only the missing bounded probe, decision, or final transport stage. Never turn invalid evidence into a guessed selection.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/vitaforge_can_empty_select_easy_gt
+trial_timeout_seconds: 900
+max_trial_retries: 1
+max_regenerations: 6
+split_code_blocks_on_breakpoint: true
+multi_turn_on_failure_only: true
+filter_multiturn_console: true
+multiturn_console_max_lines: 30
+multiturn_console_max_chars: 4000
+tactile_memory:
+  trial:
+    enabled: true
+    include_in_multiturn: true
+    max_context_chars: 4000
+  persistent:
+    enabled: false

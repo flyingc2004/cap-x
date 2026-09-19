@@ -1,0 +1,115 @@
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: /mnt/sdc/ljz/ViTaForge
+      task_name: roughness_regrasp
+      task_config: gelsight.yml
+      seed_base: 0
+      device: cuda:0
+      task_cfg_overrides:
+        rough_block_side: random
+        initial_grasp_side: random
+      task_config_overrides:
+        observations:
+          camera: [rgb, depth]
+          tactile: [rgb, rgb_marker, marker, depth, pose]
+          embodiment: [joint, ee]
+          actor: false
+        reset_time_limit: 900
+        step_lim: 500
+        record_action_frames: true
+        record_pre_move_frames: true
+      public_entities:
+        left_block:
+          source: easy_actor_anchor
+          actor_paths: [smooth_block, rough_block]
+          selector_axis: y
+          selector_order: max
+          extent: [0.04, 0.04, 0.04]
+          grasp_height: 0.04
+        right_block:
+          source: easy_actor_anchor
+          actor_paths: [smooth_block, rough_block]
+          selector_axis: y
+          selector_order: min
+          extent: [0.04, 0.04, 0.04]
+          grasp_height: 0.04
+        yellow_plate:
+          source: easy_actor_anchor
+          actor: yellow_plate
+          extent: [0.10, 0.10, 0.02]
+      api_configs:
+        franka_control_api:
+          min_safe_z: 0.08
+          default_z_approach: 0.06
+          release_hover_height: 0.08
+          preserve_landmark_orientation: true
+          use_task_grasp_actor_for_objects: true
+          use_task_place_actor_for_landmarks: false
+          public_anchor_pose_enabled: true
+          public_grasp_anchor_objects: [left_block, right_block]
+          rgbd_perception_enabled: false
+          adaptive_gripper:
+            contact_force_threshold: 0.08
+            contact_balance_threshold: 0.45
+            depth_contact_margin_mm: 0.5
+            target_depth_delta_mm: 4.0
+            min_stable_contact_area: 0.006
+            post_squeeze_qpos: 0.0001
+            post_squeeze_steps: 3
+            hold_steps: 6
+          object_pose_names:
+            left block: left_block
+            left_block: left_block
+            right block: right_block
+            right_block: right_block
+            yellow plate: yellow_plate
+            yellow_plate: yellow_plate
+        tactile_measurement_protocol:
+          capture_window: 20
+          settle_steps: 10
+          close_target_force: 0.82
+          close_max_steps: 120
+          probe_lift_m: 0.018
+          probe_hold_steps: 10
+          max_attempts_per_object: 2
+          adaptive_close: true
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis: [FrankaControlApi, UniVTACTactileApi]
+    prompt: |
+      You control a Franka robot in VitaForge. Find the rough black block by touch and place only that block on the yellow plate.
+
+      This is an Easy-GT engineering configuration. left_block and right_block are public coarse anchors only; their names do not reveal texture. Use source="anchor" for object and plate geometry, but never inspect actor state, metadata, reward, success, material names, density, friction, or private task fields.
+
+      Call get_tactile_measurement_protocol() once and save its exact dictionary as a trial_memory.v1 state record named probe_spec. Define one probe(object_name) helper and call it once for left_block and once for right_block. Both probes must reuse the same protocol: sample grasp, adaptive close with its target force and limit, verify bilateral stable contact, capture static evidence, perform the protocol short lift and hold, capture dynamic evidence, lower, open, verify release, and clear above the table. Invalid bilateral contact or a drop invalidates the full attempt; retry at most once with the unchanged protocol, then print CAPX_FAILURE reason=insufficient_tactile_evidence and stop.
+
+      Store each valid static and dynamic observation in trial_memory.v1 evidence records. Use the public bilateral depth, marker displacement, marker coherence, and lift-time displacement changes to decide in code which block is rough; write a decision record with the selected block, features, rule or weights, scores, margin, rationale, and capture provenance. The API never supplies a profile, comparison score, or hidden label.
+
+      Regrasp only the selected block independently. Require a fresh stable bilateral tactile grasp, lift to clearance, transport horizontally above yellow_plate, descend, release, verify release, and retreat. Probe evidence is not proof that the final transport grasp remains stable. Use only FrankaControlApi and UniVTACTactileApi.
+    multi_turn_prompt: |
+      This is failure-only recovery. Read list_trial_memory() before acting, preserve probe_spec and all valid evidence, and regenerate only the missing probe, decision, or final transport stage. Never use private labels or turn an invalid probe into a random choice.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/vitaforge_roughness_regrasp_easy_gt
+trial_timeout_seconds: 900
+max_trial_retries: 1
+max_regenerations: 6
+split_code_blocks_on_breakpoint: true
+multi_turn_on_failure_only: true
+filter_multiturn_console: true
+multiturn_console_max_lines: 30
+multiturn_console_max_chars: 4000
+tactile_memory:
+  trial:
+    enabled: true
+    include_in_multiturn: true
+    max_context_chars: 4000
+  persistent:
+    enabled: false
