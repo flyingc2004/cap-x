@@ -529,6 +529,11 @@ def test_composable_demo_config_is_easy_gt_and_public_only() -> None:
     assert low_level["memory_overlay_enabled"] is True
     assert low_level["expose_actor_pose"] is False
     assert low_level["privileged"] is False
+    reset_cfg = low_level["task_config_overrides"]
+    assert reset_cfg["record_video_during_reset"] is False
+    assert reset_cfg["record_pre_move_frames"] is False
+    assert reset_cfg["record_pre_move_tactile_timeline"] is False
+    assert reset_cfg["skip_pre_move_render"] is True
     assert franka_api["rgbd_perception_enabled"] is False
     assert franka_api["public_anchor_pose_enabled"] is True
     assert env_factory["cfg"]["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]

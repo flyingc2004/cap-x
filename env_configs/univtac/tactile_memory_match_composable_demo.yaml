@@ -19,8 +19,11 @@ env:
       memory_overlay_enabled: true
       selection_only_audit: true
       task_config_overrides:
-        record_video_during_reset: true
+        record_video_during_reset: false
         record_action_frames: true
+        record_pre_move_frames: false
+        record_pre_move_tactile_timeline: false
+        skip_pre_move_render: true
         video_frame_stride: 4
       api_configs:
         franka_control_api:
