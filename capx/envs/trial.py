@@ -920,13 +920,23 @@ def _query_initial_code(
 
 
 class _suspend_sigalrm:
-    """Temporarily pause trial SIGALRM while waiting on remote LLM calls."""
+    """Pause the action deadline while retaining a bounded LLM deadline."""
 
     def __enter__(self):
         self.remaining = signal.alarm(0)
+        request_timeout = float(os.getenv("CAPX_LLM_TIMEOUT_SECONDS", "200"))
+        grace_seconds = float(os.getenv("CAPX_LLM_HARD_TIMEOUT_GRACE_SECONDS", "15"))
+        self.hard_timeout_seconds = max(1, int(request_timeout + grace_seconds))
+        signal.alarm(self.hard_timeout_seconds)
+        print(
+            "[capx-llm] action deadline paused; "
+            f"LLM hard deadline={self.hard_timeout_seconds}s",
+            flush=True,
+        )
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        signal.alarm(0)
         if self.remaining > 0:
             signal.alarm(self.remaining)
         return False

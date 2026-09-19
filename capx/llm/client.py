@@ -134,10 +134,22 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
 
     if requests is not None:
         if trust_env:
-            return requests.post(url, headers=headers, data=data, timeout=timeout)
+            return requests.post(
+                url,
+                headers=headers,
+                data=data,
+                timeout=timeout,
+                stream=False,
+            )
         with requests.Session() as session:
             session.trust_env = False
-            return session.post(url, headers=headers, data=data, timeout=timeout)
+            return session.post(
+                url,
+                headers=headers,
+                data=data,
+                timeout=timeout,
+                stream=False,
+            )
 
     req = urllib.request.Request(
         url,
@@ -342,7 +354,13 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
             "messages": prompt,
             "stream": False,
         }
-    headers = {"Content-Type": "application/json"}
+    # Some compatible endpoints return a gzip stream without a usable content
+    # encoding header. Requesting identity avoids hanging in response decoding.
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Encoding": os.getenv("CAPX_LLM_ACCEPT_ENCODING", "identity"),
+    }
     if _disable_thinking_requested(args):
         payload["enable_thinking"] = False
     if args.api_key:
@@ -364,7 +382,8 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         f"timeout={request_timeout:g}s max_tokens={args.max_tokens} "
         f"max_retries={max_retries} "
         f"disable_thinking={payload.get('enable_thinking') is False} "
-        f"trust_env={trust_env}"
+        f"trust_env={trust_env} "
+        f"accept_encoding={headers['Accept-Encoding']}"
     )
     print(
         "[capx-llm] payload "
@@ -427,8 +446,27 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         retry += 1
 
     end_time = time.time()
-    print(f"Time taken to query model: {end_time - start_time:.2f} seconds")
+    print(
+        f"Time taken to query model: {end_time - start_time:.2f} seconds; "
+        f"status={response.status_code}",
+        flush=True,
+    )
+    print("[capx-llm] response body materialization begin", flush=True)
+    response_content = getattr(response, "content", None)
+    response_bytes = (
+        len(response_content)
+        if isinstance(response_content, bytes)
+        else len(str(getattr(response, "text", "")).encode("utf-8"))
+    )
+    print(
+        "[capx-llm] response body materialization end "
+        f"bytes={response_bytes} "
+        f"content_type={response.headers.get('content-type', '<missing>')} "
+        f"content_encoding={response.headers.get('content-encoding', '<missing>')}",
+        flush=True,
+    )
     response.raise_for_status()
+    print("[capx-llm] response JSON parse begin", flush=True)
     try:
         body = response.json()
     except json.JSONDecodeError as exc:
@@ -439,6 +477,11 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
             f"(status={response.status_code}, content-type={content_type}, "
             f"url={server_url}, preview={response_preview!r})"
         ) from exc
+    print(
+        "[capx-llm] response JSON parse end "
+        f"top_level_keys={sorted(body) if isinstance(body, dict) else type(body).__name__}",
+        flush=True,
+    )
     out = {}
     if args.debug:
         print(json.dumps(body, indent=2))
