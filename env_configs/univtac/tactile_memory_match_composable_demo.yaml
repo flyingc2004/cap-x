@@ -24,6 +24,7 @@ env:
         record_pre_move_frames: false
         record_pre_move_tactile_timeline: false
         skip_pre_move_render: true
+        skip_task_pre_move: true
         video_frame_stride: 4
       api_configs:
         franka_control_api:

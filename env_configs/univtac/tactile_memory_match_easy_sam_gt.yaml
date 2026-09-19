@@ -31,6 +31,10 @@ env:
         record_pre_move_frames: false
         record_pre_move_tactile_timeline: false
         skip_pre_move_render: true
+        # The generated standard probe starts from its own public grasp anchor.
+        # Avoid the legacy task pre_move, which otherwise repeats an expensive
+        # reference approach before CaP-X has begun executing its protocol.
+        skip_task_pre_move: true
         video_frame_stride: 4
       api_configs:
         franka_control_api:
