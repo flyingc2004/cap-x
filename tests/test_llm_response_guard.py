@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from capx.envs import trial
 from capx.llm import client
 
@@ -64,3 +66,56 @@ def test_query_deadline_remains_bounded_while_action_alarm_is_paused(monkeypatch
         pass
 
     assert calls == [0, 37, 0, 91]
+
+
+def test_query_sends_opted_in_reasoning_effort(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+    body = {"choices": [{"message": {"content": "print('ok')"}}]}
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        content = json.dumps(body).encode("utf-8")
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return body
+
+    def post(_url, *, headers, data, timeout, stream):
+        observed["payload"] = json.loads(data)
+        return Response()
+
+    monkeypatch.setattr(client.requests, "post", post)
+    monkeypatch.setenv("CAPX_LLM_SEND_REASONING_EFFORT", "1")
+    args = client.ModelQueryArgs(
+        model="provider-reasoning-model",
+        server_url="https://example.test/v1",
+        reasoning_effort="high",
+    )
+
+    client.query_model(args, [{"role": "user", "content": "hello"}])
+
+    assert observed["payload"]["reasoning_effort"] == "high"
+
+
+def test_query_rejects_empty_message_content(monkeypatch) -> None:
+    body = {"choices": [{"message": {"content": "", "reasoning_content": "hidden"}}]}
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        content = json.dumps(body).encode("utf-8")
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return body
+
+    monkeypatch.setattr(client.requests, "post", lambda *_args, **_kwargs: Response())
+    args = client.ModelQueryArgs(model="test-model", server_url="https://example.test/v1")
+
+    with pytest.raises(RuntimeError, match="empty message.content"):
+        client.query_model(args, [{"role": "user", "content": "hello"}])

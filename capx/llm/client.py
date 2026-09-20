@@ -354,6 +354,10 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
             "messages": prompt,
             "stream": False,
         }
+    # Generic OpenAI-compatible providers vary in reasoning_effort support.
+    # Keep legacy behavior unless the active endpoint opts in explicitly.
+    if _env_flag("CAPX_LLM_SEND_REASONING_EFFORT", False) and "input" not in payload:
+        payload["reasoning_effort"] = args.reasoning_effort
     # Some compatible endpoints return a gzip stream without a usable content
     # encoding header. Requesting identity avoids hanging in response decoding.
     headers = {
@@ -382,6 +386,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         f"timeout={request_timeout:g}s max_tokens={args.max_tokens} "
         f"max_retries={max_retries} "
         f"disable_thinking={payload.get('enable_thinking') is False} "
+        f"reasoning_effort={payload.get('reasoning_effort', '<not-sent>')} "
         f"trust_env={trust_env} "
         f"accept_encoding={headers['Accept-Encoding']}"
     )
@@ -488,12 +493,25 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     try:
         if args.model in GPT_MODELS and "codex" in args.model:
             out["content"] = body["output_text"]
+            message = None
         else:
-            out["content"] = body["choices"][0]["message"]["content"]
+            message = body["choices"][0]["message"]
+            out["content"] = message["content"]
     except (KeyError, IndexError) as exc:
         raise RuntimeError(f"Unexpected response format: {body}") from exc
+    if not isinstance(out["content"], str) or not out["content"].strip():
+        message_fields = sorted(message) if isinstance(message, dict) else []
+        finish_reason = None
+        if isinstance(body, dict) and isinstance(body.get("choices"), list) and body["choices"]:
+            finish_reason = body["choices"][0].get("finish_reason")
+        raise RuntimeError(
+            "LLM endpoint returned empty message.content "
+            f"(finish_reason={finish_reason!r}, message_fields={message_fields}). "
+            "Check the provider's reasoning configuration and response schema."
+        )
     if body.get("choices") is not None:
-        out["reasoning"] = body.get("choices")[0].get("message").get("reasoning", None)
+        message = body.get("choices")[0].get("message", {})
+        out["reasoning"] = message.get("reasoning", message.get("reasoning_content"))
     else:
         out["reasoning"] = None
     return out  # type: ignore[return-value]
