@@ -37,13 +37,10 @@ memory is enabled; it is a historical name only.
 | File | Status | Localization | Memory protocol | Use it now? |
 | --- | --- | --- | --- | --- |
 | `tactile_memory_match_easy_sam_gt.yaml` | Current | Easy-GT public anchors | `tactile_probe.v4` plus frozen `tactile_response_expression.v1` | Yes |
-| `tactile_memory_match_composable_demo.yaml` | Compatibility alias | Easy-GT public anchors | Older short prompt for the same response-selection idea | No; use the current Easy-GT file |
-| `tactile_memory_match_hard_sam.yaml` | Archived experiment | SAM/RGB-D | Earlier full transport, agent-owned evidence flow | No; not upgraded to the v4 response-expression path |
-| `tactile_memory_match_easy_sam_gt_memory.yaml` | Archived experiment | Easy-GT anchors | Earlier full transport, agent-owned evidence flow | No |
-| `tactile_memory_match_hard_sam_memory.yaml` | Archived experiment | SAM/RGB-D | Earlier full transport, agent-owned evidence flow | No |
 
-The archived files remain in place only for reproducibility of earlier runs.
-They must not be mixed with the current v4 scaler or cited as a no-memory
-baseline. A future no-memory baseline should use an explicitly named config
-with `tactile_memory.trial.enabled: false` and no `write_trial_memory` /
-`read_trial_memory` APIs.
+The prior compatibility, Hard-SAM, and `*_memory` YAMLs were deleted because
+they described obsolete full-transport experiments and were frequently
+mistaken for distinct memory modes. Git history preserves them if a prior run
+must be reproduced. A future no-memory baseline must use an explicitly named
+config with `tactile_memory.trial.enabled: false` and no
+`write_trial_memory` / `read_trial_memory` APIs.

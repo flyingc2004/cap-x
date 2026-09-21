@@ -513,54 +513,6 @@ def test_config_loader_maps_trial_memory_and_disables_persistent_injection() -> 
     assert "Tactile code memory (compact skill cards):" not in env_factory["cfg"]["prompt"]
 
 
-def test_composable_demo_config_is_easy_gt_and_public_only() -> None:
-    root = Path(__file__).resolve().parents[1]
-    env_factory, config, _ = _load_config(
-        LaunchArgs(
-            config_path=str(root / "env_configs/univtac/tactile_memory_match_composable_demo.yaml")
-        )
-    )
-
-    low_level = env_factory["cfg"]["low_level"]
-    tactile_api = low_level["api_configs"]["univtac_tactile_api"]
-    franka_api = low_level["api_configs"]["franka_control_api"]
-
-    assert low_level["task_config"] == "tactile_memory_match_composable_capx_demo"
-    assert low_level["memory_overlay_enabled"] is True
-    assert low_level["expose_actor_pose"] is False
-    assert low_level["privileged"] is False
-    reset_cfg = low_level["task_config_overrides"]
-    assert reset_cfg["record_video_during_reset"] is False
-    assert reset_cfg["record_pre_move_frames"] is False
-    assert reset_cfg["record_pre_move_tactile_timeline"] is False
-    assert reset_cfg["skip_pre_move_render"] is True
-    assert reset_cfg["skip_task_pre_move"] is True
-    assert franka_api["rgbd_perception_enabled"] is False
-    assert franka_api["public_anchor_pose_enabled"] is True
-    assert env_factory["cfg"]["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
-    assert config["tactile_memory"]["persistent"]["enabled"] is False
-    assert set(tactile_api["llm_visible_functions"]) >= {
-        "get_public_probe_spec",
-        "begin_public_probe_capture",
-        "begin_public_probe_segment",
-        "end_public_probe_segment",
-        "finalize_public_probe_capture",
-        "get_tactile_response_expression",
-        "write_trial_memory",
-        "read_trial_memory",
-    }
-    assert tactile_api["tactile_response_expression_path"].endswith(
-        "task_config/tactile_response_expression.v1.json"
-    )
-    serialized = yaml.safe_dump(tactile_api).lower()
-    for private_name in ("pose", "label", "density", "friction", "reward", "success"):
-        assert private_name not in serialized
-    assert "get_public_probe_spec" in env_factory["cfg"]["prompt"]
-    assert "tactile_probe.v4" in env_factory["cfg"]["prompt"]
-    assert "quality-weighted block rms" in env_factory["cfg"]["prompt"].lower()
-    assert "never transport" in env_factory["cfg"]["prompt"].lower()
-
-
 def test_public_probe_recorder_uses_task_v4_reducer_without_identity_logic() -> None:
     class _Task:
         def get_public_probe_spec(self):
@@ -854,101 +806,60 @@ def _load_memory_match_config(name: str) -> dict:
     return yaml.safe_load((root / "env_configs/univtac" / name).read_text())
 
 
-def test_memory_match_configs_expose_only_bounded_api_surface() -> None:
-    historical_franka = {
+def test_memory_match_config_exposes_only_bounded_api_surface() -> None:
+    config = _load_memory_match_config("tactile_memory_match_easy_sam_gt.yaml")
+    cfg = config["env"]["cfg"]
+    low_level = cfg["low_level"]
+    api_configs = low_level["api_configs"]
+    franka = api_configs["franka_control_api"]
+    tactile = api_configs["univtac_tactile_api"]
+
+    assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
+    assert set(franka["llm_visible_functions"]) == {
         "get_object_pose",
         "sample_grasp_pose",
         "goto_pose",
         "move_delta",
-        "rotate_gripper",
         "open_gripper",
         "close_gripper",
         "wait_steps",
     }
-    historical_tactile = {
-        "get_tactile_measurement_protocol",
-        "capture_tactile_observation",
+    assert set(tactile["llm_visible_functions"]) == {
+        "get_public_probe_spec",
+        "begin_public_probe_capture",
+        "begin_public_probe_segment",
+        "end_public_probe_segment",
+        "finalize_public_probe_capture",
+        "get_tactile_response_expression",
         "is_contacting",
         "is_slipping",
         "is_grasp_stable",
         "write_trial_memory",
         "read_trial_memory",
+        "list_trial_memory",
     }
+    assert franka["llm_api_profile"] == "tactile_memory_match"
+    assert low_level["expose_actor_pose"] is False
+    assert low_level["privileged"] is False
+    assert config["tactile_memory"]["persistent"]["enabled"] is False
+    assert "tactile_code_memory" not in config
+    assert "tactile_strategy_memory" not in config
 
-    for name in (
-        "tactile_memory_match_easy_sam_gt.yaml",
-        "tactile_memory_match_hard_sam.yaml",
+    prompt = cfg["prompt"]
+    for required in (
+        "get_public_probe_spec()",
+        "get_tactile_response_expression()",
+        "probe(object_name)",
+        "tactile_probe.v4",
+        "trial_memory.v1",
+        'close_gripper(mode="probe")',
+        "CAPX_SELECTION",
     ):
-        config = _load_memory_match_config(name)
-        cfg = config["env"]["cfg"]
-        low_level = cfg["low_level"]
-        api_configs = low_level["api_configs"]
-        franka = api_configs["franka_control_api"]
-        tactile = api_configs["univtac_tactile_api"]
-
-        assert cfg["apis"] == ["FrankaControlApi", "UniVTACTactileApi"]
-        if name == "tactile_memory_match_easy_sam_gt.yaml":
-            assert set(franka["llm_visible_functions"]) == {
-                "get_object_pose",
-                "sample_grasp_pose",
-                "goto_pose",
-                "move_delta",
-                "open_gripper",
-                "close_gripper",
-                "wait_steps",
-            }
-            assert set(tactile["llm_visible_functions"]) == {
-                "get_public_probe_spec",
-                "begin_public_probe_capture",
-                "begin_public_probe_segment",
-                "end_public_probe_segment",
-                "finalize_public_probe_capture",
-                "get_tactile_response_expression",
-                "is_contacting",
-                "is_slipping",
-                "is_grasp_stable",
-                "write_trial_memory",
-                "read_trial_memory",
-                "list_trial_memory",
-            }
-        else:
-            assert set(franka["llm_visible_functions"]) == historical_franka
-            assert set(tactile["llm_visible_functions"]) == historical_tactile
-        assert franka["llm_api_profile"] == "tactile_memory_match"
-        assert low_level["expose_actor_pose"] is False
-        assert low_level["privileged"] is False
-        assert config["tactile_memory"]["persistent"]["enabled"] is False
-        assert "tactile_code_memory" not in config
-        assert "tactile_strategy_memory" not in config
-
-        prompt = cfg["prompt"]
-        if name == "tactile_memory_match_easy_sam_gt.yaml":
-            for required in (
-                "get_public_probe_spec()",
-                "get_tactile_response_expression()",
-                "probe(object_name)",
-                "tactile_probe.v4",
-                "trial_memory.v1",
-                'close_gripper(mode="probe")',
-                "CAPX_SELECTION",
-            ):
-                assert required in prompt
-            assert "do not transport" in prompt.lower()
-        else:
-            for required in (
-                "get_tactile_measurement_protocol()",
-                "probe(object_name)",
-                "capture_tactile_observation",
-                "trial_memory.v1",
-                "move_delta(dz=probe_lift_m)",
-                'close_gripper(mode="probe")',
-                'close_gripper(mode="transport")',
-                "horizontal transport",
-            ):
-                assert required in prompt
-        # The prompt can explicitly forbid a hidden API by name; the actual
-        # executable namespace is enforced above by the YAML white lists.
-        assert "raw tactile image" not in prompt.lower()
+        assert required in prompt
+    assert "do not transport" in prompt.lower()
+    # The prompt can explicitly forbid a hidden API by name; the executable
+    # namespace is enforced by the YAML allow lists above.
+    assert "raw tactile image" not in prompt.lower()
 
 
 def test_easy_gt_memory_match_config_is_pose_private_and_sam_free() -> None:
