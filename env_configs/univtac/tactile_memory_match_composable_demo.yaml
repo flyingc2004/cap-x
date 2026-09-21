@@ -1,5 +1,7 @@
-# Historical entrypoint retained for existing run scripts. It uses the same
-# response-vector selection-only protocol as tactile_memory_match_easy_sam_gt.
+# COMPATIBILITY ONLY. Historical entrypoint retained for existing run scripts.
+# It has an older, shorter response-selection prompt. Use
+# tactile_memory_match_easy_sam_gt.yaml for new runs; both files enable only
+# per-trial memory and neither enables persistent memory. See README.md.
 env:
   _target_: capx.envs.tasks.base.CodeExecutionEnvBase
   cfg:

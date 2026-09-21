@@ -1,3 +1,7 @@
+# ARCHIVED EXPERIMENT. Earlier Easy-GT full-transport configuration. The
+# `_memory` suffix is historical and does not enable a different memory mode:
+# this file and the current config both use trial memory only, with persistent
+# memory disabled. Do not use for new experiments. See README.md.
 env:
   _target_: capx.envs.tasks.base.CodeExecutionEnvBase
   cfg:

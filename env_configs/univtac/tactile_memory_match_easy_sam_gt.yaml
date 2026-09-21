@@ -1,6 +1,7 @@
-# Selection-only Easy-GT engineering smoke.  It validates that CaP-X can
-# execute the public probe, write trial memory and select a match.  Transport
-# is deliberately out of scope for this first response-memory integration.
+# CURRENT ENTRY POINT. Selection-only Easy-GT engineering smoke. Its filename
+# is historical: it does not launch SAM. It validates that CaP-X can execute
+# the public v4 probe, write trial memory, and select a match. Transport is
+# deliberately out of scope. See env_configs/univtac/README.md.
 env:
   _target_: capx.envs.tasks.base.CodeExecutionEnvBase
   cfg:

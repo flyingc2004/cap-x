@@ -1,3 +1,7 @@
+# ARCHIVED EXPERIMENT. Earlier Hard-SAM full-transport configuration; it is
+# not upgraded to the current public-v4 response-expression selection path.
+# The name does not distinguish memory enablement: it uses trial memory only,
+# with persistent memory disabled. Do not use for new experiments. See README.
 env:
   _target_: capx.envs.tasks.base.CodeExecutionEnvBase
   cfg:
