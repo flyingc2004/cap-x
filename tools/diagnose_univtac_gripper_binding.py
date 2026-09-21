@@ -220,7 +220,11 @@ def main() -> None:
         sys.argv = [original_argv[0]]
         from isaaclab.app import AppLauncher
 
-        app = AppLauncher(argparse.Namespace(enable_cameras=True, num_envs=1)).app
+        # Keep camera rendering for the diagnostic videos, without loading GUI
+        # extensions that require an X11/desktop window on the remote server.
+        app = AppLauncher(
+            argparse.Namespace(enable_cameras=True, headless=True, num_envs=1)
+        ).app
     finally:
         sys.argv = original_argv
 
