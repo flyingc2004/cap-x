@@ -53,6 +53,19 @@ def _vec(value: Any) -> list[float]:
     return [float(x) for x in np.asarray(value, dtype=np.float64).reshape(-1).tolist()]
 
 
+def _as_uint8_frame(frame: Any) -> np.ndarray:
+    if hasattr(frame, "detach"):
+        frame = frame.detach()
+    if hasattr(frame, "cpu"):
+        frame = frame.cpu()
+    if hasattr(frame, "numpy"):
+        frame = frame.numpy()
+    array = np.asarray(frame)
+    if array.dtype != np.uint8:
+        array = (np.clip(array, 0.0, 1.0) * 255.0).astype(np.uint8)
+    return np.ascontiguousarray(array)
+
+
 def _relative_position(
     hand_pos: np.ndarray,
     hand_quat_wxyz: np.ndarray,
@@ -69,6 +82,8 @@ class _TraceRecorder:
         self.low_level = low_level
         self.phase = "reset"
         self.records: list[dict[str, Any]] = []
+        self.official_frames: list[np.ndarray] = []
+        self.wrist_frames: list[np.ndarray] = []
         robot = low_level.task._robot_manager.robot
         self.robot = robot
         self.body_ids = {}
@@ -109,6 +124,15 @@ class _TraceRecorder:
                 "fingers": fingers,
             }
         )
+        # Match the exact frame composition used by BaseTask's official video.
+        self.low_level.task._update_render()
+        observation = self.low_level.task._get_observations()
+        self.official_frames.append(
+            _as_uint8_frame(self.low_level.task.get_frame_shot(observation))
+        )
+        wrist = observation.get("observation", {}).get("wrist", {}).get("rgb")
+        if wrist is not None:
+            self.wrist_frames.append(_as_uint8_frame(wrist))
 
 
 def _max_relative_hold_motion(records: list[dict[str, Any]], phase: str) -> float:
@@ -242,11 +266,13 @@ def main() -> None:
             seed_base=args.seed,
             device="cuda:0",
             task_config_overrides={
-                "skip_task_pre_move": True,
+                # Match the normal expert start pose so the diagnostic video
+                # uses the same camera framing as official trajectories.
+                "skip_task_pre_move": False,
                 "skip_pre_move_render": True,
                 "record_video_during_reset": False,
-                "record_action_frames": True,
-                "record_pre_move_frames": True,
+                "record_action_frames": False,
+                "record_pre_move_frames": False,
                 "video_frame_stride": 1,
             },
             api_configs=_load_franka_api_config(args.capx_config),
@@ -254,9 +280,6 @@ def main() -> None:
             enable_render=True,
         )
         low_level.reset(seed=0)
-        low_level.enable_video_capture(
-            True, clear=True, wrist_camera=True, capture_initial_frame=True
-        )
         recorder = _TraceRecorder(low_level)
         original_step = low_level.task._step
 
@@ -314,12 +337,18 @@ def main() -> None:
         with open(output_dir / "binding_summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, sort_keys=True)
 
-        frames = low_level.get_video_frames(clear=True)
-        if frames:
-            _write_video(frames, str(output_dir), suffix="expert_vs_capx_open")
-        wrist_frames = low_level.get_wrist_video_frames(clear=True)
-        if wrist_frames:
-            _write_video(wrist_frames, str(output_dir), suffix="expert_vs_capx_open_wrist")
+        if recorder.official_frames:
+            _write_video(
+                recorder.official_frames,
+                str(output_dir),
+                suffix="expert_vs_capx_open",
+            )
+        if recorder.wrist_frames:
+            _write_video(
+                recorder.wrist_frames,
+                str(output_dir),
+                suffix="expert_vs_capx_open_wrist",
+            )
         print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
     finally:
         if low_level is not None:
