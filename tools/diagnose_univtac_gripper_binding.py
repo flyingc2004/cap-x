@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Compare UniVTAC's native and CaP-X gripper-open paths on one reset.
+"""Record focused UniVTAC gripper-binding diagnostics on one reset.
 
-The diagnostic is deliberately LLM-free.  It performs an expert-style open
-with the task atom, returns to a closed baseline, then performs the exact
-adaptive open path exposed through FrankaControlApi.  Each simulation step
-records finger positions relative to the wrist and produces a single video.
+The diagnostic is deliberately LLM-free.  It can compare the native and
+CaP-X opening paths, or replay the *motion* part of CaP-X's generated first
+probe using the same public API calls.  Every simulation step records finger
+positions relative to the wrist and uses the task's normal video framing.
 """
 
 from __future__ import annotations
@@ -44,6 +44,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=4002)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--scenario",
+        choices=("open-ab", "capx-first-probe"),
+        default="open-ab",
+        help=(
+            "open-ab compares expert and CaP-X opening. capx-first-probe replays "
+            "the generated open/approach/close/preload/lift/hold/lower/release chain."
+        ),
+    )
     parser.add_argument("--hold-steps", type=int, default=20)
     parser.add_argument("--open-max-steps", type=int, default=120)
     return parser.parse_args()
@@ -210,6 +219,41 @@ def _summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     return report
 
 
+def _summarize_probe_binding(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Report relative-finger drift only during phases with fixed gripper qpos."""
+    threshold_m = 1e-4
+    stable_phases = (
+        "capx_probe_approach",
+        "capx_probe_preload",
+        "capx_probe_lift",
+        "capx_probe_hold",
+        "capx_probe_lower",
+        "capx_probe_release_hold",
+    )
+    phases: dict[str, Any] = {}
+    for phase in stable_phases:
+        samples = [item for item in records if item["phase"] == phase]
+        if not samples:
+            continue
+        qpos_span = _phase_qpos_span(records, phase)
+        relative_motion = _max_relative_hold_motion(records, phase)
+        phases[phase] = {
+            "sample_count": len(samples),
+            "qpos_span": qpos_span,
+            "relative_finger_motion_m": relative_motion,
+            "binding_stable": bool(
+                np.isfinite(relative_motion) and relative_motion <= threshold_m
+            ),
+        }
+    unstable = [name for name, report in phases.items() if not report["binding_stable"]]
+    return {
+        "binding_hold_motion_threshold_m": threshold_m,
+        "phases": phases,
+        "verdict": "probe_relative_finger_drift_observed" if unstable else "no_probe_relative_finger_drift_observed",
+        "unstable_phases": unstable,
+    }
+
+
 def _load_franka_api_config(path: str) -> dict[str, Any]:
     config_path = Path(path).expanduser().resolve()
     with open(config_path, encoding="utf-8") as f:
@@ -308,30 +352,77 @@ def main() -> None:
             finally:
                 low_level.task.in_pre_move = previous_pre_move
 
-        expert_gripper(0.0, "expert_prepare_close")
-        expert_gripper(1.0, "expert_open")
-        recorder.phase = "expert_open_hold"
-        low_level.task.delay(args.hold_steps, is_save=True, force=True)
-
-        expert_gripper(0.0, "capx_prepare_close")
-        recorder.phase = "capx_open"
         api = UniVTACFrankaCompatApi(low_level)
-        capx_open = api.open_gripper(
-            adaptive=True,
-            target_width=1.0,
-            max_steps=args.open_max_steps,
-        )
-        recorder.phase = "capx_open_hold"
-        api.wait_steps(args.hold_steps)
+        stage_results: dict[str, Any] = {}
+        if args.scenario == "open-ab":
+            expert_gripper(0.0, "expert_prepare_close")
+            expert_gripper(1.0, "expert_open")
+            recorder.phase = "expert_open_hold"
+            low_level.task.delay(args.hold_steps, is_save=True, force=True)
+
+            expert_gripper(0.0, "capx_prepare_close")
+            recorder.phase = "capx_open"
+            capx_open = api.open_gripper(
+                adaptive=True,
+                target_width=1.0,
+                max_steps=args.open_max_steps,
+            )
+            stage_results["capx_open"] = capx_open
+            recorder.phase = "capx_open_hold"
+            api.wait_steps(args.hold_steps)
+            summary = _summarize(recorder.records)
+            video_suffix = "expert_vs_capx_open"
+        else:
+            # This is the exact visible motion sequence emitted by the first
+            # generated CaP-X program. Capture bookkeeping is intentionally
+            # omitted: it never changes the simulator state.
+            controls = api.get_callable_functions()
+            probe_spec = low_level.get_public_probe_spec()
+            object_name = "reference_object"
+
+            recorder.phase = "capx_probe_initial_open"
+            stage_results["initial_open"] = controls["open_gripper"]()
+            pos, quat = controls["sample_grasp_pose"](object_name)
+            recorder.phase = "capx_probe_approach"
+            stage_results["approach"] = controls["goto_pose"](pos, quat)
+            recorder.phase = "capx_probe_close"
+            stage_results["close"] = controls["close_gripper"](mode="probe")
+
+            recorder.phase = "capx_probe_preload"
+            stage_results["preload"] = controls["wait_steps"](
+                int(probe_spec["preload_steps"])
+            )
+            recorder.phase = "capx_probe_lift"
+            stage_results["lift"] = controls["move_delta"](
+                dz=float(probe_spec["lift_height"])
+            )
+            recorder.phase = "capx_probe_hold"
+            stage_results["hold"] = controls["wait_steps"](
+                int(probe_spec["hold_steps"])
+            )
+            recorder.phase = "capx_probe_lower"
+            stage_results["lower"] = controls["move_delta"](
+                dz=-float(probe_spec["lift_height"])
+            )
+            recorder.phase = "capx_probe_lower_settle"
+            stage_results["lower_settle"] = controls["wait_steps"](
+                int(probe_spec["lower_settle_steps"])
+            )
+            recorder.phase = "capx_probe_release"
+            stage_results["release"] = controls["open_gripper"]()
+            recorder.phase = "capx_probe_release_hold"
+            stage_results["release_hold"] = controls["wait_steps"](args.hold_steps)
+            summary = _summarize_probe_binding(recorder.records)
+            video_suffix = "capx_first_probe"
 
         trace_payload = {
-            "schema_version": "univtac_gripper_binding_trace.v1",
+            "schema_version": "univtac_gripper_binding_trace.v2",
             "seed": int(args.seed),
             "task_config": str(args.task_config),
-            "capx_open_result": capx_open,
+            "scenario": str(args.scenario),
+            "stage_results": stage_results,
             "records": recorder.records,
         }
-        summary = _summarize(recorder.records)
         with open(output_dir / "binding_trace.json", "w", encoding="utf-8") as f:
             json.dump(trace_payload, f, indent=2, sort_keys=True)
         with open(output_dir / "binding_summary.json", "w", encoding="utf-8") as f:
@@ -341,13 +432,13 @@ def main() -> None:
             _write_video(
                 recorder.official_frames,
                 str(output_dir),
-                suffix="expert_vs_capx_open",
+                suffix=video_suffix,
             )
         if recorder.wrist_frames:
             _write_video(
                 recorder.wrist_frames,
                 str(output_dir),
-                suffix="expert_vs_capx_open_wrist",
+                suffix=f"{video_suffix}_wrist",
             )
         print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
     finally:
