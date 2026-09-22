@@ -100,6 +100,55 @@ def test_query_sends_opted_in_reasoning_effort(monkeypatch) -> None:
     assert observed["payload"]["reasoning_effort"] == "high"
 
 
+@pytest.mark.parametrize(
+    ("requested_effort", "expected_effort"),
+    [("low", "low"), ("medium", "high"), ("high", "high"), ("max", "max")],
+)
+def test_kimi_k3_uses_its_native_reasoning_contract(
+    monkeypatch, requested_effort, expected_effort
+) -> None:
+    observed: dict[str, object] = {}
+    body = {
+        "choices": [
+            {
+                "message": {
+                    "content": "print('ok')",
+                    "reasoning_content": "bounded reasoning",
+                }
+            }
+        ]
+    }
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        content = json.dumps(body).encode("utf-8")
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return body
+
+    def post(_url, *, headers, data, timeout, stream):
+        observed["payload"] = json.loads(data)
+        return Response()
+
+    monkeypatch.setattr(client.requests, "post", post)
+    monkeypatch.setenv("CAPX_DISABLE_THINKING", "1")
+    args = client.ModelQueryArgs(
+        model="kimi-k3",
+        server_url="https://example.test/v1",
+        reasoning_effort=requested_effort,
+    )
+
+    result = client.query_model(args, [{"role": "user", "content": "hello"}])
+
+    assert result == {"content": "print('ok')", "reasoning": "bounded reasoning"}
+    assert observed["payload"]["reasoning_effort"] == expected_effort
+    assert "enable_thinking" not in observed["payload"]
+
+
 def test_query_rejects_empty_message_content(monkeypatch) -> None:
     body = {"choices": [{"message": {"content": "", "reasoning_content": "hidden"}}]}
 

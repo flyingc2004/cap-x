@@ -70,6 +70,17 @@ OPENROUTER_MODELS = [
 ]
 OPENROUTER_SERVER_URL = "http://localhost:8110/chat/completions"
 
+# Kimi K3 is OpenAI-compatible, but it is not a switchable-thinking model.
+# Its native request contract accepts only low/high/max for reasoning_effort.
+_KIMI_K3_EFFORT_ALIASES = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+
 # ---------------------------------------------------------------------------
 # Ensemble configuration
 # ---------------------------------------------------------------------------
@@ -89,6 +100,17 @@ ENSEMBLE_CONFIGS = [
 def is_openrouter_model(model: str) -> bool:
     """Return True if the model should be routed through the OpenRouter proxy."""
     return model.startswith("openrouter/") or model in OPENROUTER_MODELS
+
+
+def _is_kimi_k3_model(model: str) -> bool:
+    """Return whether ``model`` uses Kimi K3's native reasoning contract."""
+    return model.strip().lower().split("/")[-1].startswith("kimi-k3")
+
+
+def _kimi_k3_reasoning_effort(value: str) -> str:
+    """Map CaP-X's generic effort names onto Kimi K3's public API values."""
+    normalized = str(value).strip().lower()
+    return _KIMI_K3_EFFORT_ALIASES.get(normalized, "high")
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -172,6 +194,10 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
 
 
 def _disable_thinking_requested(args: Any) -> bool:
+    # Kimi K3 always reasons. Sending enable_thinking=false is unsupported
+    # and some OpenAI-compatible gateways silently ignore it.
+    if _is_kimi_k3_model(str(getattr(args, "model", ""))):
+        return False
     value = os.getenv("CAPX_DISABLE_THINKING", "")
     if value:
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -306,7 +332,16 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     else:
         server_url = args.server_url
 
-    if args.model in GPT_MODELS:
+    if _is_kimi_k3_model(args.model):
+        payload = {
+            "model": args.model,
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
+            "reasoning_effort": _kimi_k3_reasoning_effort(args.reasoning_effort),
+            "messages": prompt,
+            "stream": False,
+        }
+    elif args.model in GPT_MODELS:
         if "codex" in args.model:
             prompt = _completions_to_responses_convert_prompt(prompt)
             payload = {
@@ -356,7 +391,11 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         }
     # Generic OpenAI-compatible providers vary in reasoning_effort support.
     # Keep legacy behavior unless the active endpoint opts in explicitly.
-    if _env_flag("CAPX_LLM_SEND_REASONING_EFFORT", False) and "input" not in payload:
+    if (
+        not _is_kimi_k3_model(args.model)
+        and _env_flag("CAPX_LLM_SEND_REASONING_EFFORT", False)
+        and "input" not in payload
+    ):
         payload["reasoning_effort"] = args.reasoning_effort
     # Some compatible endpoints return a gzip stream without a usable content
     # encoding header. Requesting identity avoids hanging in response decoding.
@@ -538,7 +577,16 @@ def query_model_streaming(
     if requests is None:
         raise RuntimeError("Streaming model queries require the optional 'requests' package")
 
-    if args.model in GPT_MODELS:
+    if _is_kimi_k3_model(args.model):
+        payload = {
+            "model": args.model,
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
+            "reasoning_effort": _kimi_k3_reasoning_effort(args.reasoning_effort),
+            "messages": prompt,
+            "stream": True,
+        }
+    elif args.model in GPT_MODELS:
         payload = {
             "model": args.model,
             "reasoning_effort": args.reasoning_effort,
