@@ -104,7 +104,7 @@ class _TraceRecorder:
                 )
             self.body_ids[name] = int(ids[0])
 
-    def capture(self) -> None:
+    def capture(self, *, include_frame: bool = True) -> None:
         manager = self.low_level.task._robot_manager
         pos_w = self.robot.data.body_link_pos_w[0].detach().cpu().numpy()
         quat_w = self.robot.data.body_link_quat_w[0].detach().cpu().numpy()
@@ -133,8 +133,12 @@ class _TraceRecorder:
                 "fingers": fingers,
             }
         )
+        if not include_frame:
+            return
         # Match the exact frame composition used by BaseTask's official video.
-        self.low_level.task._update_render()
+        # The preceding native _step already renders during active actions.
+        # Do not force a second render immediately after reset: that boundary
+        # can block in Isaac/UIPC before any diagnostic action has begun.
         observation = self.low_level.task._get_observations()
         self.official_frames.append(
             _as_uint8_frame(self.low_level.task.get_frame_shot(observation))
@@ -333,7 +337,7 @@ def main() -> None:
             return result
 
         low_level.task._step = traced_step
-        recorder.capture()
+        recorder.capture(include_frame=False)
 
         # Reproduce the official expert's percentage/adaptive action path.
         def expert_gripper(percent: float, phase: str) -> None:
@@ -380,38 +384,55 @@ def main() -> None:
             probe_spec = low_level.get_public_probe_spec()
             object_name = "reference_object"
 
-            recorder.phase = "capx_probe_initial_open"
-            stage_results["initial_open"] = controls["open_gripper"]()
-            pos, quat = controls["sample_grasp_pose"](object_name)
-            recorder.phase = "capx_probe_approach"
-            stage_results["approach"] = controls["goto_pose"](pos, quat)
-            recorder.phase = "capx_probe_close"
-            stage_results["close"] = controls["close_gripper"](mode="probe")
+            def run_probe_stage(phase: str, action):
+                recorder.phase = phase
+                print(f"[gripper-diagnostic] stage={phase} begin", flush=True)
+                result = action()
+                ok = result.get("ok", result.get("released", None)) if isinstance(result, dict) else None
+                print(
+                    f"[gripper-diagnostic] stage={phase} end ok={ok}",
+                    flush=True,
+                )
+                return result
 
-            recorder.phase = "capx_probe_preload"
-            stage_results["preload"] = controls["wait_steps"](
-                int(probe_spec["preload_steps"])
+            stage_results["initial_open"] = run_probe_stage(
+                "capx_probe_initial_open", controls["open_gripper"]
             )
-            recorder.phase = "capx_probe_lift"
-            stage_results["lift"] = controls["move_delta"](
-                dz=float(probe_spec["lift_height"])
+            pos, quat = controls["sample_grasp_pose"](object_name)
+            stage_results["approach"] = run_probe_stage(
+                "capx_probe_approach", lambda: controls["goto_pose"](pos, quat)
             )
-            recorder.phase = "capx_probe_hold"
-            stage_results["hold"] = controls["wait_steps"](
-                int(probe_spec["hold_steps"])
+            stage_results["close"] = run_probe_stage(
+                "capx_probe_close", lambda: controls["close_gripper"](mode="probe")
             )
-            recorder.phase = "capx_probe_lower"
-            stage_results["lower"] = controls["move_delta"](
-                dz=-float(probe_spec["lift_height"])
+
+            stage_results["preload"] = run_probe_stage(
+                "capx_probe_preload",
+                lambda: controls["wait_steps"](int(probe_spec["preload_steps"])),
             )
-            recorder.phase = "capx_probe_lower_settle"
-            stage_results["lower_settle"] = controls["wait_steps"](
-                int(probe_spec["lower_settle_steps"])
+            stage_results["lift"] = run_probe_stage(
+                "capx_probe_lift",
+                lambda: controls["move_delta"](dz=float(probe_spec["lift_height"])),
             )
-            recorder.phase = "capx_probe_release"
-            stage_results["release"] = controls["open_gripper"]()
-            recorder.phase = "capx_probe_release_hold"
-            stage_results["release_hold"] = controls["wait_steps"](args.hold_steps)
+            stage_results["hold"] = run_probe_stage(
+                "capx_probe_hold",
+                lambda: controls["wait_steps"](int(probe_spec["hold_steps"])),
+            )
+            stage_results["lower"] = run_probe_stage(
+                "capx_probe_lower",
+                lambda: controls["move_delta"](dz=-float(probe_spec["lift_height"])),
+            )
+            stage_results["lower_settle"] = run_probe_stage(
+                "capx_probe_lower_settle",
+                lambda: controls["wait_steps"](int(probe_spec["lower_settle_steps"])),
+            )
+            stage_results["release"] = run_probe_stage(
+                "capx_probe_release", controls["open_gripper"]
+            )
+            stage_results["release_hold"] = run_probe_stage(
+                "capx_probe_release_hold",
+                lambda: controls["wait_steps"](args.hold_steps),
+            )
             summary = _summarize_probe_binding(recorder.records)
             video_suffix = "capx_first_probe"
 
