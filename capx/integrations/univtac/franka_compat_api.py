@@ -457,6 +457,16 @@ class UniVTACFrankaCompatApi(ApiBase):
                 "requested_distance_m": distance,
                 "max_distance_m": self.local_delta_max_m,
             }
+
+        # The benchmark's public probe is a pure vertical lift/lower after a
+        # stable task-native side grasp.  Keep that motion on the same atom
+        # path as the official expert instead of mixing it with generic
+        # delta-EE ``Action('all')`` control.  This is internal routing only:
+        # the LLM-visible API remains ``move_delta``.
+        native_vertical = self._memory_match_native_vertical_delta(dx=dx, dy=dy, dz=dz)
+        if native_vertical is not None:
+            return native_vertical
+
         current_pos, current_quat = self._current_tool_pose()
         target_pos = current_pos + requested
         target_pos[2] = max(float(target_pos[2]), self.min_safe_z)
@@ -467,6 +477,55 @@ class UniVTACFrankaCompatApi(ApiBase):
             yaw_segment_rad=self.local_yaw_segment_rad,
             operation="move_delta",
         )
+
+    def _memory_match_native_vertical_delta(
+        self,
+        *,
+        dx: float,
+        dy: float,
+        dz: float,
+    ) -> dict[str, Any] | None:
+        """Use the expert-equivalent lift/lower bridge when it is applicable."""
+        if not self._holding_with_tactile:
+            return None
+        if abs(float(dx)) > 1e-8 or abs(float(dy)) > 1e-8 or abs(float(dz)) <= 1e-8:
+            return None
+        native_move = getattr(self._env, "move_active_public_grasp_by_displacement", None)
+        if not callable(native_move):
+            return None
+
+        result = native_move(dz=float(dz), time_dilation_factor=0.5)
+        if not isinstance(result, dict):
+            return {
+                "ok": bool(result),
+                "operation": "move_delta",
+                "motion_path": "task_atom_move_by_displacement",
+            }
+        result = {
+            **result,
+            "operation": "move_delta",
+            "motion_path": "task_atom_move_by_displacement",
+        }
+        if not bool(result.get("ok", False)):
+            result.setdefault("reason", "native_probe_vertical_failed")
+            return result
+        guard_failure = self._tactile_guard_failure(
+            abort_on_contact_loss=True,
+            tactile_force_threshold=None,
+            slip_threshold=None,
+        )
+        if guard_failure is not None:
+            return {
+                **result,
+                **guard_failure,
+                "tactile_monitoring": True,
+            }
+        print(
+            "[univtac-franka] move_delta_via_task_atom "
+            f"dz={float(dz):.4f} ok=True",
+            flush=True,
+        )
+        return result
 
     def _memory_match_rotate_gripper(self, yaw_rad: float) -> dict[str, Any]:
         """Apply a bounded yaw about the current local gripper tool axis.

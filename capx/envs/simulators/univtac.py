@@ -810,6 +810,94 @@ class UniVTACLowLevelEnv(BaseEnv):
             self._active_public_grasp_object_name = str(object_name)
         return result
 
+    def move_active_public_grasp_by_displacement(
+        self,
+        *,
+        dz: float,
+        time_dilation_factor: float = 0.5,
+    ) -> dict[str, Any]:
+        """Run a vertical public-probe motion through the task's native atom.
+
+        This is an internal bridge for the tactile-memory ``move_delta`` API.
+        It intentionally exposes no new LLM function: callers still issue the
+        ordinary bounded ``move_delta(dz=...)`` request.  Once a public
+        side-grasp approach and tactile close have succeeded, the benchmark's
+        expert uses this same ``move_by_displacement`` route for lift/lower.
+        """
+        if not self.protocol_action_allowed():
+            return self._protocol_blocked_result()
+        displacement = float(dz)
+        if not np.isfinite(displacement):
+            return {
+                "ok": False,
+                "step": self.get_step_count(),
+                "action_count": self.get_action_count(),
+                "message": "public probe displacement must be finite",
+            }
+        object_name = self._active_public_grasp_object_name
+        if not object_name:
+            return {
+                "ok": False,
+                "step": self.get_step_count(),
+                "action_count": self.get_action_count(),
+                "message": "no active public grasp object for native probe motion",
+            }
+
+        try:
+            resolve_name = getattr(self._task, "_resolve_public_object_name", None)
+            public_name = resolve_name(object_name) if callable(resolve_name) else object_name
+            if not public_name:
+                raise KeyError(f"unknown public object {object_name!r}")
+            actions = self._task.atom.move_by_displacement(
+                z=displacement,
+                xyz_coord="world",
+            )
+            role_move = getattr(self._task, "_role_move", None)
+            if callable(role_move):
+                ok = bool(
+                    role_move(
+                        public_name,
+                        actions,
+                        tag=f"{public_name}_capx_probe_vertical",
+                        time_dilation_factor=float(time_dilation_factor),
+                        is_save=True,
+                        delay=False,
+                    )
+                )
+            else:
+                ok = bool(
+                    self._task.move(
+                        actions,
+                        tag=f"{public_name}_capx_probe_vertical",
+                        time_dilation_factor=float(time_dilation_factor),
+                        is_save=True,
+                        delay=False,
+                    )
+                )
+        except Exception as exc:
+            ok = False
+            message = f"native public probe displacement failed: {exc!r}"
+        else:
+            message = (
+                "native public probe displacement executed"
+                if ok
+                else "native public probe displacement planning failed"
+            )
+
+        self._update_after_action()
+        self._append_debug_record(f"after_public_probe_vertical_{object_name}")
+        result = {
+            "ok": bool(ok),
+            "step": self.get_step_count(),
+            "action_count": self.get_action_count(),
+            "message": message,
+            "object_name": str(object_name),
+            "dz": displacement,
+            "motion_path": "task_atom_move_by_displacement",
+        }
+        self._last_action_result = result
+        return result
+
     def get_public_grasp_pose(
         self,
         object_name: str,
