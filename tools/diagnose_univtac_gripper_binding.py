@@ -328,7 +328,9 @@ def main() -> None:
             enable_render=True,
         )
         low_level.reset(seed=0)
+        print("[gripper-diagnostic] recorder_init begin", flush=True)
         recorder = _TraceRecorder(low_level)
+        print("[gripper-diagnostic] recorder_init end", flush=True)
         original_step = low_level.task._step
 
         def traced_step(*step_args, **step_kwargs):
@@ -337,7 +339,9 @@ def main() -> None:
             return result
 
         low_level.task._step = traced_step
+        print("[gripper-diagnostic] initial_state_capture begin", flush=True)
         recorder.capture(include_frame=False)
+        print("[gripper-diagnostic] initial_state_capture end", flush=True)
 
         # Reproduce the official expert's percentage/adaptive action path.
         def expert_gripper(percent: float, phase: str) -> None:
@@ -357,6 +361,7 @@ def main() -> None:
                 low_level.task.in_pre_move = previous_pre_move
 
         api = UniVTACFrankaCompatApi(low_level)
+        print("[gripper-diagnostic] control_api_init end", flush=True)
         stage_results: dict[str, Any] = {}
         if args.scenario == "open-ab":
             expert_gripper(0.0, "expert_prepare_close")
