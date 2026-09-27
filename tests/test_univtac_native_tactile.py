@@ -382,6 +382,8 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
         Path(__file__).resolve().parents[1]
         / "env_configs"
         / "univtac"
+        / "legacy"
+        / "capx-baselines-v1"
         / "grasp_classify_tactile.yaml"
     )
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -434,7 +436,7 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
         "target object": "can",
     }
 
-    legacy_config_dir = config_path.parent / "legacy"
+    legacy_config_dir = config_path.parents[2] / "legacy"
     transfer_config_path = (
         legacy_config_dir
         / "tactile-transfer-v1"

@@ -437,7 +437,13 @@ def test_configured_open_release_floor_overrides_short_model_request() -> None:
 
 
 def test_lift_can_ablation_configs_isolate_tactile_access() -> None:
-    config_root = Path(__file__).resolve().parents[1] / "env_configs" / "univtac"
+    config_root = (
+        Path(__file__).resolve().parents[1]
+        / "env_configs"
+        / "univtac"
+        / "legacy"
+        / "capx-baselines-v1"
+    )
     controller_only = yaml.safe_load(
         (config_root / "lift_can_tactile_controller_only.yaml").read_text(encoding="utf-8")
     )["env"]["cfg"]
@@ -539,6 +545,8 @@ def test_lift_can_prompt_and_controller_do_not_use_univtac_adaptive_helper() -> 
         Path(__file__).resolve().parents[1]
         / "env_configs"
         / "univtac"
+        / "legacy"
+        / "capx-baselines-v1"
         / "lift_can_tactile.yaml"
     )
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -562,6 +570,7 @@ def test_lift_can_prompt_and_controller_do_not_use_univtac_adaptive_helper() -> 
 
 def test_code_execution_treats_zero_system_exit_as_normal_completion() -> None:
     env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.cfg = SimpleNamespace(stream_user_code_output=False)
     env._exec_globals = {}
     env._apis = {}
     env._get_observation = lambda: {}
@@ -579,6 +588,7 @@ def test_code_execution_treats_zero_system_exit_as_normal_completion() -> None:
 
 def test_code_execution_always_exposes_numpy_alias() -> None:
     env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.cfg = SimpleNamespace(stream_user_code_output=False)
     env.low_level_env = object()
     env._apis = {}
     env._init_exec_globals()
@@ -602,6 +612,7 @@ def test_code_execution_blocks_undefined_global_before_motion() -> None:
         take_action=lambda *args, **kwargs: setattr(low_level, "called", True),
     )
     env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.cfg = SimpleNamespace(stream_user_code_output=False)
     env.low_level_env = low_level
     env._apis = {}
     env._init_exec_globals()
@@ -620,6 +631,7 @@ def test_code_execution_blocks_undefined_global_before_motion() -> None:
 
 def test_code_execution_auto_calls_new_solve_when_model_forgets_call() -> None:
     env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.cfg = SimpleNamespace(stream_user_code_output=False)
     env.low_level_env = SimpleNamespace(get_action_count=lambda: 0, get_step_count=lambda: 0)
     env._apis = {}
     env._get_observation = lambda: {}
@@ -637,6 +649,7 @@ def test_code_execution_auto_calls_new_solve_when_model_forgets_call() -> None:
 
 def test_code_execution_does_not_double_call_explicit_solve() -> None:
     env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.cfg = SimpleNamespace(stream_user_code_output=False)
     env.low_level_env = SimpleNamespace(get_action_count=lambda: 0, get_step_count=lambda: 0)
     env._apis = {}
     env._get_observation = lambda: {}
@@ -658,6 +671,7 @@ def test_code_execution_does_not_double_call_explicit_solve() -> None:
 
 def test_code_execution_propagates_timeout_to_runner() -> None:
     env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.cfg = SimpleNamespace(stream_user_code_output=False)
     env.low_level_env = SimpleNamespace(get_action_count=lambda: 0, get_step_count=lambda: 0)
     env._apis = {}
     env._get_observation = lambda: {}

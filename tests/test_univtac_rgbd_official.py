@@ -582,7 +582,8 @@ def test_official_yaml_uses_native_protocol_without_privileged_pose() -> None:
 
     task_config = yaml.safe_load(
         Path(
-            "/mnt/sdc/ljz/UniVTAC/task_config/smoke_capx_lift_can_official.yml"
+            "/mnt/sdc/ljz/UniVTAC/task_config/legacy/capx-baselines-v1/"
+            "smoke_capx_lift_can_official.yml"
         ).read_text()
     )
     assert task_config["skip_task_pre_move"] is False

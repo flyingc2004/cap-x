@@ -14,7 +14,7 @@ case "${MODE}" in
   *) echo "Usage: bash ${BASH_SOURCE[0]} {smoke|quick}" >&2; exit 2 ;;
 esac
 
-CONFIG_PATH="${CAPX_CONFIG_PATH:-env_configs/univtac/grasp_classify_tactile.yaml}"
+CONFIG_PATH="${CAPX_CONFIG_PATH:-env_configs/univtac/tactile_memory_match_response_selection_easy_gt.yaml}"
 if [[ "${CONFIG_PATH}" = /* ]]; then
   CONFIG_FILE="${CONFIG_PATH}"
 else
@@ -53,7 +53,7 @@ python capx/envs/launch_univtac.py \
   --total-trials "${TRIALS}" \
   --num-workers "${CAPX_WORKERS:-1}" \
   --record-video "${CAPX_RECORD_VIDEO:-True}" \
-  --output-dir "${CAPX_OUTPUT_DIR:-${PROJECT_ROOT}/outputs/univtac_grasp_classify_tactile}" \
+  --output-dir "${CAPX_OUTPUT_DIR:-${PROJECT_ROOT}/outputs/univtac_tactile_response_selection}" \
   --model "${CAPX_MODEL:-gpt-4o}" \
   --server-url "${CAPX_SERVER_URL:-http://127.0.0.1:8110/chat/completions}" \
   --temperature "${CAPX_TEMPERATURE:-1.0}"
