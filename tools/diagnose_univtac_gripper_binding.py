@@ -38,7 +38,10 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--capx-config",
-        default=str(REPO_ROOT / "env_configs/univtac/tactile_memory_match_easy_sam_gt.yaml"),
+        default=str(
+            REPO_ROOT
+            / "env_configs/univtac/tactile_memory_match_response_selection_easy_gt.yaml"
+        ),
         help="CaP-X YAML used to load the production FrankaControlApi settings.",
     )
     parser.add_argument("--seed", type=int, default=4002)

@@ -462,7 +462,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         stale in exactly that failure mode, which is misleading during manual
         debugging.
         """
-        if not self._record_frames or not self.live_preview_enabled:
+        if not getattr(self, "_record_frames", False) or not getattr(
+            self, "live_preview_enabled", False
+        ):
             return
         try:
             self._task._update_render()
@@ -547,8 +549,8 @@ class UniVTACLowLevelEnv(BaseEnv):
                 },
             )
 
-        start = self._code_block_action_start
-        limit = self._code_block_action_limit
+        start = getattr(self, "_code_block_action_start", None)
+        limit = getattr(self, "_code_block_action_limit", None)
         if start is None or limit is None:
             return
         used = self.get_action_count() - int(start)
@@ -1258,7 +1260,7 @@ class UniVTACLowLevelEnv(BaseEnv):
     def _record_active_public_probe_frame(self) -> None:
         active = [
             session
-            for session in self._public_probe_sessions.values()
+            for session in getattr(self, "_public_probe_sessions", {}).values()
             if session.get("active_segment") is not None
         ]
         if not active:
@@ -1329,13 +1331,6 @@ class UniVTACLowLevelEnv(BaseEnv):
             return (
                 "Grasp and lift the cylindrical can using UniVTAC native tactile feedback, "
                 "then release it upright on the table."
-            )
-        if self.task_name == "tactile_transfer_rearrange_clean":
-            return (
-                "Move two cylindrical objects in order: object_a to slot_a, then object_b "
-                "to slot_b. The task reset places the gripper near the current object; "
-                "do not assume it is already grasped. Use public anchors and UniVTAC "
-                "native tactile feedback for local grasping, stable transport, and release."
             )
         if self.task_name == "tactile_memory_match":
             return (
@@ -2818,7 +2813,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         ]
         active = [
             session
-            for session in self._public_probe_sessions.values()
+            for session in getattr(self, "_public_probe_sessions", {}).values()
             if session.get("active_segment") is not None
         ]
         if active:

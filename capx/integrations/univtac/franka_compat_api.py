@@ -387,7 +387,7 @@ class UniVTACFrankaCompatApi(ApiBase):
             "get_step_status": self.get_step_status,
             "wait_steps": self.wait_steps,
         }
-        if self.llm_api_profile == "tactile_memory_match":
+        if getattr(self, "llm_api_profile", None) == "tactile_memory_match":
             full = {
                 "get_object_pose": self._memory_match_get_object_pose,
                 "sample_grasp_pose": self.sample_grasp_pose,
@@ -401,7 +401,7 @@ class UniVTACFrankaCompatApi(ApiBase):
         return self._filter_llm_visible_functions(full)
 
     def _filter_llm_visible_functions(self, functions: dict[str, Any]) -> dict[str, Any]:
-        if self.llm_visible_functions is None:
+        if getattr(self, "llm_visible_functions", None) is None:
             return functions
         unknown = self.llm_visible_functions.difference(functions)
         if unknown:

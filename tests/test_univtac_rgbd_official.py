@@ -545,7 +545,10 @@ def test_perception_artifacts_are_saved_under_trial_directory(tmp_path) -> None:
 def test_official_yaml_uses_native_protocol_without_privileged_pose() -> None:
     repo = Path(__file__).resolve().parents[1]
     config = yaml.safe_load(
-        (repo / "env_configs/univtac/lift_can_tactile_official.yaml").read_text()
+        (
+            repo
+            / "env_configs/univtac/legacy/lift-can-memory-v1/lift_can_tactile_official.yaml"
+        ).read_text()
     )
     cfg = config["env"]["cfg"]
     low = cfg["low_level"]
@@ -591,7 +594,10 @@ def test_official_yaml_uses_native_protocol_without_privileged_pose() -> None:
 def test_transfer_easy_gt_yaml_uses_public_anchors_without_sam() -> None:
     repo = Path(__file__).resolve().parents[1]
     config = yaml.safe_load(
-        (repo / "env_configs/univtac/tactile_transfer_easy_gt.yaml").read_text()
+        (
+            repo
+            / "env_configs/univtac/legacy/tactile-transfer-v1/tactile_transfer_easy_gt.yaml"
+        ).read_text()
     )
     cfg = config["env"]["cfg"]
     low = cfg["low_level"]
@@ -629,7 +635,10 @@ def test_transfer_easy_gt_yaml_uses_public_anchors_without_sam() -> None:
 def test_transfer_hard_sam_yaml_routes_pose_perception_without_gt_slots() -> None:
     repo = Path(__file__).resolve().parents[1]
     config = yaml.safe_load(
-        (repo / "env_configs/univtac/tactile_transfer_hard_sam.yaml").read_text()
+        (
+            repo
+            / "env_configs/univtac/legacy/tactile-transfer-v1/tactile_transfer_hard_sam.yaml"
+        ).read_text()
     )
     cfg = config["env"]["cfg"]
     low = cfg["low_level"]

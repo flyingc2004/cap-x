@@ -497,7 +497,10 @@ def test_config_loader_maps_trial_memory_and_disables_persistent_injection() -> 
     root = Path(__file__).resolve().parents[1]
     env_factory, config, _ = _load_config(
         LaunchArgs(
-            config_path=str(root / "env_configs/univtac/tactile_memory_match_easy_sam_gt.yaml")
+            config_path=str(
+                root
+                / "env_configs/univtac/tactile_memory_match_response_selection_easy_gt.yaml"
+            )
         )
     )
 
@@ -807,7 +810,7 @@ def _load_memory_match_config(name: str) -> dict:
 
 
 def test_memory_match_config_exposes_only_bounded_api_surface() -> None:
-    config = _load_memory_match_config("tactile_memory_match_easy_sam_gt.yaml")
+    config = _load_memory_match_config("tactile_memory_match_response_selection_easy_gt.yaml")
     cfg = config["env"]["cfg"]
     low_level = cfg["low_level"]
     api_configs = low_level["api_configs"]
@@ -863,7 +866,7 @@ def test_memory_match_config_exposes_only_bounded_api_surface() -> None:
 
 
 def test_easy_gt_memory_match_config_is_pose_private_and_sam_free() -> None:
-    config = _load_memory_match_config("tactile_memory_match_easy_sam_gt.yaml")
+    config = _load_memory_match_config("tactile_memory_match_response_selection_easy_gt.yaml")
     cfg = config["env"]["cfg"]
     low_level = cfg["low_level"]
     franka = low_level["api_configs"]["franka_control_api"]

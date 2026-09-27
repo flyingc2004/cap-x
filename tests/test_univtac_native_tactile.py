@@ -434,8 +434,11 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
         "target object": "can",
     }
 
-    transfer_config_path = config_path.with_name(
-        "tactile_transfer_rearrange_clean_tactile.yaml"
+    legacy_config_dir = config_path.parent / "legacy"
+    transfer_config_path = (
+        legacy_config_dir
+        / "tactile-transfer-v1"
+        / "tactile_transfer_rearrange_clean_tactile.yaml"
     )
     transfer_config = yaml.safe_load(transfer_config_path.read_text(encoding="utf-8"))
     transfer_cfg = transfer_config["env"]["cfg"]
@@ -460,8 +463,10 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
     assert 'Do not move back to get_object_pose("current_object")' in transfer_cfg["prompt"]
     assert "TactileMemoryApi" not in transfer_cfg["apis"]
 
-    touch_config_path = config_path.with_name(
-        "tactile_transfer_rearrange_clean_touch_primitives.yaml"
+    touch_config_path = (
+        legacy_config_dir
+        / "tactile-transfer-v1"
+        / "tactile_transfer_rearrange_clean_touch_primitives.yaml"
     )
     touch_config = yaml.safe_load(touch_config_path.read_text(encoding="utf-8"))
     touch_cfg = touch_config["env"]["cfg"]
@@ -492,7 +497,13 @@ def test_univtac_api_registration_and_config_are_native_only() -> None:
         "lift_can_tactile_minimal_memory_initial.yaml",
         "lift_can_tactile_minimal_memory_closed_loop.yaml",
     ]:
-        minimal_config = yaml.safe_load(config_path.with_name(minimal_name).read_text(encoding="utf-8"))
+        minimal_config = yaml.safe_load(
+            (
+                legacy_config_dir
+                / "lift-can-memory-v1"
+                / minimal_name
+            ).read_text(encoding="utf-8")
+        )
         minimal_franka = minimal_config["env"]["cfg"]["low_level"]["api_configs"][
             "franka_control_api"
         ]

@@ -2,45 +2,33 @@
 
 ## Current Entry Point
 
-Use `tactile_memory_match_easy_sam_gt.yaml` for the current public-v4
-response-memory selection smoke.
+Use `tactile_memory_match_response_selection_easy_gt.yaml` for the current
+composable tactile-response selection smoke.
 
-- Despite its historical filename, it is **Easy-GT**, not SAM. It uses public
-  reset/grasp anchors for coarse motion and does not launch SAM.
-- It is a fixed, selection-only engineering smoke: CaP-X performs the public
-  probe for reference/left/right, writes trial memory, and selects a
-  candidate. It intentionally does not transport an object to the slot.
-- It requires a generated `tactile_response_expression.v1.json`, provided at
-  runtime through `CAPX_TACTILE_RESPONSE_EXPRESSION`.
+- It uses public reset/grasp anchors only for coarse motion and does not launch
+  SAM.
+- It validates the public probe, task-local trial memory, and candidate
+  selection. Transport is deliberately out of scope for this engineering demo.
+- It requires a generated `tactile_response_expression.v1.json`, passed with
+  `CAPX_TACTILE_RESPONSE_EXPRESSION` when it is not in the UniVTAC default
+  location.
 
-## Memory Terminology
+## Baselines
 
-Every tactile-memory-match YAML currently contains:
+- `lift_can_tactile.yaml` is the native tactile regression baseline.
+- `lift_can_no_tactile.yaml`, `lift_can_tactile_controller_only.yaml`, and the
+  `grasp_classify_*` files remain compact comparison configurations.
 
-```yaml
-tactile_memory:
-  trial:
-    enabled: true
-    include_in_multiturn: true
-  persistent:
-    enabled: false
-```
+## Memory Scope
 
-`trial.enabled` means generated code can write/read `trial_memory.v1` records
-within one trial, including a failure-only regeneration. `persistent.enabled`
-is false, so no configuration carries tactile evidence or a code/skill bank
-across trials. Therefore the `_memory` filename suffix does **not** mean that
-memory is enabled; it is a historical name only.
+The current response-selection configuration enables only bounded trial-local
+memory. It does not inject a persistent code-memory or strategy-memory bank.
+Those generic modules remain available for other experiments but are not part
+of this UniVTAC entry point.
 
-## File Status
+## Archived Configurations
 
-| File | Status | Localization | Memory protocol | Use it now? |
-| --- | --- | --- | --- | --- |
-| `tactile_memory_match_easy_sam_gt.yaml` | Current | Easy-GT public anchors | `tactile_probe.v4` plus frozen `tactile_response_expression.v1` | Yes |
-
-The prior compatibility, Hard-SAM, and `*_memory` YAMLs were deleted because
-they described obsolete full-transport experiments and were frequently
-mistaken for distinct memory modes. Git history preserves them if a prior run
-must be reproduced. A future no-memory baseline must use an explicitly named
-config with `tactile_memory.trial.enabled: false` and no
-`write_trial_memory` / `read_trial_memory` APIs.
+`legacy/lift-can-memory-v1/` contains the earlier lift-can memory-stage
+workflow. `legacy/tactile-transfer-v1/` contains the retired two-cylinder
+transfer variants. They are preserved for history, but are not default entry
+points and their former root paths are intentionally unavailable.
