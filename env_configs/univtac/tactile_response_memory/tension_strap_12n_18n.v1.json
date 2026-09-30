@@ -1,0 +1,140 @@
+{
+  "schema_version": "tactile_stage_memory.v1",
+  "scope": "external_tension_strap_public_response",
+  "protocol_id": "external_strap_12n_18n_hold_response.v1",
+  "response_schema_version": "tactile_stage_response.v1",
+  "capture": {
+    "sampling_rate_hz": 60,
+    "hold_seconds": 3.0,
+    "window_steps": 180,
+    "edge_window_steps": 30,
+    "min_bilateral_contact_ratio": 0.8,
+    "contact_area_threshold": 0.001
+  },
+  "retrieval_rule": {
+    "block_distance": "rms((response-prototype_median)/shared_calibration_iqr)",
+    "fused_distance": "mean(block_distance)",
+    "owner": "generated_code",
+    "note": "The API exposes prototypes only; generated code calculates retrieval distances."
+  },
+  "retrieval_scaler": {
+    "method": "pooled_calibration_iqr",
+    "response_blocks": [
+      {
+        "name": "normal_static",
+        "median": [6.344046688079835, 6.782974052429199],
+        "iqr": [0.017397618293761852, 0.008373808860778986]
+      },
+      {
+        "name": "normal_dynamic",
+        "median": [0.019894933700562056, 0.006863927841186168],
+        "iqr": [0.0024400353431714983, 0.010908198356628152]
+      },
+      {
+        "name": "surface_spatial_static",
+        "median": [7.097784210134022, 7.665632646625328, 6.217715553703611, 6.546614694676554, 0.1318927778045803, 0.1577154854524473],
+        "iqr": [1.496558559871204, 1.5872266793791816, 1.240189739559403, 1.3305743403147945, 0.01148353936096047, 0.003852682710052957]
+      }
+    ]
+  },
+  "provenance": {
+    "calibration_seed_split": [0, 2, 4, 6, 8],
+    "calibration_episode_count": 5,
+    "uses_actor_state": false,
+    "uses_success_label": false,
+    "uses_true_tension": false
+  },
+  "stages": [
+    {
+      "memory_id": "tension_strap_hold_12n.v1",
+      "target_stage": "12n",
+      "response_blocks": [
+        {
+          "name": "normal_static",
+          "fields": [
+            {"path": "hold.left.depth_mm", "transform": "identity"},
+            {"path": "hold.right.depth_mm", "transform": "identity"}
+          ],
+          "scaler": {
+            "median": [6.335203933715821, 6.778904438018799],
+            "iqr": [0.0004458904266346764, 0.00018801689147984746]
+          }
+        },
+        {
+          "name": "normal_dynamic",
+          "fields": [
+            {"path": "end_minus_start.left.depth_mm", "transform": "identity"},
+            {"path": "end_minus_start.right.depth_mm", "transform": "identity"}
+          ],
+          "scaler": {
+            "median": [0.02145972251892303, 0.012306737899779208],
+            "iqr": [0.0005521774291974424, 0.00046644210815571796]
+          }
+        },
+        {
+          "name": "surface_spatial_static",
+          "fields": [
+            {"path": "hold.left.marker_row_gradient_px", "transform": "identity"},
+            {"path": "hold.right.marker_row_gradient_px", "transform": "identity"},
+            {"path": "hold.left.marker_col_gradient_px", "transform": "identity"},
+            {"path": "hold.right.marker_col_gradient_px", "transform": "identity"},
+            {"path": "hold.left.marker_anisotropy_ratio", "transform": "log"},
+            {"path": "hold.right.marker_anisotropy_ratio", "transform": "log"}
+          ],
+          "scaler": {
+            "median": [6.349847128331553, 6.870286742375645, 5.597744360452638, 5.879768091192382, 0.12605193207540302, 0.15567925553013984],
+            "iqr": [0.002172120526552135, 0.006890215473435823, 0.00220638757031022, 0.006296620150934906, 5.2026582599895566e-05, 6.792850255118998e-05]
+          }
+        }
+      ]
+    },
+    {
+      "memory_id": "tension_strap_hold_18n.v1",
+      "target_stage": "18n",
+      "response_blocks": [
+        {
+          "name": "normal_static",
+          "fields": [
+            {"path": "hold.left.depth_mm", "transform": "identity"},
+            {"path": "hold.right.depth_mm", "transform": "identity"}
+          ],
+          "scaler": {
+            "median": [6.352719497680663, 6.787352561950684],
+            "iqr": [0.0003379344940199758, 0.0004419326782230115]
+          }
+        },
+        {
+          "name": "normal_dynamic",
+          "fields": [
+            {"path": "end_minus_start.left.depth_mm", "transform": "identity"},
+            {"path": "end_minus_start.right.depth_mm", "transform": "identity"}
+          ],
+          "scaler": {
+            "median": [0.018977499008178356, 0.0013848304748531604],
+            "iqr": [2.0742416383612294e-05, 0.000433540344237926]
+          }
+        },
+        {
+          "name": "surface_spatial_static",
+          "fields": [
+            {"path": "hold.left.marker_row_gradient_px", "transform": "identity"},
+            {"path": "hold.right.marker_row_gradient_px", "transform": "identity"},
+            {"path": "hold.left.marker_col_gradient_px", "transform": "identity"},
+            {"path": "hold.right.marker_col_gradient_px", "transform": "identity"},
+            {"path": "hold.left.marker_anisotropy_ratio", "transform": "log"},
+            {"path": "hold.right.marker_anisotropy_ratio", "transform": "log"}
+          ],
+          "scaler": {
+            "median": [7.8468283247810255, 8.45876556588506, 6.838407801404509, 7.211499083417769, 0.13754687360034254, 0.1595467636903399],
+            "iqr": [0.0007535611221705096, 0.0011314431672211356, 0.0006951129075991602, 0.0009976192398459816, 6.263953837801206e-05, 1.9756961484596047e-05]
+          }
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "Stage target names are public task targets, not observed labels.",
+    "All response features are derived only from bilateral depth and marker frames.",
+    "The snapshot is frozen from calibration seeds 0,2,4,6,8; runtime must not refit it."
+  ]
+}

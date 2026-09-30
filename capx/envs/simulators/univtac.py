@@ -39,6 +39,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         task_name: str = "grasp_classify",
         task_config: str = "smoke_capx",
         seed_base: int = 0,
+        force_task_seed: int | None = None,
+        force_task: bool = False,
         device: str | None = None,
         task_config_overrides: dict[str, Any] | None = None,
         api_configs: dict[str, Any] | None = None,
@@ -65,6 +67,11 @@ class UniVTACLowLevelEnv(BaseEnv):
         self.task_name = task_name
         self.task_config_name = task_config
         self.seed_base = int(seed_base)
+        self.force_task_seed = (
+            int(force_task_seed) if force_task_seed is not None else None
+        )
+        self._force_task_requested = bool(force_task)
+        self._force_task_mode = False
         self.device_override = device
         self.task_config_overrides = dict(task_config_overrides or {})
         self.api_configs = api_configs or {}
@@ -147,7 +154,16 @@ class UniVTACLowLevelEnv(BaseEnv):
         options: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         trial = int((options or {}).get("trial", 0) or 0)
-        actual_seed = self.seed_base + int(seed if seed is not None else trial)
+        if self._force_task_mode:
+            if self.force_task_seed is None:
+                raise RuntimeError("force_task requires an explicit force_task_seed")
+            if self._reset_serial:
+                raise RuntimeError(
+                    "force tasks require one CaP-X trial per process; rebuild the environment for another seed"
+                )
+            actual_seed = self.force_task_seed
+        else:
+            actual_seed = self.seed_base + int(seed if seed is not None else trial)
         if not self._record_frames:
             self._frame_buffer.clear()
             self._wrist_frame_buffer.clear()
@@ -245,7 +261,12 @@ class UniVTACLowLevelEnv(BaseEnv):
         return 1.0 if self.task_completed() else 0.0
 
     def task_completed(self) -> bool:
-        return bool(self._task.check_success())
+        completed = bool(self._task.check_success())
+        if completed and bool(getattr(self, "_force_task_mode", False)):
+            finalize = getattr(self._task, "_finish_strap_episode", None)
+            if callable(finalize):
+                finalize()
+        return completed
 
     def _active_object_height(self, object_name: str) -> float | None:
         actor = getattr(self._task, str(object_name), None)
@@ -1845,6 +1866,27 @@ class UniVTACLowLevelEnv(BaseEnv):
         env_cfg.scene.num_envs = 1
         if self.device_override:
             env_cfg.sim.device = self.device_override
+        self._force_task_mode = self._force_task_requested or bool(
+            self._task_config.get("force_task", False)
+        )
+        if self._force_task_mode:
+            if self.force_task_seed is None:
+                raise ValueError("force_task config requires low_level.force_task_seed")
+            try:
+                from envs._force_task_utils import prepare_force_task_config
+            except Exception as exc:
+                raise RuntimeError(
+                    "force_task config requires a ViTaForge-compatible task root"
+                ) from exc
+            prepare_force_task_config(
+                env_cfg,
+                self._task_config,
+                task_config_file,
+                seed=self.force_task_seed,
+            )
+            # Preserve the final public tactile response until generated code
+            # returns; the task's physical scorer still remains authoritative.
+            env_cfg.capx_defer_terminal_on_success = True
         self._task = task_module.Task(env_cfg, mode="eval")
         self.record_video_during_reset = bool(
             self._task_config.get(

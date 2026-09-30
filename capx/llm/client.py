@@ -133,6 +133,35 @@ class ModelQueryArgs:
     debug: bool = False
 
 
+class LLMQueryError(RuntimeError):
+    """A completed HTTP request that the model endpoint rejected.
+
+    This is deliberately separate from connection and read timeouts: callers
+    can persist a trial-level diagnostic for a provider rejection (such as
+    HTTP 429) without treating it as a simulator failure.
+    """
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        server_url: str,
+        response_preview: str,
+        retry_after: str | None,
+    ) -> None:
+        self.status_code = int(status_code)
+        self.server_url = server_url
+        self.response_preview = response_preview
+        self.retry_after = retry_after
+        message = (
+            f"LLM endpoint rejected request (status={self.status_code}, "
+            f"url={self.server_url}, preview={self.response_preview!r}"
+        )
+        if retry_after:
+            message += f", retry_after={retry_after!r}"
+        super().__init__(message + ")")
+
+
 class _SimpleResponse:
     """Tiny response wrapper used when requests is unavailable."""
 
@@ -191,6 +220,18 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
     except urllib.error.HTTPError as exc:
         text = exc.read().decode("utf-8", errors="replace")
         return _SimpleResponse(exc.code, dict(exc.headers.items()), text)
+
+
+def _response_preview(response: Any, *, limit: int = 500) -> str:
+    """Return a concise, encoding-safe body preview for an HTTP error."""
+    content = getattr(response, "content", None)
+    if isinstance(content, bytes):
+        text = content.decode("utf-8", errors="replace")
+    elif content is not None:
+        text = str(content)
+    else:
+        text = str(getattr(response, "text", ""))
+    return text[:limit].replace("\n", "\\n")
 
 
 def _disable_thinking_requested(args: Any) -> bool:
@@ -509,7 +550,15 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         f"content_encoding={response.headers.get('content-encoding', '<missing>')}",
         flush=True,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except Exception as exc:
+        raise LLMQueryError(
+            status_code=int(getattr(response, "status_code", 0)),
+            server_url=server_url,
+            response_preview=_response_preview(response),
+            retry_after=response.headers.get("retry-after"),
+        ) from exc
     print("[capx-llm] response JSON parse begin", flush=True)
     try:
         body = response.json()

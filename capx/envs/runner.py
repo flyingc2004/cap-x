@@ -20,6 +20,7 @@ from tqdm import tqdm
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.llm.client import LLMQueryError
 from capx.envs.trial import (
     _annotate_code_blocks,
     _build_log_lines,
@@ -380,6 +381,27 @@ def _run_single_trial_with_timeout(
             flush=True,
         )
         raise
+    except LLMQueryError as exc:
+        print(
+            f"[capx-runner] trial={trial} model request failed; "
+            "saving partial artifacts and ending this trial...",
+            flush=True,
+        )
+        return _build_aborted_summary(
+            env,
+            trial,
+            partial_artifacts,
+            config,
+            exc,
+            sandbox_rc=1,
+            truncated=False,
+            prefix=(
+                f"Trial {trial} stopped because the LLM endpoint rejected the request "
+                f"(HTTP {exc.status_code})."
+            ),
+            error_label="LLM Query Error",
+            video_suffix="llm_error",
+        )
     except BaseException as exc:
         is_timeout = timed_out or isinstance(exc, TimeoutError)
         try:

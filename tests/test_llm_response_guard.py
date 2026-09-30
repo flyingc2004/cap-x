@@ -168,3 +168,22 @@ def test_query_rejects_empty_message_content(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="empty message.content"):
         client.query_model(args, [{"role": "user", "content": "hello"}])
+
+
+def test_query_exposes_provider_rejection_with_status_and_body(monkeypatch) -> None:
+    class Response:
+        status_code = 429
+        headers = {"content-type": "application/json", "retry-after": "30"}
+        content = b'{"error":{"message":"rate limit exceeded"}}'
+
+        def raise_for_status(self) -> None:
+            raise RuntimeError("HTTP 429")
+
+    monkeypatch.setattr(client.requests, "post", lambda *_args, **_kwargs: Response())
+    args = client.ModelQueryArgs(model="kimi-k3", server_url="https://example.test/v1")
+
+    with pytest.raises(client.LLMQueryError, match="status=429") as exc_info:
+        client.query_model(args, [{"role": "user", "content": "hello"}])
+
+    assert exc_info.value.retry_after == "30"
+    assert "rate limit exceeded" in exc_info.value.response_preview

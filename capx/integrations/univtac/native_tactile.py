@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -51,6 +52,79 @@ class UniVTACTactileBuffer:
 
     def frames(self) -> list[UniVTACTactileFrame]:
         return list(self._frames)
+
+
+def summarize_tactile_stage_response(
+    frames: list[UniVTACTactileFrame],
+    *,
+    window_steps: int,
+    edge_window_steps: int,
+    min_bilateral_contact_ratio: float,
+    depth_far_plane_mm: float | None = None,
+    depth_contact_margin_mm: float = 0.5,
+    contact_area_threshold: float = 0.001,
+) -> dict[str, Any]:
+    """Aggregate a public hold response for a frozen tactile stage memory.
+
+    The reducer intentionally mirrors the external tension-strap analysis:
+    robust indentation is the fifth percentile inside the contact support and
+    marker deformation is summarized on its square marker grid.  It consumes
+    only native depth and marker frames; no task state, force label, or actor
+    data is involved.
+    """
+    requested_window = max(1, int(window_steps))
+    requested_edge = max(1, int(edge_window_steps))
+    selected = list(frames)[-requested_window:]
+    sufficient_window = len(selected) >= requested_window
+    edge = min(requested_edge, max(1, len(selected) // 2))
+
+    hold = _stage_response_window(
+        selected,
+        depth_far_plane_mm=depth_far_plane_mm,
+        depth_contact_margin_mm=depth_contact_margin_mm,
+        contact_area_threshold=contact_area_threshold,
+    )
+    start = _stage_response_window(
+        selected[:edge],
+        depth_far_plane_mm=depth_far_plane_mm,
+        depth_contact_margin_mm=depth_contact_margin_mm,
+        contact_area_threshold=contact_area_threshold,
+    )
+    end = _stage_response_window(
+        selected[-edge:],
+        depth_far_plane_mm=depth_far_plane_mm,
+        depth_contact_margin_mm=depth_contact_margin_mm,
+        contact_area_threshold=contact_area_threshold,
+    )
+    ratios = {
+        "hold": float(hold["bilateral_contact_ratio"]),
+        "start": float(start["bilateral_contact_ratio"]),
+        "end": float(end["bilateral_contact_ratio"]),
+    }
+    return {
+        "schema_version": "tactile_stage_response.v1",
+        "window": {
+            "requested_window_steps": requested_window,
+            "captured_frame_count": len(selected),
+            "edge_window_steps": requested_edge,
+            "used_edge_frame_count": edge if selected else 0,
+            "sufficient_window": bool(sufficient_window),
+            "start_step": int(selected[0].step) if selected else None,
+            "end_step": int(selected[-1].step) if selected else None,
+        },
+        "hold": hold,
+        "start": start,
+        "end": end,
+        "end_minus_start": _stage_response_delta(end, start),
+        "quality": {
+            "bilateral_contact_ratios": ratios,
+            "minimum_bilateral_contact_ratio": float(min_bilateral_contact_ratio),
+            "valid": bool(
+                sufficient_window
+                and min(ratios.values()) >= float(min_bilateral_contact_ratio)
+            ),
+        },
+    }
 
 
 def frame_from_observation(obs: dict[str, Any], *, step: int, timestamp: float) -> UniVTACTactileFrame:
@@ -205,6 +279,196 @@ def tactile_event_sequence(
         if not events or events[-1] != event:
             events.append(event)
     return events
+
+
+_STAGE_RESPONSE_FIELDS = (
+    "depth_mm",
+    "marker_displacement_px",
+    "marker_coherence",
+    "marker_row_gradient_px",
+    "marker_col_gradient_px",
+    "marker_anisotropy_ratio",
+    "contact_area",
+)
+
+
+def _stage_response_window(
+    frames: list[UniVTACTactileFrame],
+    *,
+    depth_far_plane_mm: float | None,
+    depth_contact_margin_mm: float,
+    contact_area_threshold: float,
+) -> dict[str, Any]:
+    if not frames:
+        return {
+            "frame_count": 0,
+            "start_step": None,
+            "end_step": None,
+            "bilateral_contact_ratio": 0.0,
+            "left": _empty_stage_response_hand(),
+            "right": _empty_stage_response_hand(),
+        }
+
+    metrics = [
+        {
+            "left": _stage_response_hand_metrics(
+                frame.left_depth,
+                frame.left_marker,
+                depth_far_plane_mm=depth_far_plane_mm,
+                depth_contact_margin_mm=depth_contact_margin_mm,
+                contact_area_threshold=contact_area_threshold,
+            ),
+            "right": _stage_response_hand_metrics(
+                frame.right_depth,
+                frame.right_marker,
+                depth_far_plane_mm=depth_far_plane_mm,
+                depth_contact_margin_mm=depth_contact_margin_mm,
+                contact_area_threshold=contact_area_threshold,
+            ),
+        }
+        for frame in frames
+    ]
+    return {
+        "frame_count": len(frames),
+        "start_step": int(frames[0].step),
+        "end_step": int(frames[-1].step),
+        "bilateral_contact_ratio": float(
+            np.mean([item["left"]["contact"] and item["right"]["contact"] for item in metrics])
+        ),
+        "left": _median_stage_response_hand(item["left"] for item in metrics),
+        "right": _median_stage_response_hand(item["right"] for item in metrics),
+    }
+
+
+def _empty_stage_response_hand() -> dict[str, Any]:
+    return {field: 0.0 for field in _STAGE_RESPONSE_FIELDS} | {"contact": False}
+
+
+def _median_stage_response_hand(values: Any) -> dict[str, Any]:
+    items = list(values)
+    if not items:
+        return _empty_stage_response_hand()
+    result = {}
+    for field in _STAGE_RESPONSE_FIELDS:
+        data = np.asarray([item[field] for item in items], dtype=np.float64)
+        finite = data[np.isfinite(data)]
+        result[field] = float(np.median(finite)) if finite.size else 0.0
+    result["contact"] = bool(np.mean([item["contact"] for item in items]) >= 0.5)
+    return result
+
+
+def _stage_response_delta(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str, dict[str, float]]:
+    return {
+        hand: {
+            field: float(current[hand][field] - baseline[hand][field])
+            for field in _STAGE_RESPONSE_FIELDS
+        }
+        for hand in ("left", "right")
+    }
+
+
+def _stage_response_hand_metrics(
+    depth: np.ndarray | None,
+    marker: np.ndarray | None,
+    *,
+    depth_far_plane_mm: float | None,
+    depth_contact_margin_mm: float,
+    contact_area_threshold: float,
+) -> dict[str, Any]:
+    depth_metrics = _stage_response_depth_metrics(
+        depth,
+        depth_far_plane_mm=depth_far_plane_mm,
+        depth_contact_margin_mm=depth_contact_margin_mm,
+        contact_area_threshold=contact_area_threshold,
+    )
+    marker_metrics = _stage_response_marker_metrics(marker)
+    return {**depth_metrics, **marker_metrics}
+
+
+def _stage_response_depth_metrics(
+    depth: np.ndarray | None,
+    *,
+    depth_far_plane_mm: float | None,
+    depth_contact_margin_mm: float,
+    contact_area_threshold: float,
+) -> dict[str, Any]:
+    if depth is None or depth.size == 0:
+        return {"depth_mm": 0.0, "contact_area": 0.0, "contact": False}
+    values = np.asarray(depth, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {"depth_mm": 0.0, "contact_area": 0.0, "contact": False}
+    far_plane = (
+        float(depth_far_plane_mm)
+        if depth_far_plane_mm is not None
+        else float(np.percentile(values, 95.0))
+    )
+    support = values < far_plane - max(0.0, float(depth_contact_margin_mm))
+    contact_area = float(np.mean(support))
+    depth_mm = (
+        max(0.0, far_plane - float(np.percentile(values[support], 5.0)))
+        if np.any(support)
+        else 0.0
+    )
+    return {
+        "depth_mm": float(depth_mm),
+        "contact_area": contact_area,
+        "contact": bool(
+            depth_mm >= max(0.0, float(depth_contact_margin_mm))
+            and contact_area > max(0.0, float(contact_area_threshold))
+        ),
+    }
+
+
+def _stage_response_marker_metrics(marker: np.ndarray | None) -> dict[str, float]:
+    empty = {
+        "marker_displacement_px": 0.0,
+        "marker_coherence": 0.0,
+        "marker_row_gradient_px": 0.0,
+        "marker_col_gradient_px": 0.0,
+        "marker_anisotropy_ratio": 1.0,
+    }
+    if marker is None or marker.size == 0:
+        return empty
+    marker_array = np.asarray(marker, dtype=np.float64)
+    if marker_array.ndim < 3 or marker_array.shape[0] < 2 or marker_array.shape[-1] < 2:
+        return empty
+    flow_grid = marker_array[-1, ..., :2] - marker_array[0, ..., :2]
+    if flow_grid.ndim == 3 and flow_grid.shape[-1] == 2:
+        grid = flow_grid
+        side = grid.shape[0]
+        if grid.shape[1] != side:
+            return empty
+    elif flow_grid.ndim == 2 and flow_grid.shape[-1] == 2:
+        marker_count = flow_grid.shape[0]
+        side = int(round(math.sqrt(marker_count)))
+        if side * side != marker_count:
+            return empty
+        grid = flow_grid.reshape(side, side, 2)
+    else:
+        return empty
+    valid = grid.reshape(-1, 2)
+    valid = valid[np.isfinite(valid).all(axis=1)]
+    if valid.size == 0:
+        return empty
+    magnitude = np.linalg.norm(valid, axis=1)
+    mean_magnitude = float(np.mean(magnitude))
+    coherence = (
+        0.0
+        if mean_magnitude <= 1e-12
+        else float(np.clip(np.linalg.norm(np.mean(valid, axis=0)) / mean_magnitude, 0.0, 1.0))
+    )
+    row_gradient = float(np.sqrt(np.nanmean(np.square(np.diff(grid, axis=0)))))
+    col_gradient = float(np.sqrt(np.nanmean(np.square(np.diff(grid, axis=1)))))
+    return {
+        "marker_displacement_px": mean_magnitude,
+        "marker_coherence": coherence,
+        "marker_row_gradient_px": row_gradient,
+        "marker_col_gradient_px": col_gradient,
+        "marker_anisotropy_ratio": float(
+            max(row_gradient, 1e-12) / max(col_gradient, 1e-12)
+        ),
+    }
 
 
 def _empty_summary() -> dict[str, Any]:

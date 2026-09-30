@@ -14,10 +14,12 @@ from .univtac import (
     UniVTACTactileApi,
     UniVTACTouchManipulationApi,
 )
+from .opentac import OpenTacApi
 
 register_api("UniVTACControlApi", UniVTACControlApi)
 register_api("UniVTACTactileApi", UniVTACTactileApi)
 register_api("UniVTACTouchManipulationApi", UniVTACTouchManipulationApi)
+register_api("OpenTacApi", OpenTacApi)
 if os.getenv("CAPX_UNIVTAC_MINIMAL_IMPORTS", "0") == "1":
     register_api("FrankaControlApi", UniVTACFrankaCompatApi)
 

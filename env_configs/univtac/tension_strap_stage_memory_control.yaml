@@ -1,0 +1,86 @@
+# One-process, one-seed CaP-X control run for ViTaForge's tension_strap task.
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    stream_user_code_output: false
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/sdc/ljz/ViTaForge_capx_tension}
+      task_name: tension_strap
+      task_config: tension_strap_capx_control
+      force_task: true
+      force_task_seed: ${oc.env:CAPX_FORCE_TASK_SEED,1}
+      seed_base: ${oc.env:CAPX_FORCE_TASK_SEED,1}
+      device: cuda:0
+      live_preview_enabled: true
+      live_preview_path: ${oc.env:CAPX_LIVE_PREVIEW_PATH,/tmp/capx_tension_strap_preview.jpg}
+      live_preview_stride: 5
+      live_preview_jpeg_quality: 85
+      api_configs:
+        franka_control_api:
+          llm_api_profile: opentac_tension_control
+          llm_visible_functions: [move_delta, open_gripper, close_gripper, get_robot_state, wait_steps]
+          tactile_adaptive_gripper_enabled: true
+          use_native_pose_planner: false
+          local_delta_max_m: 0.002
+          local_delta_segment_m: 0.001
+          min_safe_z: 0.10
+          max_gripper_servo_steps: 160
+        opentac_api:
+          llm_visible_functions: [get_tactile_tension_control_contract, begin_tactile_tension_estimator, get_tactile_tension_estimate, get_tactile_stage_memory, capture_tactile_stage_response]
+          tension_calibration_path: task_config/force_task_rgb/tension_strap_dual_stage.json
+          tactile_stage_memory_path: env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v1.json
+          max_delta_z_m: 0.002
+          observation_wait_steps: 2
+          observation_dt_s: 0.016666666666666666
+          stage_hold_seconds: 3.0
+          max_control_actions_per_stage: 120
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis: [FrankaControlApi, OpenTacApi]
+    prompt: |
+      Complete the public two-stage tension-strap task using only FrankaControlApi and OpenTacApi. The task instruction states the ordered targets and hold requirement. Do not read or infer simulator true tension, actor state, reward, success, task metadata, private task fields, or direct environment objects.
+
+      The task pre-move has already reached the public non-contact strap approach. First close the gripper adaptively and wait briefly for the physical grasp fixture to release. Then call begin_tactile_tension_estimator once; if marker tracking cannot initialize, report CAPX_FAILURE and stop.
+
+      Read get_tactile_tension_control_contract() and get_tactile_stage_memory() once. The control contract is the only source of local-motion, sampling, and holding limits. For each target from the task instruction, repeatedly call get_tactile_tension_estimate(). Move only with move_delta(dz=...), using the sign of the public estimate error and a bounded adjustment within the returned contract. Wait between estimates. Avoid oscillation near a target: keep the current pose while the estimate is inside the local hold band.
+
+      After maintaining a complete public hold window, call capture_tactile_stage_response(). Extract all frozen response-block fields, compute block RMS distances using each prototype median and the single shared pooled-calibration IQR, then retain the response only when it matches the intended stage more closely than the other stage. Print a concise CAPX_STAGE diagnostic with both distances and margin. The frozen memory confirms the stage but does not control the robot for you.
+
+      Advance to the next target only after both the hold and its matching 10D response are valid. At the final target, remain in place until the full hold and final response are complete. If grasp, marker tracking, response quality, or action budget fails, print CAPX_FAILURE with the reason and stop. Return concise executable Python only.
+    multi_turn_prompt: |
+      Executed code:
+      {executed_code}
+
+      Console stdout:
+      {console_stdout}
+
+      Console stderr:
+      {console_stderr}
+
+      This is failure-only recovery. Preserve a completed first stage; do not restart its hold or alter the frozen memory. Repair only the incomplete control stage using the public estimator and contract. Do not use private force signals or change the target sequence.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/vitaforge_tension_strap_stage_memory_control
+trial_timeout_seconds: 1200
+max_trial_retries: 1
+max_regenerations: 2
+save_multiturn_prompts: true
+split_code_blocks_on_breakpoint: true
+multi_turn_on_failure_only: true
+filter_multiturn_console: true
+multiturn_console_max_lines: 35
+multiturn_console_max_chars: 5000
+multiturn_console_keep_recent_other: 5
+multiturn_executed_code_max_chars: 6000
+multiturn_remaining_code_max_chars: 3000
+tactile_memory:
+  trial:
+    enabled: false
+    include_in_multiturn: false
+  persistent:
+    enabled: false

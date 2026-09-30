@@ -158,6 +158,7 @@ def _register_univtac_components() -> None:
         UniVTACTactileApi,
         UniVTACTouchManipulationApi,
     )
+    from capx.integrations.opentac import OpenTacApi
 
     class UniVTACCodeEnv(CodeExecutionEnvBase):
         """Generic CaP-X code-execution env for UniVTAC tasks."""
@@ -173,6 +174,7 @@ def _register_univtac_components() -> None:
                     "FrankaControlApi",
                     "UniVTACTactileApi",
                     "UniVTACTouchManipulationApi",
+                    "OpenTacApi",
                 }
             }
 
@@ -190,6 +192,7 @@ def _register_univtac_components() -> None:
     register_api("FrankaControlApi", UniVTACFrankaCompatApi)
     register_api("UniVTACTactileApi", UniVTACTactileApi)
     register_api("UniVTACTouchManipulationApi", UniVTACTouchManipulationApi)
+    register_api("OpenTacApi", OpenTacApi)
 
 
 if __name__ == "__main__":

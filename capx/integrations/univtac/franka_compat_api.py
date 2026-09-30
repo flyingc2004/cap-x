@@ -398,6 +398,14 @@ class UniVTACFrankaCompatApi(ApiBase):
                 "close_gripper": self._memory_match_close_gripper,
                 "wait_steps": self._memory_match_wait_steps,
             }
+        elif getattr(self, "llm_api_profile", None) == "opentac_tension_control":
+            full = {
+                "move_delta": self._opentac_tension_move_delta,
+                "open_gripper": self.open_gripper,
+                "close_gripper": self.close_gripper,
+                "get_robot_state": self.get_robot_state,
+                "wait_steps": self.wait_steps,
+            }
         return self._filter_llm_visible_functions(full)
 
     def _filter_llm_visible_functions(self, functions: dict[str, Any]) -> dict[str, Any]:
@@ -476,6 +484,34 @@ class UniVTACFrankaCompatApi(ApiBase):
             translation_segment_m=self.local_delta_segment_m,
             yaw_segment_rad=self.local_yaw_segment_rad,
             operation="move_delta",
+        )
+
+    def _opentac_tension_move_delta(self, dz: float) -> dict[str, Any]:
+        """Apply one bounded world-Z adjustment for a ViTaForge force task.
+
+        The force controller is intentionally restricted to vertical local
+        motion. This keeps the CaP-X policy from using hidden task geometry or
+        lateral motion as a substitute for tactile feedback.
+        """
+        delta_z = float(dz)
+        if not np.isfinite(delta_z):
+            raise ValueError("move_delta requires a finite dz")
+        if abs(delta_z) > self.local_delta_max_m + 1e-8:
+            return {
+                "ok": False,
+                "reason": "local_delta_limit",
+                "requested_delta_z_m": delta_z,
+                "max_delta_z_m": self.local_delta_max_m,
+            }
+        current_pos, current_quat = self._current_tool_pose()
+        target_pos = current_pos.copy()
+        target_pos[2] = max(float(target_pos[2] + delta_z), self.min_safe_z)
+        return self._memory_match_execute_relative_pose(
+            target_pos,
+            current_quat,
+            translation_segment_m=self.local_delta_segment_m,
+            yaw_segment_rad=self.local_yaw_segment_rad,
+            operation="opentac_tension_move_delta",
         )
 
     def _memory_match_native_vertical_delta(
