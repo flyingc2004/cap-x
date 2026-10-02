@@ -23,6 +23,7 @@ _STAGE_MEMORY_SCHEMA = "tactile_stage_memory.v1"
 _STAGE_RESPONSE_SCHEMA = "tactile_stage_response.v1"
 _ESTIMATE_SCHEMA = "opentac_tension_estimate.v1"
 _CONTROL_SCHEMA = "opentac_tension_control_contract.v1"
+_CONTROL_STATE_SCHEMA = "opentac_tension_control_state.v1"
 
 
 class OpenTacApi(ApiBase):
@@ -46,12 +47,25 @@ class OpenTacApi(ApiBase):
         self._tracker: Any | None = None
         self._reference_images: dict[str, np.ndarray] | None = None
         self._calibration: dict[str, Any] | None = None
+        self._observer_name = f"opentac_tension_estimator_{id(self)}"
+        self._observer_registered = False
+        self._latest_estimate: dict[str, Any] | None = None
+        self._last_observed_step: int | None = None
+        self._last_error: str | None = None
+        self._consecutive_invalid_samples = 0
+        self._stage_index = 0
+        self._stage_hold_seconds = 0.0
+        self._stage_action_counts: list[int] = []
+        self._completed_stage_ids: list[str] = []
+        self._last_state_signature: str | None = None
+        self._stage_memory_cache: dict[str, Any] | None = None
 
     def functions(self) -> dict[str, Any]:
         full = {
             "get_tactile_tension_control_contract": self.get_tactile_tension_control_contract,
             "begin_tactile_tension_estimator": self.begin_tactile_tension_estimator,
             "get_tactile_tension_estimate": self.get_tactile_tension_estimate,
+            "get_tactile_tension_control_state": self.get_tactile_tension_control_state,
             "get_tactile_stage_memory": self.get_tactile_stage_memory,
             "capture_tactile_stage_response": self.capture_tactile_stage_response,
         }
@@ -64,20 +78,35 @@ class OpenTacApi(ApiBase):
 
     def reset_episode(self) -> None:
         """Discard the per-episode marker reference and capture counters."""
+        self._unregister_observers()
         self._capture_count = 0
         self._estimate_count = 0
         self._tracker = None
         self._reference_images = None
         self._calibration = None
+        self._latest_estimate = None
+        self._last_observed_step = None
+        self._last_error = None
+        self._consecutive_invalid_samples = 0
+        self._stage_index = 0
+        self._stage_hold_seconds = 0.0
+        self._stage_action_counts = []
+        self._completed_stage_ids = []
+        self._last_state_signature = None
+        self._stage_memory_cache = None
+        self._publish_diagnostics()
 
     def get_tactile_tension_control_contract(self) -> dict[str, Any]:
         """Return the public local-control contract for the force task.
 
-        It exposes only action safety and sampling cadence. Target force values
-        remain part of the task instruction; the runtime physical scorer is
-        never exposed.
+        It exposes only public action safety, sampling cadence, and target
+        bands. The runtime physical scorer is never exposed.
         """
         config = self._runtime_config()
+        stage_targets = _float_list(config.get("stage_targets_N", [12.0, 18.0]))
+        stage_tolerance = float(config.get("stage_tolerance_N", 0.5))
+        raw_max_actions = config.get("max_control_actions_per_stage", 120)
+        max_actions = None if raw_max_actions is None else int(raw_max_actions)
         contract = {
             "schema_version": _CONTROL_SCHEMA,
             "control_frame": "world",
@@ -86,20 +115,59 @@ class OpenTacApi(ApiBase):
             "observation_wait_steps": int(config.get("observation_wait_steps", 2)),
             "observation_dt_s": float(config.get("observation_dt_s", 1.0 / 60.0)),
             "stage_hold_seconds": float(config.get("stage_hold_seconds", 3.0)),
-            "max_control_actions_per_stage": int(config.get("max_control_actions_per_stage", 120)),
+            "max_control_actions_per_stage": max_actions,
+            "estimator_settle_steps": int(config.get("estimator_settle_steps", 30)),
+            "proportional_delta_gain_m_per_N": float(
+                config.get("proportional_delta_gain_m_per_N", 1.0 / 120000.0)
+            ),
+            "stage_targets_N": stage_targets,
+            "stage_bands_N": [
+                [float(target - stage_tolerance), float(target + stage_tolerance)]
+                for target in stage_targets
+            ],
+            "estimator_update_stride": int(config.get("estimator_update_stride", 1)),
+            "max_estimate_age_steps": int(config.get("max_estimate_age_steps", 3)),
+            "max_consecutive_invalid_samples": int(
+                config.get("max_consecutive_invalid_samples", 3)
+            ),
         }
         if contract["max_delta_z_m"] <= 0.0:
             raise RuntimeError("OpenTac max_delta_z_m must be positive")
         if (
             contract["observation_wait_steps"] < 1
+            or contract["estimator_settle_steps"] < 1
+            or contract["proportional_delta_gain_m_per_N"] <= 0.0
             or contract["observation_dt_s"] <= 0.0
-            or contract["max_control_actions_per_stage"] < 1
+            or (
+                contract["max_control_actions_per_stage"] is not None
+                and contract["max_control_actions_per_stage"] < 1
+            )
+            or stage_tolerance <= 0.0
+            or contract["estimator_update_stride"] < 1
+            or contract["max_estimate_age_steps"] < 0
+            or contract["max_consecutive_invalid_samples"] < 1
+            or len(contract["stage_targets_N"]) != 2
+            or any(target <= 0.0 for target in contract["stage_targets_N"])
         ):
             raise RuntimeError("OpenTac control step limits must be positive")
         return _jsonable(contract)
 
     def begin_tactile_tension_estimator(self) -> dict[str, Any]:
         """Capture a marker-RGB baseline after the agent has secured the strap."""
+        # A retry must not throw away a partially completed public hold by
+        # creating a fresh marker baseline.  Repeated calls are acknowledgements
+        # of the active estimator, not resets.
+        if self._tracker is not None:
+            return _jsonable(
+                {
+                    "schema_version": _ESTIMATE_SCHEMA,
+                    "ok": True,
+                    "status": "already_active",
+                    "step": self._step_count(),
+                    "current_stage_index": self._stage_index,
+                    "completed_stage_ids": list(self._completed_stage_ids),
+                }
+            )
         images = self._read_marker_images()
         calibration = self._load_tension_calibration()
         utilities = self._force_task_utilities()
@@ -110,6 +178,21 @@ class OpenTacApi(ApiBase):
         self._reference_images = images
         self._calibration = calibration
         self._tracker = tracker
+        contract = self.get_tactile_tension_control_contract()
+        # A baseline establishes marker identities; it is not itself a flow
+        # sample. Updating a temporal tracker against the identical baseline
+        # image would consume its first coarse-flow update and make the first
+        # physical motion use only the fragile local correspondence search.
+        self._latest_estimate = self._baseline_pending_record()
+        self._last_observed_step = self._step_count()
+        self._last_error = None
+        self._consecutive_invalid_samples = 0
+        self._stage_index = 0
+        self._stage_hold_seconds = 0.0
+        self._stage_action_counts = [0 for _ in contract["stage_targets_N"]]
+        self._completed_stage_ids = []
+        self._last_state_signature = None
+        self._register_observers()
         record = {
             "schema_version": _ESTIMATE_SCHEMA,
             "ok": True,
@@ -118,6 +201,7 @@ class OpenTacApi(ApiBase):
             "step": self._step_count(),
         }
         self._trace("tension_estimator_begin", record)
+        self._publish_diagnostics()
         return _jsonable(record)
 
     def get_tactile_tension_estimate(self) -> dict[str, Any]:
@@ -129,35 +213,52 @@ class OpenTacApi(ApiBase):
         """
         if self._tracker is None or self._calibration is None or self._reference_images is None:
             raise RuntimeError("call begin_tactile_tension_estimator() after grasping first")
-        images = self._read_marker_images()
-        utilities = self._force_task_utilities()
-        try:
-            features, tracking = utilities.tracked_flow_rgb_features(
-                self._reference_images,
-                images,
-                self._tracker,
-            )
-            estimate = float(utilities.predict_calibrated(self._calibration, features))
-        except Exception as exc:
-            return {
+        record = dict(self._latest_estimate or self._unavailable_record("awaiting_observer_sample"))
+        age_steps = self._estimate_age_steps(record)
+        record["observation_age_steps"] = age_steps
+        if record.get("ok") is True and age_steps > int(
+            self.get_tactile_tension_control_contract()["max_estimate_age_steps"]
+        ):
+            record = {
                 "schema_version": _ESTIMATE_SCHEMA,
                 "ok": False,
-                "status": "tracking_unavailable",
-                "message": str(exc),
+                "status": "stale_estimate",
+                "message": "no fresh marker-RGB update after the last task step",
+                "sample_step": record.get("sample_step"),
                 "step": self._step_count(),
+                "observation_age_steps": age_steps,
             }
-        self._estimate_count += 1
-        record = {
-            "schema_version": _ESTIMATE_SCHEMA,
-            "ok": bool(np.isfinite(estimate)),
-            "status": "ok" if np.isfinite(estimate) else "invalid_estimate",
-            "estimated_tension_N": float(estimate) if np.isfinite(estimate) else None,
-            "tracking": _public_tracking_summary(tracking),
-            "estimate_id": f"estimate_{self._estimate_count:03d}",
-            "step": self._step_count(),
-        }
-        self._trace("tension_estimate", record)
         return _jsonable(record)
+
+    def get_tactile_tension_control_state(self) -> dict[str, Any]:
+        """Return public marker-derived control progress for safe continuation."""
+        contract = self.get_tactile_tension_control_contract()
+        targets = list(contract["stage_targets_N"])
+        current_target = targets[self._stage_index] if self._stage_index < len(targets) else None
+        current_memory_id = (
+            self._stage_memory_id(current_target) if current_target is not None else None
+        )
+        latest = self.get_tactile_tension_estimate() if self._tracker is not None else None
+        action_count = (
+            self._stage_action_counts[self._stage_index]
+            if self._stage_index < len(self._stage_action_counts)
+            else 0
+        )
+        return _jsonable(
+            {
+                "schema_version": _CONTROL_STATE_SCHEMA,
+                "estimator_active": self._tracker is not None,
+                "completed_stage_ids": list(self._completed_stage_ids),
+                "current_stage_index": int(self._stage_index),
+                "current_stage_memory_id": current_memory_id,
+                "current_target_N": current_target,
+                "current_stage_in_band_hold_seconds": self._stage_hold_seconds,
+                "current_stage_action_count": int(action_count),
+                "latest_estimate": latest,
+                "consecutive_invalid_samples": int(self._consecutive_invalid_samples),
+                "last_error": self._last_error,
+            }
+        )
 
     def get_tactile_stage_memory(self) -> dict[str, Any]:
         """Return the frozen 12N/18N public tactile-response memory.
@@ -168,6 +269,13 @@ class OpenTacApi(ApiBase):
         memory = self._load_stage_memory()
         _validate_stage_memory(memory)
         record = _jsonable(memory)
+        publish_memory = getattr(
+            self._env, "set_tension_stage_memory_visualization", None
+        )
+        if callable(publish_memory):
+            # Frozen medians are useful video context even before the first
+            # completed 3-second capture exists. This is display-only.
+            publish_memory(record)
         self._trace(
             "stage_memory",
             {
@@ -203,8 +311,314 @@ class OpenTacApi(ApiBase):
         }
         if record.get("schema_version") != _STAGE_RESPONSE_SCHEMA:
             raise RuntimeError("OpenTac stage reducer returned an invalid schema")
+        # The video renderer receives the public capture and frozen medians as
+        # a read-only diagnostic. This never feeds into OpenTac control or the
+        # LLM request context.
+        publish_visualization = getattr(
+            self._env, "set_tension_response_visualization", None
+        )
+        if callable(publish_visualization):
+            publish_visualization(record, memory)
         self._trace("stage_response_capture", {"record": record})
         return _jsonable(record)
+
+    def runtime_memory_context(self, max_chars: int = 4000) -> str:
+        """Return bounded public estimator state for a failure-recovery turn."""
+        state = self.get_tactile_tension_control_state()
+        latest = state.get("latest_estimate")
+        if isinstance(latest, dict):
+            latest = {
+                key: latest.get(key)
+                for key in (
+                    "ok",
+                    "status",
+                    "estimated_tension_N",
+                    "sample_step",
+                    "observation_age_steps",
+                    "tracking",
+                    "message",
+                )
+                if key in latest
+            }
+        context = {
+            "schema_version": _CONTROL_STATE_SCHEMA,
+            "estimator_active": state["estimator_active"],
+            "completed_stage_ids": state["completed_stage_ids"],
+            "current_stage_index": state["current_stage_index"],
+            "current_stage_memory_id": state["current_stage_memory_id"],
+            "current_target_N": state["current_target_N"],
+            "current_stage_in_band_hold_seconds": state[
+                "current_stage_in_band_hold_seconds"
+            ],
+            "current_stage_action_count": state["current_stage_action_count"],
+            "latest_estimate": latest,
+            "consecutive_invalid_samples": state["consecutive_invalid_samples"],
+            "last_error": state["last_error"],
+        }
+        text = json.dumps(_jsonable(context), ensure_ascii=False, separators=(",", ":"))
+        return text[: max(0, int(max_chars))]
+
+    def _register_observers(self) -> None:
+        if self._observer_registered:
+            return
+        register_step = getattr(self._env, "register_post_step_observer", None)
+        register_action = getattr(self._env, "register_post_action_observer", None)
+        if callable(register_step):
+            register_step(self._observer_name, self._on_post_task_step)
+        if callable(register_action):
+            register_action(self._observer_name, self._on_post_action)
+        self._observer_registered = callable(register_step) or callable(register_action)
+
+    def _unregister_observers(self) -> None:
+        unregister_step = getattr(self._env, "unregister_post_step_observer", None)
+        unregister_action = getattr(self._env, "unregister_post_action_observer", None)
+        if callable(unregister_step):
+            unregister_step(self._observer_name)
+        if callable(unregister_action):
+            unregister_action(self._observer_name)
+        self._observer_registered = False
+
+    def _on_post_task_step(self) -> None:
+        if self._tracker is None:
+            return
+        self._sample_estimator()
+
+    def _on_post_action(self, action_type: str, result: dict[str, Any]) -> None:
+        if self._tracker is None or result.get("ok") is not True:
+            return
+        if action_type != "qpos" or self._stage_index >= len(self._stage_action_counts):
+            return
+        self._stage_action_counts[self._stage_index] += 1
+        self._publish_diagnostics()
+
+    def _sample_estimator(self, *, force: bool = False) -> None:
+        if self._tracker is None or self._calibration is None or self._reference_images is None:
+            return
+        step = self._step_count()
+        if step is not None and self._last_observed_step == step and not force:
+            return
+        if step is not None and not force:
+            stride = int(self.get_tactile_tension_control_contract()["estimator_update_stride"])
+            if self._last_observed_step is not None and step - self._last_observed_step < stride:
+                return
+        if step is not None:
+            self._last_observed_step = step
+        try:
+            images = self._read_marker_images()
+            utilities = self._force_task_utilities()
+            features, tracking = utilities.tracked_flow_rgb_features(
+                self._reference_images,
+                images,
+                self._tracker,
+            )
+            estimate = float(utilities.predict_calibrated(self._calibration, features))
+        except Exception as exc:
+            self._record_invalid_estimate("tracking_unavailable", str(exc), step)
+            return
+
+        if not np.isfinite(estimate):
+            self._record_invalid_estimate("invalid_estimate", "calibration returned non-finite value", step)
+            return
+
+        self._estimate_count += 1
+        record = {
+            "schema_version": _ESTIMATE_SCHEMA,
+            "ok": True,
+            "status": "ok",
+            "estimated_tension_N": float(estimate),
+            "tracking": _public_tracking_summary(tracking),
+            "estimate_id": f"estimate_{self._estimate_count:03d}",
+            "sample_step": step,
+            "step": step,
+        }
+        self._latest_estimate = record
+        self._last_error = None
+        self._consecutive_invalid_samples = 0
+        self._update_public_stage_progress(record)
+        self._emit_state_transition("tension_estimate_state")
+        self._publish_diagnostics()
+        self._publish_live_stage_response()
+
+    def _publish_live_stage_response(self) -> None:
+        """Refresh the video-only rolling 10D preview from public frames.
+
+        This does not create a capture artifact, advance a stage, or enter the
+        LLM context. It is only the dashboard's view of the recent public
+        tactile window that a later explicit capture will reduce.
+        """
+        publish = getattr(self._env, "set_tension_response_preview", None)
+        tactile_buffer = getattr(self._env, "tactile_buffer", None)
+        if not callable(publish) or tactile_buffer is None:
+            return
+        try:
+            memory = self._load_stage_memory()
+            capture = memory["capture"]
+            calibration = self._native_tactile_calibration()
+            response = summarize_tactile_stage_response(
+                tactile_buffer.recent(int(capture["window_steps"])),
+                window_steps=int(capture["window_steps"]),
+                edge_window_steps=int(capture["edge_window_steps"]),
+                min_bilateral_contact_ratio=float(capture["min_bilateral_contact_ratio"]),
+                contact_area_threshold=float(capture["contact_area_threshold"]),
+                depth_far_plane_mm=calibration.get("depth_far_plane_mm"),
+                depth_contact_margin_mm=float(
+                    calibration.get("depth_contact_margin_mm", 0.5)
+                ),
+            )
+            step = self._step_count()
+            response.update(
+                {
+                    "capture_id": f"live_step_{step}" if step is not None else "live",
+                    "protocol_id": str(memory["protocol_id"]),
+                    "step": step,
+                }
+            )
+            publish(response, memory)
+        except Exception:
+            # Preview must never interrupt control or turn a rendering hiccup
+            # into a false environment/control failure.
+            return
+
+    def _record_invalid_estimate(self, status: str, message: str, step: int | None) -> None:
+        self._consecutive_invalid_samples += 1
+        self._stage_hold_seconds = 0.0
+        self._last_error = str(message)
+        self._latest_estimate = {
+            "schema_version": _ESTIMATE_SCHEMA,
+            "ok": False,
+            "status": str(status),
+            "message": str(message),
+            "sample_step": step,
+            "step": step,
+        }
+        self._publish_diagnostics()
+        max_invalid = int(
+            self.get_tactile_tension_control_contract()["max_consecutive_invalid_samples"]
+        )
+        self._emit_state_transition(
+            "tension_estimate_invalid",
+            force=self._consecutive_invalid_samples in {1, max_invalid},
+        )
+
+    def _update_public_stage_progress(self, estimate: dict[str, Any]) -> None:
+        contract = self.get_tactile_tension_control_contract()
+        targets = list(contract["stage_targets_N"])
+        if self._stage_index >= len(targets):
+            return
+        tension = float(estimate["estimated_tension_N"])
+        target = float(targets[self._stage_index])
+        low, high = contract["stage_bands_N"][self._stage_index]
+        if not float(low) <= tension <= float(high):
+            self._stage_hold_seconds = 0.0
+            return
+        self._stage_hold_seconds += float(contract["observation_dt_s"])
+        if self._stage_hold_seconds + 1e-9 < float(contract["stage_hold_seconds"]):
+            return
+        stage_id = self._stage_memory_id(target)
+        self._completed_stage_ids.append(stage_id)
+        self._stage_index += 1
+        self._stage_hold_seconds = 0.0
+        self._trace(
+            "tension_stage_checkpoint",
+            {
+                "schema_version": _CONTROL_STATE_SCHEMA,
+                "completed_stage_id": stage_id,
+                "sample_step": estimate.get("sample_step"),
+                "estimated_tension_N": tension,
+            },
+        )
+        self._emit_state_transition("tension_stage_progress", force=True)
+
+    def _estimate_age_steps(self, estimate: dict[str, Any]) -> int | None:
+        current_step = self._step_count()
+        sample_step = estimate.get("sample_step")
+        if not isinstance(current_step, int) or not isinstance(sample_step, int):
+            return None
+        return max(0, int(current_step - sample_step))
+
+    def _unavailable_record(self, status: str) -> dict[str, Any]:
+        return {
+            "schema_version": _ESTIMATE_SCHEMA,
+            "ok": False,
+            "status": status,
+            "message": "no marker-RGB estimate is cached",
+            "sample_step": self._step_count(),
+            "step": self._step_count(),
+        }
+
+    def _baseline_pending_record(self) -> dict[str, Any]:
+        step = self._step_count()
+        return {
+            "schema_version": _ESTIMATE_SCHEMA,
+            "ok": False,
+            "status": "baseline_pending",
+            "message": "awaiting the first post-baseline marker-RGB sample",
+            "sample_step": step,
+            "step": step,
+        }
+
+    @staticmethod
+    def _stage_memory_id(target: float) -> str:
+        return f"tension_strap_hold_{float(target):g}n.v1"
+
+    def _publish_diagnostics(self) -> None:
+        setter = getattr(self._env, "set_opentac_tension_estimator_diagnostics", None)
+        if not callable(setter):
+            return
+        latest = self._latest_estimate or {}
+        setter(
+            {
+                "schema_version": _CONTROL_STATE_SCHEMA,
+                "estimator_active": self._tracker is not None,
+                "latest_estimate": latest,
+                "completed_stage_ids": list(self._completed_stage_ids),
+                "current_stage_index": self._stage_index,
+                "current_stage_in_band_hold_seconds": self._stage_hold_seconds,
+                "stage_action_counts": list(self._stage_action_counts),
+                "consecutive_invalid_samples": self._consecutive_invalid_samples,
+                "last_error": self._last_error,
+            }
+        )
+
+    def _emit_state_transition(self, event: str, *, force: bool = False) -> None:
+        latest = self._latest_estimate or {}
+        signature = json.dumps(
+            {
+                "status": latest.get("status"),
+                "message": latest.get("message"),
+                "completed": self._completed_stage_ids,
+                "stage_index": self._stage_index,
+                "invalid_phase": (
+                    0
+                    if self._consecutive_invalid_samples == 0
+                    else (
+                        "limit"
+                        if self._consecutive_invalid_samples
+                        >= int(
+                            self.get_tactile_tension_control_contract()[
+                                "max_consecutive_invalid_samples"
+                            ]
+                        )
+                        else "transient"
+                    )
+                ),
+            },
+            sort_keys=True,
+        )
+        if not force and signature == self._last_state_signature:
+            return
+        self._last_state_signature = signature
+        self._trace(
+            event,
+            {
+                "schema_version": _CONTROL_STATE_SCHEMA,
+                "latest_estimate": latest,
+                "completed_stage_ids": list(self._completed_stage_ids),
+                "current_stage_index": self._stage_index,
+                "consecutive_invalid_samples": self._consecutive_invalid_samples,
+                "last_error": self._last_error,
+            },
+        )
 
     def _runtime_config(self) -> dict[str, Any]:
         configs = getattr(self._env, "api_configs", {})
@@ -212,7 +626,9 @@ class OpenTacApi(ApiBase):
         return config if isinstance(config, dict) else {}
 
     def _read_marker_images(self) -> dict[str, np.ndarray]:
-        _refresh_tactile(self._env, data_types=["rgb_marker"])
+        # The tracker consumes marker RGB; the co-sampled public depth and
+        # marker coordinates are retained for the runtime 10D panel/capture.
+        _refresh_tactile(self._env, data_types=["rgb_marker", "depth", "marker"])
         raw_fn = getattr(self._env, "current_raw_observation", None)
         raw = raw_fn() if callable(raw_fn) else {}
         tactile = raw.get("tactile", {}) if isinstance(raw, dict) else {}
@@ -239,6 +655,8 @@ class OpenTacApi(ApiBase):
         return payload
 
     def _load_stage_memory(self) -> dict[str, Any]:
+        if self._stage_memory_cache is not None:
+            return self._stage_memory_cache
         config = self._runtime_config()
         source = config.get("tactile_stage_memory")
         path_value = config.get("tactile_stage_memory_path")
@@ -250,6 +668,7 @@ class OpenTacApi(ApiBase):
                 raise RuntimeError(f"could not load OpenTac stage memory from {path}: {exc}") from exc
         if not isinstance(source, dict):
             raise RuntimeError("OpenTac requires a tactile_stage_memory.v1 sidecar")
+        self._stage_memory_cache = source
         return source
 
     def _force_task_utilities(self) -> Any:
@@ -381,6 +800,15 @@ def _finite(value: Any) -> bool:
         return bool(np.isfinite(float(value)))
     except (TypeError, ValueError):
         return False
+
+
+def _float_list(value: Any) -> list[float]:
+    if not isinstance(value, (list, tuple)):
+        raise RuntimeError("OpenTac stage_targets_N must be a list")
+    values = [float(item) for item in value]
+    if not all(np.isfinite(item) for item in values):
+        raise RuntimeError("OpenTac stage_targets_N must be finite")
+    return values
 
 
 def _jsonable(value: Any) -> Any:

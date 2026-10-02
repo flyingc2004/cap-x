@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
-from capx.llm.client import LLMQueryError
+from capx.llm.client import LLMQueryError, summarize_llm_usage
 from capx.envs.trial import (
     _annotate_code_blocks,
     _build_log_lines,
@@ -521,6 +521,7 @@ def _build_aborted_summary(
         visual_feedback_imgs=pa.get("visual_feedback_imgs", []),
         ensemble_data=pa.get("ensemble_data"),
         multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
+        llm_usage_events=pa.get("llm_usage_events", []),
     )
     # Ignore repeated Ctrl-C while serializing the buffered frames.  The first
     # interrupt has already been handled; a second should not corrupt the only
@@ -570,4 +571,5 @@ def _build_aborted_summary(
         num_regenerations=num_regenerations,
         num_finishes=num_finishes,
         num_code_blocks=num_code_blocks,
+        llm_usage=summarize_llm_usage(pa.get("llm_usage_events", [])),
     )

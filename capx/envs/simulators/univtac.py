@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
+import math
 import os
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import cv2
 import numpy as np
 import torch
 import yaml
@@ -53,6 +58,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         ),
         live_preview_stride: int = 5,
         live_preview_jpeg_quality: int = 80,
+        video_renderer: str = "capx_composed",
+        tension_response_panel: dict[str, Any] | None = None,
+        runtime_preflight: dict[str, Any] | None = None,
         memory_overlay_enabled: bool = False,
         selection_only_audit: bool = False,
         tactile_buffer_size: int = 500,
@@ -72,6 +80,11 @@ class UniVTACLowLevelEnv(BaseEnv):
         )
         self._force_task_requested = bool(force_task)
         self._force_task_mode = False
+        # Force tasks use a target-position servo.  Keep the commanded target
+        # separately from the lagging physical end-effector pose so repeated
+        # small public deltas compose like the official expert controller.
+        self._force_task_command_ee_pos: torch.Tensor | None = None
+        self._force_task_command_ee_quat: torch.Tensor | None = None
         self.device_override = device
         self.task_config_overrides = dict(task_config_overrides or {})
         self.api_configs = api_configs or {}
@@ -86,6 +99,33 @@ class UniVTACLowLevelEnv(BaseEnv):
         self.live_preview_jpeg_quality = int(
             np.clip(int(live_preview_jpeg_quality), 1, 95)
         )
+        self.video_renderer = str(video_renderer).strip().lower()
+        if self.video_renderer not in {"capx_composed", "task_native"}:
+            raise ValueError(
+                "video_renderer must be 'capx_composed' or 'task_native'"
+            )
+        self.tension_response_panel = dict(tension_response_panel or {})
+        self.tension_response_panel_enabled = bool(
+            self.tension_response_panel.get("enabled", False)
+        )
+        self.tension_response_panel_style = str(
+            self.tension_response_panel.get("style", "compact")
+        ).strip().lower()
+        if self.tension_response_panel_style not in {"compact", "detailed"}:
+            raise ValueError(
+                "tension_response_panel.style must be 'compact' or 'detailed'"
+            )
+        self.tension_response_panel_height = max(
+            120, int(self.tension_response_panel.get("height", 240))
+        )
+        self.tension_response_history_points = max(
+            30, int(self.tension_response_panel.get("history_points", 180))
+        )
+        self.runtime_preflight = dict(runtime_preflight or {})
+        if self.video_renderer == "task_native" and memory_overlay_enabled:
+            raise ValueError(
+                "task_native video cannot be combined with memory_overlay_enabled"
+            )
         self.memory_overlay_enabled = bool(memory_overlay_enabled)
         self.selection_only_audit = bool(selection_only_audit)
         self._record_action_frames = True
@@ -102,6 +142,16 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._record_wrist_camera = False
         self._frame_buffer: list[np.ndarray] = []
         self._wrist_frame_buffer: list[np.ndarray] = []
+        self._video_stream_enabled = False
+        self._video_stream_dir: Path | None = None
+        self._video_stream_combined_writer: Any | None = None
+        self._video_stream_turn_writer: Any | None = None
+        self._video_stream_turn_index: int | None = None
+        self._video_stream_frame_count = 0
+        # OpenCV's mp4v stream writer is fast enough for simulation-time
+        # recording, but not reliably playable by iPad/browser previews.
+        # Native tension videos are converted after writers are closed.
+        self._video_stream_h264 = self.video_renderer == "task_native"
         self._tactile_buffer = UniVTACTactileBuffer(maxlen=tactile_buffer_size)
         self.lift_success_height_delta = float(lift_success_height_delta)
         self.lift_success_require_contact = bool(lift_success_require_contact)
@@ -123,6 +173,16 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._public_probe_serial = 0
         self._pre_move_tactile_timeline: list[dict[str, Any]] = []
         self._pre_move_tactile_last_error: str | None = None
+        self._runtime_preflight_diagnostics: dict[str, Any] = {}
+        self._tension_response_visualization = _empty_tension_response_visualization()
+        self._tension_response_video_frames: list[Any] = []
+        self._tension_response_video_history: list[dict[str, Any]] = []
+        self._post_step_observers: dict[str, Callable[[], None]] = {}
+        self._post_action_observers: dict[
+            str, Callable[[str, dict[str, Any]], None]
+        ] = {}
+        self._post_observer_errors: set[tuple[str, str]] = set()
+        self._opentac_tension_estimator_diagnostics: dict[str, Any] = {}
         self._perception_artifacts: list[dict[str, Any]] = []
         self._public_pose_cache: dict[str, dict[str, Any]] = {}
         self._active_public_grasp_object_name: str | None = None
@@ -185,9 +245,20 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._public_probe_serial = 0
         self._pre_move_tactile_timeline.clear()
         self._pre_move_tactile_last_error = None
+        self._tension_response_visualization = _empty_tension_response_visualization()
+        self._tension_response_video_frames.clear()
+        self._tension_response_video_history.clear()
+        # APIs reset immediately after the low-level reset. Clearing callbacks here
+        # prevents a previous episode's marker tracker from observing reset motion.
+        self._post_step_observers.clear()
+        self._post_action_observers.clear()
+        self._post_observer_errors.clear()
+        self._opentac_tension_estimator_diagnostics.clear()
         self._perception_artifacts.clear()
         self._public_pose_cache.clear()
         self._active_public_grasp_object_name = None
+        self._force_task_command_ee_pos = None
+        self._force_task_command_ee_quat = None
         self._protocol_stopped = False
         self._protocol_stop_reason = None
         self.clear_trial_deadline()
@@ -291,7 +362,186 @@ class UniVTACLowLevelEnv(BaseEnv):
             "message": "action executed" if exec_success else "UniVTAC action execution failed",
         }
         self._last_action_result = result
+        self._notify_post_action_observers(action_type, result)
         return result
+
+    def register_post_step_observer(self, name: str, observer: Callable[[], None]) -> None:
+        """Register an adapter-internal observer invoked after each task step."""
+        self._post_step_observers[str(name)] = observer
+
+    def unregister_post_step_observer(self, name: str) -> None:
+        self._post_step_observers.pop(str(name), None)
+
+    def register_post_action_observer(
+        self, name: str, observer: Callable[[str, dict[str, Any]], None]
+    ) -> None:
+        """Register an adapter-internal observer invoked after each public action."""
+        self._post_action_observers[str(name)] = observer
+
+    def unregister_post_action_observer(self, name: str) -> None:
+        self._post_action_observers.pop(str(name), None)
+
+    def set_opentac_tension_estimator_diagnostics(self, diagnostics: dict[str, Any]) -> None:
+        """Store public OpenTac estimator diagnostics for the trial artifact."""
+        self._opentac_tension_estimator_diagnostics = _jsonable(dict(diagnostics))
+
+    def _notify_post_step_observers(self) -> None:
+        self._notify_observers(self._post_step_observers, "post_step")
+
+    def _notify_post_action_observers(
+        self, action_type: str, result: dict[str, Any]
+    ) -> None:
+        for name, observer in tuple(self._post_action_observers.items()):
+            try:
+                observer(str(action_type), _jsonable(dict(result)))
+            except Exception as exc:
+                self._record_observer_error(name, "post_action", exc)
+
+    def _notify_observers(
+        self, observers: dict[str, Callable[[], None]], phase: str
+    ) -> None:
+        for name, observer in tuple(observers.items()):
+            try:
+                observer()
+            except Exception as exc:
+                self._record_observer_error(name, phase, exc)
+
+    def _record_observer_error(self, name: str, phase: str, exc: Exception) -> None:
+        key = (str(name), repr(exc))
+        if key in self._post_observer_errors:
+            return
+        self._post_observer_errors.add(key)
+        print(
+            f"[capx-univtac] internal observer error name={name} phase={phase}: {exc!r}",
+            flush=True,
+        )
+
+    def move_force_task_vertical_delta(self, *, dz: float) -> dict[str, Any]:
+        """Execute a public vertical delta through force-task absolute qpos.
+
+        ViTaForge's final-acceptance force tasks intentionally reject generic
+        Cartesian actions.  The adapter uses its native differential-IK helper
+        to form a single absolute qpos target while keeping the LLM-visible
+        operation restricted to a bounded public Z delta.
+        """
+        if not self._force_task_mode:
+            return {
+                "ok": False,
+                "reason": "force_task_qpos_bridge_unavailable",
+            }
+        if not np.isfinite(dz):
+            raise ValueError("force-task vertical delta must be finite")
+        robot_manager = getattr(self._task, "_robot_manager", None)
+        if robot_manager is None:
+            return {"ok": False, "reason": "force_task_ik_bridge_unavailable"}
+        try:
+            qpos, target_pos, motion_path = self._force_task_accumulated_qpos_target(
+                robot_manager, float(dz)
+            )
+            if qpos.numel() != 8 or not bool(torch.isfinite(qpos).all()):
+                raise RuntimeError("native IK returned an invalid qpos target")
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": "force_task_ik_target_failed",
+                "message": str(exc),
+            }
+        result = self.take_action(qpos, action_type="qpos")
+        return {
+            **result,
+            "operation": "opentac_tension_move_delta",
+            "motion_path": motion_path,
+            "requested_delta_z_m": float(dz),
+            "command_target_ee_z_m": float(target_pos.reshape(-1, 3)[0, 2].item()),
+        }
+
+    def _force_task_accumulated_qpos_target(
+        self, robot_manager: Any, dz: float
+    ) -> tuple[torch.Tensor, torch.Tensor, str]:
+        """Build the next force-task qpos target using an expert-style servo.
+
+        ViTaForge's expert integrates its desired end-effector target and then
+        solves IK from the *current* physical pose.  Reconstructing each
+        ``move_delta`` from the physical pose loses target motion whenever the
+        compliant strap lags the arm.  This adapter-only bridge keeps a bounded
+        command lead while preserving the public local-Z action interface.
+        """
+        get_pose = getattr(robot_manager, "get_ee_pose_tensor", None)
+        ik_controller = getattr(robot_manager, "_ik_controller", None)
+        setup_ik = getattr(robot_manager, "_setup_ik_controller", None)
+        if ik_controller is None and callable(setup_ik):
+            setup_ik()
+            ik_controller = getattr(robot_manager, "_ik_controller", None)
+        arm_ids = getattr(robot_manager, "_arm_ids", None)
+        jacobian = getattr(robot_manager, "jacobian_b", None)
+        robot = getattr(robot_manager, "robot", None)
+        if not (
+            callable(get_pose)
+            and ik_controller is not None
+            and arm_ids is not None
+            and jacobian is not None
+            and robot is not None
+        ):
+            return self._force_task_legacy_delta_qpos_target(robot_manager, dz)
+
+        current_pos, current_quat = get_pose()
+        current_pos = current_pos.detach().to(device=self._task.device, dtype=torch.float32)
+        current_quat = current_quat.detach().to(device=self._task.device, dtype=torch.float32)
+        if self._force_task_command_ee_pos is None:
+            commanded_pos = current_pos.clone()
+            commanded_quat = current_quat.clone()
+        else:
+            commanded_pos = self._force_task_command_ee_pos.to(
+                device=self._task.device, dtype=torch.float32
+            ).clone()
+            commanded_quat = self._force_task_command_ee_quat.to(
+                device=self._task.device, dtype=torch.float32
+            ).clone()
+
+        commanded_pos[:, 2] += float(dz)
+        lead = self._force_task_target_lead_m()
+        commanded_pos[:, 2] = torch.minimum(
+            commanded_pos[:, 2], current_pos[:, 2] + lead
+        )
+        ik_controller.set_command(torch.cat([commanded_pos, commanded_quat], dim=-1))
+        joint_pos = robot.data.joint_pos[:, arm_ids]
+        joint_pos_des = ik_controller.compute(
+            current_pos,
+            current_quat,
+            jacobian[:, :, arm_ids],
+            joint_pos,
+        )
+        limits = robot.data.soft_joint_pos_limits[:, arm_ids]
+        joint_pos_des = torch.clamp(joint_pos_des, limits[..., 0], limits[..., 1])
+        gripper_qpos = robot.data.joint_pos[:, robot_manager._gripper_ids][0, 0]
+        qpos = torch.cat([joint_pos_des.reshape(-1)[:7], gripper_qpos.reshape(1)])
+        self._force_task_command_ee_pos = commanded_pos.detach().clone()
+        self._force_task_command_ee_quat = commanded_quat.detach().clone()
+        return qpos, commanded_pos, "force_task_accumulated_ik_to_absolute_qpos"
+
+    def _force_task_legacy_delta_qpos_target(
+        self, robot_manager: Any, dz: float
+    ) -> tuple[torch.Tensor, torch.Tensor, str]:
+        """Keep the old bridge for lightweight tests and older task roots."""
+        compute_target = getattr(robot_manager, "compute_delta_ee_rotvec_qpos_target", None)
+        if not callable(compute_target):
+            raise RuntimeError("force_task_ik_bridge_unavailable")
+        action = torch.tensor(
+            [0.0, 0.0, float(dz), 0.0, 0.0, 0.0, 0.0],
+            dtype=torch.float32,
+            device=self._task.device,
+        )
+        arm_qpos, gripper_qpos, target_pos, _target_quat = compute_target(action)
+        qpos = torch.cat([arm_qpos.reshape(-1)[:7], gripper_qpos.reshape(-1)[:1]])
+        return qpos, target_pos, "force_task_legacy_delta_ik_to_absolute_qpos"
+
+    def _force_task_target_lead_m(self) -> float:
+        config = self.api_configs.get("franka_control_api", {})
+        configured = config.get("force_task_target_lead_m", 0.001) if isinstance(config, dict) else 0.001
+        lead = float(configured)
+        if not np.isfinite(lead) or lead <= 0.0:
+            raise ValueError("force_task_target_lead_m must be a positive finite distance")
+        return lead
 
     def _task_native_safe_placement_enabled(self) -> bool:
         cfg = self.api_configs.get("franka_control_api", {})
@@ -494,7 +744,7 @@ class UniVTACLowLevelEnv(BaseEnv):
                 include_tactile=True,
                 include_embodiment=False,
                 include_actor=False,
-                tactile_data_types=["rgb", "rgb_marker"],
+                tactile_data_types=["rgb", "rgb_marker", "depth", "marker"],
             )
             self._record_frame(obs, force=True)
         except Exception as exc:
@@ -1531,6 +1781,57 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._tactile_buffer.clear()
         self._last_recorded_tactile_step = None
 
+    def set_tension_response_visualization(
+        self,
+        response: dict[str, Any],
+        stage_memory: dict[str, Any],
+    ) -> None:
+        """Update the video-only 10D response panel from public OpenTac data."""
+        snapshot = _build_tension_response_visualization(response, stage_memory)
+        current = snapshot.get("current_values")
+        if current is not None:
+            self._tension_response_visualization = snapshot
+            return
+
+        previous = self._tension_response_visualization
+        if previous.get("current_values") is not None:
+            previous["status"] = str(snapshot.get("status", "invalid_capture"))
+            previous["latest_capture_id"] = snapshot.get("capture_id")
+            previous["latest_quality"] = snapshot.get("quality", {})
+            previous["stage_values"] = snapshot.get("stage_values", previous.get("stage_values", {}))
+            return
+        self._tension_response_visualization = snapshot
+
+    def set_tension_stage_memory_visualization(self, stage_memory: dict[str, Any]) -> None:
+        """Publish frozen response medians before a live capture exists."""
+        previous = self._tension_response_visualization
+        previous["stage_values"] = _stage_memory_medians(stage_memory)
+        if previous.get("current_values") is None:
+            previous["status"] = "awaiting_live_window"
+
+    def set_tension_response_preview(
+        self,
+        response: dict[str, Any],
+        stage_memory: dict[str, Any],
+    ) -> None:
+        """Update the video-only rolling 10D preview from public observations."""
+        snapshot = _build_tension_response_visualization(
+            response,
+            stage_memory,
+            source="rolling_preview",
+            allow_partial=True,
+        )
+        if snapshot.get("current_values") is not None:
+            self._tension_response_visualization = snapshot
+            return
+        previous = self._tension_response_visualization
+        previous["stage_values"] = snapshot.get(
+            "stage_values", previous.get("stage_values", {})
+        )
+        previous["status"] = str(snapshot.get("status", "live_warming_up"))
+        previous["latest_capture_id"] = snapshot.get("capture_id")
+        previous["latest_quality"] = snapshot.get("quality", {})
+
     def enable_video_capture(
         self,
         enabled: bool = True,
@@ -1538,18 +1839,30 @@ class UniVTACLowLevelEnv(BaseEnv):
         clear: bool = True,
         wrist_camera: bool = False,
         capture_initial_frame: bool = True,
+        stream_dir: str | os.PathLike[str] | None = None,
     ) -> None:
         self._record_frames = bool(enabled)
         self._record_wrist_camera = bool(wrist_camera)
+        use_stream = bool(enabled and self.tension_response_panel_enabled and stream_dir)
         if clear:
+            self._close_video_stream_writers()
             self._frame_buffer.clear()
             self._wrist_frame_buffer.clear()
             self._last_recorded_video_step = None
             self._video_record_failures = 0
+            self._video_stream_frame_count = 0
+        self._video_stream_enabled = use_stream
+        self._video_stream_dir = (
+            Path(stream_dir).expanduser() if use_stream else None
+        )
+        if self._video_stream_dir is not None:
+            self._video_stream_dir.mkdir(parents=True, exist_ok=True)
         if enabled and capture_initial_frame:
             self._record_frame(force=True)
 
     def get_video_frames(self, *, clear: bool = False) -> list[np.ndarray]:
+        if self._video_stream_enabled:
+            return []
         frames = [frame.copy() for frame in self._frame_buffer]
         if frames:
             self._write_live_preview(frames[-1], force=True)
@@ -1558,10 +1871,92 @@ class UniVTACLowLevelEnv(BaseEnv):
         return frames
 
     def get_video_frame_count(self) -> int:
+        if self._video_stream_enabled:
+            return self._video_stream_frame_count
         return len(self._frame_buffer)
 
     def get_video_frames_range(self, start: int, end: int) -> list[np.ndarray]:
+        if self._video_stream_enabled:
+            return []
         return [frame.copy() for frame in self._frame_buffer[start:end]]
+
+    def begin_video_turn(self, turn_index: int) -> None:
+        """Start a streamed per-code-block video when streaming is enabled."""
+        if not self._video_stream_enabled:
+            return
+        self._close_video_stream_turn_writer()
+        self._video_stream_turn_index = int(turn_index)
+
+    def end_video_turn(self) -> None:
+        """Flush the active streamed per-code-block video."""
+        self._close_video_stream_turn_writer()
+        self._video_stream_turn_index = None
+
+    def finalize_streamed_video(self, output_dir: str | os.PathLike[str]) -> bool:
+        """Close and atomically publish a streamed tension video set."""
+        if not self._video_stream_enabled or self._video_stream_dir is None:
+            return False
+        self._close_video_stream_writers()
+        source_dir = self._video_stream_dir
+        target_dir = Path(output_dir) / "videos"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        moved = False
+        for source in sorted(source_dir.glob("video_*.mp4")):
+            target = target_dir / source.name
+            if getattr(self, "_video_stream_h264", False) and self._transcode_streamed_video_h264(source, target):
+                pass
+            else:
+                source.replace(target)
+            moved = True
+            print(f"Saved interaction video to {target} (streamed)")
+        self._video_stream_enabled = False
+        self._video_stream_dir = None
+        self._video_stream_turn_index = None
+        return moved
+
+    @staticmethod
+    def _transcode_streamed_video_h264(source: Path, target: Path) -> bool:
+        """Publish an H.264/yuv420p copy without risking the source video."""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return False
+        temporary = target.with_name(f".{target.stem}.h264.tmp.mp4")
+        try:
+            completed = subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(source),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "20",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    str(temporary),
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=180,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            temporary.unlink(missing_ok=True)
+            return False
+        if completed.returncode != 0 or not temporary.exists() or temporary.stat().st_size == 0:
+            temporary.unlink(missing_ok=True)
+            return False
+        temporary.replace(target)
+        source.unlink(missing_ok=True)
+        return True
 
     def get_wrist_video_frames(self, *, clear: bool = False) -> list[np.ndarray]:
         frames = [frame.copy() for frame in self._wrist_frame_buffer]
@@ -1574,29 +1969,43 @@ class UniVTACLowLevelEnv(BaseEnv):
 
     def export_debug_artifacts(self, output_dir: str | os.PathLike[str]) -> str | None:
         """Write private UniVTAC diagnostics for audit, never for LLM prompts."""
+        debug_records = getattr(self, "_debug_records", [])
+        gripper_trace = getattr(self, "_tactile_gripper_trace", [])
         primitive_trace = getattr(self, "_primitive_trace", [])
         working_memory_trace = getattr(self, "_tactile_working_memory_trace", [])
         trial_memory_snapshot = getattr(self, "_tactile_trial_memory_snapshot", {})
         public_probe_records = getattr(self, "_public_probe_records", {})
+        perception_artifacts = getattr(self, "_perception_artifacts", [])
+        runtime_preflight = getattr(self, "_runtime_preflight_diagnostics", {})
         if (
-            not self._debug_records
-            and not self._tactile_gripper_trace
+            not debug_records
+            and not gripper_trace
             and not primitive_trace
             and not working_memory_trace
             and not trial_memory_snapshot
             and not public_probe_records
-            and not self._perception_artifacts
+            and not perception_artifacts
+            and not runtime_preflight
         ):
             return None
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         debug_path = output_path / "univtac_debug.json"
-        if self._debug_records:
+        preflight_path = None
+        if runtime_preflight:
+            preflight_path = output_path / "univtac_runtime_preflight.json"
+            with open(preflight_path, "w", encoding="utf-8") as f:
+                json.dump(runtime_preflight, f, indent=2, sort_keys=True)
+            print(
+                f"[capx-univtac] saved runtime preflight diagnostics to {preflight_path}",
+                flush=True,
+            )
+        if debug_records:
             payload = {
                 "task": self.task_name,
                 "task_config": self.task_config_name,
                 "metadata": _jsonable(getattr(self._task, "metadata", {})),
-                "records": self._debug_records,
+                "records": debug_records,
             }
             with open(debug_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, sort_keys=True)
@@ -1604,10 +2013,10 @@ class UniVTACLowLevelEnv(BaseEnv):
                 f"[capx-univtac] saved private debug diagnostics to {debug_path}",
                 flush=True,
             )
-        if self._tactile_gripper_trace:
+        if gripper_trace:
             trace_path = output_path / "tactile_gripper_trace.json"
             with open(trace_path, "w", encoding="utf-8") as f:
-                json.dump(self._tactile_gripper_trace, f, indent=2, sort_keys=True)
+                json.dump(gripper_trace, f, indent=2, sort_keys=True)
             print(f"[capx-univtac] saved tactile gripper trace to {trace_path}", flush=True)
         primitive_path = None
         if primitive_trace:
@@ -1648,9 +2057,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         audit_path = self._export_oracle_audit(output_path, trial_memory_snapshot)
         perception_path = self._export_perception_artifacts(output_path)
         self._export_pre_move_tactile_timeline(output_path)
-        if self._debug_records:
+        if debug_records:
             return str(debug_path)
-        if self._tactile_gripper_trace:
+        if gripper_trace:
             return str(trace_path)
         if primitive_path is not None:
             return str(primitive_path)
@@ -1664,6 +2073,8 @@ class UniVTACLowLevelEnv(BaseEnv):
             return str(selection_path)
         if audit_path is not None:
             return str(audit_path)
+        if preflight_path is not None:
+            return str(preflight_path)
         return str(perception_path) if perception_path is not None else None
 
     def _export_selection_summary(
@@ -1800,7 +2211,7 @@ class UniVTACLowLevelEnv(BaseEnv):
             raise ValueError("Only rgb_array render mode is supported")
         obs = self._read_native_observation(include_camera=True, include_tactile=True)
         self._current_obs = obs
-        return self._compose_frame(obs)
+        return self._render_video_frame(obs)
 
     def render_wrist(self) -> np.ndarray | None:
         obs = self._read_native_observation(include_camera=True, include_tactile=False)
@@ -1897,7 +2308,196 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._official_task_protocol = bool(
             self._task_config.get("official_task_protocol", False)
         )
+        self._validate_runtime_preflight()
         self._install_task_runtime_patches()
+
+    def _validate_runtime_preflight(self) -> None:
+        """Fail before an LLM query when a force-task TacEx stack is mixed."""
+        config = self.runtime_preflight
+        if not bool(config.get("enabled", False)):
+            return
+
+        expected_root_value = config.get("tacex_root") or os.getenv(
+            "TACEX_RUNTIME_ROOT", ""
+        )
+        expected_root = Path(str(expected_root_value)).expanduser().resolve()
+        diagnostics: dict[str, Any] = {
+            "schema_version": "capx_univtac_runtime_preflight.v1",
+            "task": self.task_name,
+            "tacex_root": str(expected_root),
+            "modules": {},
+            "assets_dir": None,
+            "attachments": {},
+            "robot_asset": None,
+            "errors": [],
+        }
+        errors: list[str] = diagnostics["errors"]
+
+        if not expected_root.is_dir():
+            errors.append(f"TacEx root does not exist: {expected_root}")
+        for package in ("tacex", "tacex_uipc", "tacex_assets", "tacex_tasks"):
+            try:
+                if package == "tacex_tasks":
+                    # This is IsaacLab's optional training-task bundle.  Its
+                    # package import eagerly loads RL configs and can require
+                    # rsl_rl, which the force-task runtime never uses. Verify
+                    # its source resolution without executing that import.
+                    spec = importlib.util.find_spec(package)
+                    if spec is None:
+                        raise ModuleNotFoundError(package)
+                    origin = spec.origin
+                    if origin is None:
+                        locations = list(spec.submodule_search_locations or [])
+                        if not locations:
+                            raise RuntimeError("package has no source location")
+                        module_path = Path(locations[0]).resolve()
+                    else:
+                        module_path = Path(origin).resolve()
+                else:
+                    module = importlib.import_module(package)
+                    module_path = Path(inspect.getfile(module)).resolve()
+                diagnostics["modules"][package] = str(module_path)
+                expected_package_root = expected_root / "source" / package
+                if not _path_within(module_path, expected_package_root):
+                    errors.append(
+                        f"{package} resolves to {module_path}, expected under {expected_package_root}"
+                    )
+            except Exception as exc:
+                errors.append(f"could not import {package}: {exc!r}")
+
+        if bool(config.get("require_contact_gradient", False)):
+            try:
+                from tacex_uipc.sim.uipc_sim import UipcSim
+
+                uipc_sim_path = Path(inspect.getfile(UipcSim)).resolve()
+                diagnostics["uipc_sim"] = str(uipc_sim_path)
+                if not _path_within(
+                    uipc_sim_path, expected_root / "source" / "tacex_uipc"
+                ):
+                    errors.append(
+                        "UipcSim resolves outside the requested TacEx runtime: "
+                        f"{uipc_sim_path}"
+                    )
+                if not hasattr(UipcSim, "get_contact_gradient"):
+                    errors.append("UipcSim.get_contact_gradient is missing")
+            except Exception as exc:
+                errors.append(f"could not validate UipcSim contact gradient: {exc!r}")
+
+            task_uipc_sim = getattr(self._task, "uipc_sim", None)
+            task_uipc_type = type(task_uipc_sim) if task_uipc_sim is not None else None
+            task_uipc_path = None
+            if task_uipc_type is not None:
+                try:
+                    task_uipc_path = Path(inspect.getfile(task_uipc_type)).resolve()
+                except (OSError, TypeError):
+                    task_uipc_path = None
+            diagnostics["task_uipc_sim"] = {
+                "class": (
+                    f"{task_uipc_type.__module__}.{task_uipc_type.__qualname__}"
+                    if task_uipc_type is not None
+                    else None
+                ),
+                "source": str(task_uipc_path) if task_uipc_path is not None else None,
+                "has_contact_gradient": bool(
+                    callable(getattr(task_uipc_sim, "get_contact_gradient", None))
+                ),
+            }
+            if task_uipc_sim is None:
+                errors.append("task did not construct a UipcSim instance")
+            elif not callable(getattr(task_uipc_sim, "get_contact_gradient", None)):
+                errors.append(
+                    "task UipcSim instance has no get_contact_gradient method"
+                )
+            elif task_uipc_path is not None and not _path_within(
+                task_uipc_path, expected_root / "source" / "tacex_uipc"
+            ):
+                errors.append(
+                    "task UipcSim instance resolves outside the requested TacEx runtime: "
+                    f"{task_uipc_path}"
+                )
+
+        try:
+            from tacex_assets import TACEX_ASSETS_DATA_DIR
+
+            assets_dir = Path(str(TACEX_ASSETS_DATA_DIR)).expanduser().resolve()
+            diagnostics["assets_dir"] = str(assets_dir)
+            if not _path_within(assets_dir, expected_root):
+                errors.append(
+                    "TacEx asset directory resolves outside the requested runtime: "
+                    f"{assets_dir}"
+                )
+        except Exception as exc:
+            errors.append(f"could not validate TacEx asset directory: {exc!r}")
+
+        robot_cfg = getattr(getattr(self._task, "cfg", None), "robot", None)
+        spawn = getattr(getattr(robot_cfg, "robot", None), "spawn", None)
+        robot_asset = str(getattr(spawn, "usd_path", ""))
+        diagnostics["robot_asset"] = robot_asset
+        if bool(config.get("require_attached_gelpad_asset", False)) and not robot_asset.endswith(
+            "uipc_gelpads_high_res_wrist_attached.usda"
+        ):
+            errors.append(
+                "robot asset is not the ViTaForge attached gelpad USD: "
+                f"{robot_asset or '<missing>'}"
+            )
+
+        if bool(config.get("require_attachment_points", False)):
+            tactiles = getattr(
+                getattr(self._task, "_tactile_manager", None), "tactiles", {}
+            )
+            for name in ("left_tactile", "right_tactile"):
+                tactile = tactiles.get(name) if isinstance(tactiles, dict) else None
+                attachment = getattr(tactile, "attachment", None)
+                count = getattr(attachment, "num_attachment_points_per_obj", None)
+                diagnostics["attachments"][name] = count
+                if not isinstance(count, int) or count <= 0:
+                    errors.append(f"{name} attachment has no points: {count!r}")
+
+        self._runtime_preflight_diagnostics = _jsonable(diagnostics)
+        if errors:
+            diagnostic_path = self._write_runtime_preflight_failure_diagnostics()
+            if diagnostic_path is not None:
+                diagnostics["diagnostic_path"] = str(diagnostic_path)
+                self._runtime_preflight_diagnostics = _jsonable(diagnostics)
+            message = "CAPX_ENVIRONMENT_ERROR: " + " | ".join(errors)
+            print(f"[capx-univtac] {message}", flush=True)
+            raise RuntimeError(message)
+        print(
+            "[capx-univtac] runtime preflight passed "
+            f"asset={Path(robot_asset).name} "
+            f"attachments={diagnostics['attachments']}",
+            flush=True,
+        )
+
+    def _write_runtime_preflight_failure_diagnostics(self) -> Path | None:
+        """Persist an early runtime mismatch when no trial object exists yet."""
+        output_value = os.getenv("CAPX_OUTPUT_DIR", "").strip()
+        if not output_value:
+            return None
+        try:
+            output_dir = Path(output_value).expanduser()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            diagnostic_path = output_dir / "univtac_runtime_preflight_error.json"
+            with open(diagnostic_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    self._runtime_preflight_diagnostics,
+                    f,
+                    indent=2,
+                    sort_keys=True,
+                )
+            print(
+                "[capx-univtac] saved runtime preflight failure diagnostics to "
+                f"{diagnostic_path}",
+                flush=True,
+            )
+            return diagnostic_path
+        except OSError as exc:
+            print(
+                "WARNING: failed to save runtime preflight diagnostics: "
+                f"{exc!r}",
+                flush=True,
+            )
+            return None
 
     def _task_config_path(self) -> Path:
         path = Path(self.task_config_name)
@@ -1933,6 +2533,7 @@ class UniVTACLowLevelEnv(BaseEnv):
 
         def _capx_step(*args, **kwargs):
             result = original_step(*args, **kwargs)
+            self._notify_post_step_observers()
             self._record_pre_move_tactile_step()
             # Read the post-step tactile frame so externally executed probes
             # are reduced by the same v3 schema as the task-side expert.
@@ -2171,6 +2772,10 @@ class UniVTACLowLevelEnv(BaseEnv):
                 getattr(task, "_deterministic_inhand_follow", False)
             ),
         }
+        if self._opentac_tension_estimator_diagnostics:
+            record["opentac_tension_estimator"] = _jsonable(
+                self._opentac_tension_estimator_diagnostics
+            )
 
         target_inhand_pose = getattr(task, "origin_inhand_pose", None)
         if target_inhand_pose is None:
@@ -2307,7 +2912,10 @@ class UniVTACLowLevelEnv(BaseEnv):
                 include_tactile=True,
                 include_embodiment=False,
                 include_actor=False,
-                tactile_data_types=["rgb", "rgb_marker"],
+                # Keep the public depth/marker geometry in this same rendered
+                # sample so the dashboard plots and rolling 10D panel advance
+                # with every saved video frame.
+                tactile_data_types=["rgb", "rgb_marker", "depth", "marker"],
             )
             self._record_frame(obs)
         except Exception as exc:
@@ -2336,8 +2944,12 @@ class UniVTACLowLevelEnv(BaseEnv):
         if not force and self._last_recorded_video_step == step:
             return
         obs = obs or self._read_native_observation(include_camera=True, include_tactile=True)
-        frame = self._compose_frame(obs)
-        self._frame_buffer.append(frame)
+        self._record_tension_response_video_sample(obs)
+        frame = self._render_video_frame(obs)
+        if self._video_stream_enabled:
+            self._write_streamed_video_frame(frame)
+        else:
+            self._frame_buffer.append(frame)
         self._last_recorded_video_step = step
         self._write_live_preview(frame, force=force)
         if self._record_wrist_camera:
@@ -2345,10 +2957,53 @@ class UniVTACLowLevelEnv(BaseEnv):
             if wrist is not None:
                 self._wrist_frame_buffer.append(_as_uint8_rgb(wrist))
 
+    def _write_streamed_video_frame(self, frame: np.ndarray) -> None:
+        if self._video_stream_dir is None:
+            return
+        rgb = np.ascontiguousarray(_as_uint8_rgb(frame))
+        combined_path = self._video_stream_dir / "video_combined.mp4"
+        self._video_stream_combined_writer = self._ensure_video_stream_writer(
+            self._video_stream_combined_writer, combined_path, rgb
+        )
+        self._video_stream_combined_writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        if self._video_stream_turn_index is not None:
+            turn_path = self._video_stream_dir / f"video_turn_{self._video_stream_turn_index:02d}.mp4"
+            self._video_stream_turn_writer = self._ensure_video_stream_writer(
+                self._video_stream_turn_writer, turn_path, rgb
+            )
+            self._video_stream_turn_writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        self._video_stream_frame_count += 1
+
+    @staticmethod
+    def _ensure_video_stream_writer(writer: Any | None, path: Path, frame: np.ndarray) -> Any:
+        if writer is not None:
+            return writer
+        height, width = frame.shape[:2]
+        created = cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (int(width), int(height))
+        )
+        if not created.isOpened():
+            raise RuntimeError(f"could not open streamed video writer: {path}")
+        return created
+
+    def _close_video_stream_turn_writer(self) -> None:
+        writer = self._video_stream_turn_writer
+        self._video_stream_turn_writer = None
+        if writer is not None:
+            writer.release()
+
+    def _close_video_stream_writers(self) -> None:
+        self._close_video_stream_turn_writer()
+        writer = self._video_stream_combined_writer
+        self._video_stream_combined_writer = None
+        if writer is not None:
+            writer.release()
+
     def _write_live_preview(self, frame: np.ndarray, *, force: bool = False) -> None:
         if not self.live_preview_enabled or self.live_preview_path is None:
             return
-        if not force and len(self._frame_buffer) % self.live_preview_stride != 0:
+        frame_count = self.get_video_frame_count()
+        if not force and frame_count % self.live_preview_stride != 0:
             return
         try:
             out_path = self.live_preview_path
@@ -2368,6 +3023,88 @@ class UniVTACLowLevelEnv(BaseEnv):
                     f"WARNING: failed to write UniVTAC live preview: {exc!r}",
                     flush=True,
                 )
+
+    def _render_video_frame(self, obs: dict[str, Any]) -> np.ndarray:
+        if self.video_renderer != "task_native":
+            return self._compose_frame(obs)
+        if self.tension_response_panel_enabled:
+            # The tension task uses the same 1600x1200 public-observation
+            # dashboard as the expert replay, not the generic native collage
+            # with an extra panel appended underneath.
+            return _render_tension_strap_demo_frame(
+                obs=obs,
+                visualization=self._tension_response_visualization,
+                control_diagnostics=self._opentac_tension_estimator_diagnostics,
+                history=self._tension_response_video_history,
+            )
+        native_renderer = getattr(self._task, "get_frame_shot", None)
+        if not callable(native_renderer):
+            raise RuntimeError(
+                f"task {self.task_name!r} does not provide get_frame_shot() for task_native video"
+            )
+        return np.ascontiguousarray(_as_uint8_rgb(native_renderer(obs)))
+
+    def _record_tension_response_video_sample(self, obs: dict[str, Any]) -> None:
+        """Collect display-only public tactile values for the native video panel."""
+        if not self.tension_response_panel_enabled:
+            return
+        tactile = obs.get("tactile") if isinstance(obs, dict) else None
+        if not isinstance(tactile, dict):
+            return
+        left = tactile.get("left_tactile")
+        right = tactile.get("right_tactile")
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return
+        if left.get("depth") is None or right.get("depth") is None:
+            return
+        frame = frame_from_observation(
+            obs,
+            step=self.get_step_count(),
+            timestamp=time.time(),
+        )
+        if frame.left_depth is None or frame.right_depth is None:
+            return
+        self._tension_response_video_frames.append(frame)
+        self._tension_response_video_frames = self._tension_response_video_frames[-8:]
+        summary = summarize_native_tactile(
+            self._tension_response_video_frames,
+            hand="both",
+        )
+        left_summary = summary.get("left", {})
+        right_summary = summary.get("right", {})
+        diagnostics = self._opentac_tension_estimator_diagnostics
+        latest_estimate = diagnostics.get("latest_estimate", {})
+        latest_estimate = latest_estimate if isinstance(latest_estimate, dict) else {}
+        sample = {
+            "step": int(self.get_step_count()),
+            "left_depth_mm": float(left_summary.get("depth_delta_mm", 0.0)),
+            "right_depth_mm": float(right_summary.get("depth_delta_mm", 0.0)),
+            "left_marker_displacement_px": float(
+                left_summary.get("marker_displacement_px", 0.0)
+            ),
+            "right_marker_displacement_px": float(
+                right_summary.get("marker_displacement_px", 0.0)
+            ),
+            "left_marker_coherence": float(left_summary.get("marker_coherence", 0.0)),
+            "right_marker_coherence": float(right_summary.get("marker_coherence", 0.0)),
+            "estimated_tension_N": _panel_optional_float(
+                latest_estimate.get("estimated_tension_N")
+            ),
+            "stage_index": int(diagnostics.get("current_stage_index", 0) or 0),
+            "hold_seconds": _panel_optional_float(
+                diagnostics.get("current_stage_in_band_hold_seconds")
+            )
+            or 0.0,
+        }
+        if self._tension_response_video_history and (
+            self._tension_response_video_history[-1].get("step") == sample["step"]
+        ):
+            self._tension_response_video_history[-1] = sample
+        else:
+            self._tension_response_video_history.append(sample)
+        self._tension_response_video_history = self._tension_response_video_history[
+            -self.tension_response_history_points :
+        ]
 
     def _refresh_public_pose_cache(self) -> None:
         """Cache only task-declared public anchors and slots for LLM APIs."""
@@ -3082,6 +3819,405 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+_TENSION_RESPONSE_FIELDS: tuple[tuple[str, str, str, tuple[str, ...], str], ...] = (
+    ("normal_static", "L depth", "mm", ("hold", "left", "depth_mm"), "identity"),
+    ("normal_static", "R depth", "mm", ("hold", "right", "depth_mm"), "identity"),
+    ("normal_dynamic", "L depth delta", "mm", ("end_minus_start", "left", "depth_mm"), "identity"),
+    ("normal_dynamic", "R depth delta", "mm", ("end_minus_start", "right", "depth_mm"), "identity"),
+    ("surface_spatial_static", "L row gradient", "px", ("hold", "left", "marker_row_gradient_px"), "identity"),
+    ("surface_spatial_static", "R row gradient", "px", ("hold", "right", "marker_row_gradient_px"), "identity"),
+    ("surface_spatial_static", "L col gradient", "px", ("hold", "left", "marker_col_gradient_px"), "identity"),
+    ("surface_spatial_static", "R col gradient", "px", ("hold", "right", "marker_col_gradient_px"), "identity"),
+    ("surface_spatial_static", "L log anisotropy", "log", ("hold", "left", "marker_anisotropy_ratio"), "log"),
+    ("surface_spatial_static", "R log anisotropy", "log", ("hold", "right", "marker_anisotropy_ratio"), "log"),
+)
+
+
+def _empty_tension_response_visualization() -> dict[str, Any]:
+    return {
+        "schema_version": "capx_tension_response_panel.v1",
+        "status": "waiting_for_valid_capture",
+        "capture_id": None,
+        "latest_capture_id": None,
+        "window": {},
+        "quality": {},
+        "latest_quality": {},
+        "current_values": None,
+        "stage_values": {},
+    }
+
+
+def _build_tension_response_visualization(
+    response: dict[str, Any],
+    stage_memory: dict[str, Any],
+    *,
+    source: str = "stage_capture",
+    allow_partial: bool = False,
+) -> dict[str, Any]:
+    response = response if isinstance(response, dict) else {}
+    stage_memory = stage_memory if isinstance(stage_memory, dict) else {}
+    quality = response.get("quality", {})
+    quality = quality if isinstance(quality, dict) else {}
+    current_values = _flatten_tension_response_values(response)
+    current_is_valid = bool(quality.get("valid", False)) and current_values is not None
+    show_current = current_values is not None and (current_is_valid or allow_partial)
+    if source == "rolling_preview":
+        status = "live_valid_window" if current_is_valid else "live_warming_up"
+    else:
+        status = "valid_capture" if current_is_valid else "invalid_capture"
+    return {
+        "schema_version": "capx_tension_response_panel.v1",
+        "status": status,
+        "source": str(source),
+        "capture_id": response.get("capture_id"),
+        "latest_capture_id": response.get("capture_id"),
+        "window": _jsonable(response.get("window", {})),
+        "quality": _jsonable(quality),
+        "latest_quality": _jsonable(quality),
+        "current_values": current_values if show_current else None,
+        "stage_values": _stage_memory_medians(stage_memory),
+    }
+
+
+def _flatten_tension_response_values(response: dict[str, Any]) -> list[float] | None:
+    values: list[float] = []
+    for _block, _label, _unit, path, transform in _TENSION_RESPONSE_FIELDS:
+        value: Any = response
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
+                return None
+            value = value[key]
+        try:
+            numeric = float(value)
+            if transform == "log":
+                if numeric <= 0.0:
+                    return None
+                numeric = math.log(numeric)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(numeric):
+            return None
+        values.append(numeric)
+    return values
+
+
+def _stage_memory_medians(memory: dict[str, Any]) -> dict[str, list[float]]:
+    values: dict[str, list[float]] = {}
+    stages = memory.get("stages", []) if isinstance(memory, dict) else []
+    if not isinstance(stages, list):
+        return values
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        memory_id = str(stage.get("memory_id", ""))
+        if memory_id == "tension_strap_hold_12n.v1":
+            label = "12N"
+        elif memory_id == "tension_strap_hold_18n.v1":
+            label = "18N"
+        else:
+            continue
+        flattened: list[float] = []
+        for block in stage.get("response_blocks", []):
+            scaler = block.get("scaler", {}) if isinstance(block, dict) else {}
+            median = scaler.get("median") if isinstance(scaler, dict) else None
+            if not isinstance(median, list):
+                flattened = []
+                break
+            try:
+                flattened.extend(float(item) for item in median)
+            except (TypeError, ValueError):
+                flattened = []
+                break
+        if len(flattened) == len(_TENSION_RESPONSE_FIELDS) and np.isfinite(
+            np.asarray(flattened, dtype=np.float64)
+        ).all():
+            values[label] = flattened
+    return values
+
+
+_TENSION_DEMO_WIDTH = 1600
+_TENSION_DEMO_HEIGHT = 1200
+_TENSION_DEMO_HEADER_HEIGHT = 70
+_TENSION_DEMO_SCENE_HEIGHT = 450
+_TENSION_DEMO_TACTILE_HEIGHT = 300
+_TENSION_DEMO_RESPONSE_TOP = (
+    _TENSION_DEMO_HEADER_HEIGHT + _TENSION_DEMO_SCENE_HEIGHT + _TENSION_DEMO_TACTILE_HEIGHT
+)
+_TENSION_DEMO_RESPONSE_HEIGHT = 180
+_TENSION_DEMO_CHART_TOP = _TENSION_DEMO_RESPONSE_TOP + _TENSION_DEMO_RESPONSE_HEIGHT
+_TENSION_DEMO_RESPONSE_LABELS = (
+    ("D_L", "mm"), ("D_R", "mm"), ("dD_L", "mm"), ("dD_R", "mm"),
+    ("row_L", "px"), ("row_R", "px"), ("col_L", "px"), ("col_R", "px"),
+    ("logA_L", ""), ("logA_R", ""),
+)
+
+
+def _render_tension_strap_demo_frame(
+    *,
+    obs: dict[str, Any],
+    visualization: dict[str, Any],
+    control_diagnostics: dict[str, Any] | None,
+    history: list[dict[str, Any]] | None,
+) -> np.ndarray:
+    """Render the live counterpart of ``render_tension_strap_demo.py``.
+
+    It deliberately consumes only the already-public camera/tactile observation,
+    cached public estimator state, and frozen response medians.
+    """
+    canvas = np.full(
+        (_TENSION_DEMO_HEIGHT, _TENSION_DEMO_WIDTH, 3), (16, 19, 23), dtype=np.uint8
+    )
+    diagnostics = control_diagnostics if isinstance(control_diagnostics, dict) else {}
+    latest = diagnostics.get("latest_estimate", {})
+    latest = latest if isinstance(latest, dict) else {}
+    estimate = _panel_optional_float(latest.get("estimated_tension_N"))
+    stage_index = int(diagnostics.get("current_stage_index", 0) or 0)
+    completed_stage_ids = diagnostics.get("completed_stage_ids", [])
+    completed_stage_ids = (
+        [str(item) for item in completed_stage_ids]
+        if isinstance(completed_stage_ids, list)
+        else []
+    )
+    hold_seconds = _panel_optional_float(
+        diagnostics.get("current_stage_in_band_hold_seconds")
+    ) or 0.0
+    action_counts = diagnostics.get("stage_action_counts", [])
+    action_count = (
+        int(action_counts[stage_index])
+        if isinstance(action_counts, list) and stage_index < len(action_counts)
+        else 0
+    )
+    stage_label = "12N target hold" if stage_index == 0 else "18N target hold"
+    stage_color = (125, 205, 255) if stage_index == 0 else (255, 205, 125)
+    if stage_index == 1 and "tension_strap_hold_12n.v1" in completed_stage_ids:
+        stage_label = "12N complete -> 18N target hold"
+    if stage_index >= 2:
+        stage_label, stage_color = "both target holds complete", (135, 225, 170)
+
+    cv2.rectangle(
+        canvas, (0, 0), (_TENSION_DEMO_WIDTH, _TENSION_DEMO_HEADER_HEIGHT), (10, 12, 15), -1
+    )
+    _tension_demo_text(
+        canvas, "CaP-X / OpenTac runtime replay | public GelSight response", 22, 29,
+        scale=0.78, thickness=2,
+    )
+    _tension_demo_text(canvas, stage_label, 22, 58, scale=0.65, color=stage_color, thickness=2)
+    estimate_text = "waiting for marker-RGB estimate" if estimate is None else f"estimate {estimate:.3f} N"
+    _tension_demo_text(
+        canvas,
+        f"{estimate_text} | current-stage hold {hold_seconds:.2f}s / 3.00s | control actions {action_count}",
+        730,
+        56,
+        scale=0.44,
+        color=(201, 208, 215),
+    )
+
+    head = _tension_demo_observation_image(obs, "head", "rgb")
+    wrist = _tension_demo_observation_image(obs, "wrist", "rgb")
+    _tension_demo_tile(canvas, head, 0, _TENSION_DEMO_HEADER_HEIGHT, 800, _TENSION_DEMO_SCENE_HEIGHT, "Head RGB", "runtime public observation")
+    _tension_demo_tile(canvas, wrist, 800, _TENSION_DEMO_HEADER_HEIGHT, 800, _TENSION_DEMO_SCENE_HEIGHT, "Wrist RGB", "runtime public observation")
+
+    last_sample = history[-1] if isinstance(history, list) and history else {}
+    for index, hand in enumerate(("left", "right")):
+        base_x = index * 800
+        rgb = _tension_demo_tactile_image(obs, hand, "rgb")
+        marker = _tension_demo_tactile_image(obs, hand, "rgb_marker")
+        detail = (
+            f"depth {_panel_optional_float(last_sample.get(f'{hand}_depth_mm')) or 0.0:.3f} mm | "
+            f"disp {_panel_optional_float(last_sample.get(f'{hand}_marker_displacement_px')) or 0.0:.3f} px | "
+            f"coherence {_panel_optional_float(last_sample.get(f'{hand}_marker_coherence')) or 0.0:.3f}"
+        )
+        tile_y = _TENSION_DEMO_HEADER_HEIGHT + _TENSION_DEMO_SCENE_HEIGHT
+        _tension_demo_tile(canvas, rgb, base_x, tile_y, 400, _TENSION_DEMO_TACTILE_HEIGHT, f"{hand.title()} GelSight RGB", detail)
+        _tension_demo_tile(canvas, marker, base_x + 400, tile_y, 400, _TENSION_DEMO_TACTILE_HEIGHT, f"{hand.title()} marker stream", "black dots are tracked marker locations")
+
+    state = visualization if isinstance(visualization, dict) else {}
+    current = state.get("current_values")
+    stage_values = state.get("stage_values", {})
+    stage_values = stage_values if isinstance(stage_values, dict) else {}
+    _tension_demo_text(canvas, "Current public 10D response and frozen stage memory", 18, _TENSION_DEMO_RESPONSE_TOP + 18, scale=0.48, color=(225, 230, 236))
+    card_y = _TENSION_DEMO_RESPONSE_TOP + 28
+    card_width, card_height, gap = 517, _TENSION_DEMO_RESPONSE_HEIGHT - 34, 8
+    current_title = (
+        "Current rolling 10D"
+        if state.get("source") == "rolling_preview"
+        else "Current captured 10D"
+    )
+    cards = (
+        (current_title, current, (221, 228, 237), bool(current)),
+        ("12N target hold memory", stage_values.get("12N"), (117, 194, 255), stage_index == 0),
+        ("18N target hold memory", stage_values.get("18N"), (255, 179, 117), stage_index == 1),
+    )
+    for index, (title, values, color, active) in enumerate(cards):
+        _tension_demo_response_card(
+            canvas, values, 16 + index * (card_width + gap), card_y, card_width, card_height,
+            title, active=active, color=color,
+        )
+
+    chart_y = _TENSION_DEMO_CHART_TOP + 16
+    chart_height = _TENSION_DEMO_HEIGHT - chart_y - 18
+    chart_specs = (
+        ("left_depth_mm", "Raw left indentation", "mm", (92, 210, 245)),
+        ("right_depth_mm", "Raw right indentation", "mm", (97, 221, 148)),
+        ("left_marker_displacement_px", "Raw left marker displacement", "px", (245, 181, 78)),
+        ("right_marker_displacement_px", "Raw right marker displacement", "px", (241, 120, 133)),
+    )
+    for index, (key, title, unit, color) in enumerate(chart_specs):
+        _tension_demo_plot(
+            canvas, history or [], key, 16 + index * 392, chart_y,
+            380 if index < 3 else 392, chart_height, title, unit, color, stage_index,
+        )
+    return np.ascontiguousarray(canvas)
+
+
+def _tension_demo_observation_image(obs: dict[str, Any], camera: str, field: str) -> np.ndarray:
+    record = obs.get("observation", {}).get(camera, {}) if isinstance(obs, dict) else {}
+    image = record.get(field) if isinstance(record, dict) else None
+    return _tension_demo_image_or_placeholder(image, f"{camera} {field} unavailable")
+
+
+def _tension_demo_tactile_image(obs: dict[str, Any], hand: str, field: str) -> np.ndarray:
+    tactile = obs.get("tactile", {}) if isinstance(obs, dict) else {}
+    record = tactile.get(f"{hand}_tactile", tactile.get(hand, {})) if isinstance(tactile, dict) else {}
+    image = record.get(field) if isinstance(record, dict) else None
+    return _tension_demo_image_or_placeholder(image, f"{hand} {field} unavailable")
+
+
+def _tension_demo_image_or_placeholder(image: Any, message: str) -> np.ndarray:
+    if image is not None:
+        try:
+            return _as_uint8_rgb(image)
+        except Exception:
+            pass
+    fallback = np.full((240, 320, 3), (20, 24, 28), dtype=np.uint8)
+    _tension_demo_text(fallback, message, 20, 120, scale=0.48, color=(180, 190, 200))
+    return fallback
+
+
+def _tension_demo_fit(image: np.ndarray, width: int, height: int) -> np.ndarray:
+    scale = min(width / image.shape[1], height / image.shape[0])
+    resized = cv2.resize(
+        image,
+        (max(1, round(image.shape[1] * scale)), max(1, round(image.shape[0] * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+    panel = np.full((height, width, 3), (20, 24, 28), dtype=np.uint8)
+    x, y = (width - resized.shape[1]) // 2, (height - resized.shape[0]) // 2
+    panel[y : y + resized.shape[0], x : x + resized.shape[1]] = resized
+    return panel
+
+
+def _tension_demo_text(
+    image: np.ndarray,
+    value: str,
+    x: int,
+    y: int,
+    *,
+    scale: float = 0.5,
+    color: tuple[int, int, int] = (242, 244, 246),
+    thickness: int = 1,
+) -> None:
+    cv2.putText(image, value, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+
+def _tension_demo_tile(
+    canvas: np.ndarray,
+    image: np.ndarray,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    title: str,
+    detail: str,
+) -> None:
+    canvas[y : y + height, x : x + width] = _tension_demo_fit(image, width, height)
+    cv2.rectangle(canvas, (x, y), (x + width - 1, y + height - 1), (92, 101, 111), 1)
+    cv2.rectangle(canvas, (x, y), (x + width, y + 25), (10, 12, 15), -1)
+    _tension_demo_text(canvas, title, x + 8, y + 18, scale=0.47)
+    _tension_demo_text(canvas, detail, x + 8, y + height - 10, scale=0.42, color=(180, 214, 255))
+
+
+def _tension_demo_response_card(
+    canvas: np.ndarray,
+    values: Any,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    title: str,
+    *,
+    active: bool,
+    color: tuple[int, int, int],
+) -> None:
+    values = values if isinstance(values, list) and len(values) == 10 else None
+    cv2.rectangle(canvas, (x, y), (x + width, y + height), (53, 65, 84) if active else (30, 35, 42), -1)
+    cv2.rectangle(canvas, (x, y), (x + width, y + height), color if active else (92, 101, 111), 2 if active else 1)
+    _tension_demo_text(canvas, title, x + 10, y + 21, scale=0.45, color=color, thickness=2 if active else 1)
+    _tension_demo_text(canvas, "ACTIVE WINDOW" if active else "REFERENCE", x + width - 132, y + 21, scale=0.34, color=(224, 228, 232))
+    if values is None:
+        _tension_demo_text(canvas, "waiting for valid 10D capture", x + 12, y + height // 2, scale=0.42, color=(170, 180, 190))
+        return
+    column_width = (width - 16) // 5
+    for index, ((label, unit), value) in enumerate(zip(_TENSION_DEMO_RESPONSE_LABELS, values, strict=True)):
+        row, column = divmod(index, 5)
+        px, py = x + 8 + column * column_width, y + 48 + row * 42
+        _tension_demo_text(canvas, label, px, py, scale=0.34, color=(190, 201, 212))
+        _tension_demo_text(canvas, f"{float(value):.3f}{' ' + unit if unit else ''}", px, py + 18, scale=0.37, color=(247, 248, 249))
+    _tension_demo_text(canvas, "10D: [normal static | normal dynamic | marker spatial]", x + 10, y + height - 8, scale=0.31, color=(190, 201, 212))
+
+
+def _tension_demo_plot(
+    canvas: np.ndarray,
+    history: list[dict[str, Any]],
+    key: str,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    title: str,
+    unit: str,
+    color: tuple[int, int, int],
+    stage_index: int,
+) -> None:
+    cv2.rectangle(canvas, (x, y), (x + width, y + height), (33, 38, 43), -1)
+    cv2.rectangle(canvas, (x, y), (x + width, y + height), (92, 101, 111), 1)
+    background = (44, 63, 93) if stage_index == 0 else (90, 59, 42)
+    cv2.rectangle(canvas, (x + 1, y + 1), (x + width - 1, y + height - 1), background, -1)
+    values = [_panel_optional_float(row.get(key)) for row in history if isinstance(row, dict)]
+    values = [value for value in values if value is not None]
+    _tension_demo_text(canvas, title, x + 8, y + 19, scale=0.40)
+    if len(values) < 2:
+        _tension_demo_text(canvas, "waiting for public samples", x + 8, y + height - 7, scale=0.34, color=(190, 201, 212))
+        return
+    low, high = min(values), max(values)
+    span = max(1e-6, high - low)
+    low, high = low - 0.08 * span, high + 0.08 * span
+    points = []
+    for index, value in enumerate(values):
+        px = x + 1 + int(index * (width - 2) / max(1, len(values) - 1))
+        py = y + height - 18 - int((value - low) * (height - 42) / max(1e-6, high - low))
+        points.append((px, py))
+    cv2.polylines(canvas, [np.asarray(points, dtype=np.int32)], False, color, 1, cv2.LINE_AA)
+    cv2.line(canvas, points[-1], (points[-1][0], y + height - 1), (255, 255, 255), 1, cv2.LINE_AA)
+    _tension_demo_text(canvas, f"{low:.3g}-{high:.3g} {unit}", x + 8, y + height - 6, scale=0.32, color=(209, 215, 221))
+
+
+def _panel_optional_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if np.isfinite(numeric) else None
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def _safe_overlay_float(value: Any) -> float:

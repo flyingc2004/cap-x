@@ -63,6 +63,7 @@ class TrialSummary:
     num_regenerations: int = 0
     num_finishes: int = 0
     num_code_blocks: int = 0
+    llm_usage: dict[str, Any] | None = None
 
 
 def run_server_proc(api_cfg) -> multiprocessing.Process:
@@ -640,6 +641,7 @@ def _save_trial_artifacts(
     visual_feedback_imgs: list[Image.Image],
     ensemble_data: dict[str, str] | None = None,
     multiturn_ensemble_data: list[dict[str, str]] | None = None,
+    llm_usage_events: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Save trial artifacts (code, logs, images) to the output directory.
 
@@ -662,6 +664,12 @@ def _save_trial_artifacts(
         (trial_dir / "raw_response.sh").write_text(raw_code)
 
     (trial_dir / "all_responses.json").write_text(json.dumps(all_responses, indent=2))
+    if llm_usage_events is not None:
+        from capx.llm.client import summarize_llm_usage
+
+        (trial_dir / "llm_usage.json").write_text(
+            json.dumps(summarize_llm_usage(llm_usage_events), indent=2)
+        )
     (trial_dir / "summary.txt").write_text("\n".join(log_lines))
     if all_responses:
         try:
@@ -729,6 +737,7 @@ def _save_in_progress_trial_artifacts(
     final_code: str,
     raw_code: str | None,
     all_responses: list[dict],
+    llm_usage_events: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Persist generated code before physical execution completes.
 
@@ -764,6 +773,12 @@ def _save_in_progress_trial_artifacts(
     )
     (trial_dir / "all_responses.json").write_text(serialized_responses)
     print("[capx-trial] in-progress save all_responses done", flush=True)
+    if llm_usage_events is not None:
+        from capx.llm.client import summarize_llm_usage
+
+        (trial_dir / "llm_usage.json").write_text(
+            json.dumps(summarize_llm_usage(llm_usage_events), indent=2)
+        )
 
     if all_responses:
         try:
@@ -797,6 +812,10 @@ def _print_and_save_summary(
     total_code_blocks = 0
     total_regenerations = 0
     total_finishes = 0
+    total_llm_queries = 0
+    provider_reported_llm_queries = 0
+    total_llm_tokens = 0
+    has_total_llm_tokens = False
     executed_trials = len(summaries)
 
     for summary in summaries:
@@ -809,6 +828,15 @@ def _print_and_save_summary(
         total_code_blocks += summary.num_code_blocks
         total_regenerations += summary.num_regenerations
         total_finishes += summary.num_finishes
+        if summary.llm_usage:
+            total_llm_queries += int(summary.llm_usage.get("query_count", 0))
+            provider_reported_llm_queries += int(
+                summary.llm_usage.get("provider_reported_query_count", 0)
+            )
+            total_tokens = summary.llm_usage.get("totals", {}).get("total_tokens")
+            if isinstance(total_tokens, int):
+                total_llm_tokens += total_tokens
+                has_total_llm_tokens = True
 
     if executed_trials == 0:
         print("No trials completed.")
@@ -858,6 +886,11 @@ def _print_and_save_summary(
     print(f"Average code blocks: {average_code_blocks:.3f}")
     print(f"Average regenerations: {average_regenerations:.3f}")
     print(f"Average finishes: {average_finishes:.3f}")
+    print(
+        "LLM usage (provider-reported): "
+        f"queries={total_llm_queries}, reported={provider_reported_llm_queries}, "
+        f"total_tokens={total_llm_tokens if has_total_llm_tokens else 'unavailable'}"
+    )
     print(f"Elapsed time: {elapsed_time:.2f} seconds")
 
     # Write summaries to a txt file
@@ -876,4 +909,9 @@ def _print_and_save_summary(
             f.write(f"Average code blocks: {average_code_blocks:.3f}\n")
             f.write(f"Average regenerations: {average_regenerations:.3f}\n")
             f.write(f"Average finishes: {average_finishes:.3f}\n")
+            f.write(
+                "LLM usage (provider-reported): "
+                f"queries={total_llm_queries}, reported={provider_reported_llm_queries}, "
+                f"total_tokens={total_llm_tokens if has_total_llm_tokens else 'unavailable'}\n"
+            )
             f.write(f"Elapsed time: {elapsed_time:.2f} seconds\n")

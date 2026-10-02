@@ -17,40 +17,89 @@ env:
       live_preview_path: ${oc.env:CAPX_LIVE_PREVIEW_PATH,/tmp/capx_tension_strap_preview.jpg}
       live_preview_stride: 5
       live_preview_jpeg_quality: 85
+      video_renderer: task_native
+      tension_response_panel:
+        enabled: true
+        history_points: 360
+      # Pre-move is benchmark initialization, not agent behavior.  Rendering
+      # the 1600x1200 dashboard and extracting a tactile timeline at every
+      # pre-move physics step consumed most of the outer process watchdog.
+      # Start recording at the post-reset agent state instead.  The task runs
+      # at 60 Hz, so stride 2 preserves real-time playback at the writer's
+      # 30 FPS while cutting dashboard rendering and encoding in half.
+      task_config_overrides:
+        task_cfg_overrides:
+          save_pre_move: false
+        record_video_during_reset: false
+        record_pre_move_frames: false
+        record_pre_move_tactile_timeline: false
+        video_frame_stride: 2
+      runtime_preflight:
+        enabled: true
+        tacex_root: ${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/ViTaForge_capx_tension/third_party/TacEx}
+        require_contact_gradient: true
+        require_attached_gelpad_asset: true
+        require_attachment_points: true
       api_configs:
         franka_control_api:
           llm_api_profile: opentac_tension_control
           llm_visible_functions: [move_delta, open_gripper, close_gripper, get_robot_state, wait_steps]
           tactile_adaptive_gripper_enabled: true
           use_native_pose_planner: false
-          local_delta_max_m: 0.002
+          local_delta_max_m: 0.001
           local_delta_segment_m: 0.001
+          force_task_target_lead_m: 0.002
           min_safe_z: 0.10
           max_gripper_servo_steps: 160
+          adaptive_gripper:
+            # The public expert accepts the grasp at 27.6 mm raw depth with a
+            # 34 mm calibrated far plane, i.e. at least 6.4 mm indentation.
+            target_depth_delta_mm: 6.4
+            min_stable_contact_area: 0.006
+            post_squeeze_qpos: 0.00015
+            post_squeeze_steps: 4
+            hold_steps: 8
         opentac_api:
-          llm_visible_functions: [get_tactile_tension_control_contract, begin_tactile_tension_estimator, get_tactile_tension_estimate, get_tactile_stage_memory, capture_tactile_stage_response]
+          llm_visible_functions: [get_tactile_tension_control_contract, begin_tactile_tension_estimator, get_tactile_tension_estimate, get_tactile_tension_control_state, get_tactile_stage_memory, capture_tactile_stage_response]
           tension_calibration_path: task_config/force_task_rgb/tension_strap_dual_stage.json
           tactile_stage_memory_path: env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v1.json
-          max_delta_z_m: 0.002
+          max_delta_z_m: 0.001
           observation_wait_steps: 2
           observation_dt_s: 0.016666666666666666
           stage_hold_seconds: 3.0
-          max_control_actions_per_stage: 120
+          max_control_actions_per_stage: null
+          estimator_settle_steps: 30
+          proportional_delta_gain_m_per_N: 0.00008333333333333333
+          stage_targets_N: [12.0, 18.0]
+          stage_tolerance_N: 0.5
+          estimator_update_stride: 1
+          max_estimate_age_steps: 3
+          max_consecutive_invalid_samples: 3
       expose_actor_pose: false
       privileged: false
       enable_render: true
     privileged: false
     apis: [FrankaControlApi, OpenTacApi]
     prompt: |
-      Complete the public two-stage tension-strap task using only FrankaControlApi and OpenTacApi. The task instruction states the ordered targets and hold requirement. Do not read or infer simulator true tension, actor state, reward, success, task metadata, private task fields, or direct environment objects.
+      Complete this public tension-strap task using only the documented functions from FrankaControlApi and OpenTacApi. The documented API names are already injected as top-level Python functions. Call them directly, for example close_gripper(...), get_tactile_tension_estimate(), and move_delta(dz=...). Do not import API modules, instantiate FrankaControlApi/OpenTacApi, use APIS, or access env directly.
 
-      The task pre-move has already reached the public non-contact strap approach. First close the gripper adaptively and wait briefly for the physical grasp fixture to release. Then call begin_tactile_tension_estimator once; if marker tracking cannot initialize, report CAPX_FAILURE and stop.
+      Task objective: keep the same grasp throughout two ordered tension stages. First control the public estimated_tension_N into the 12 N target band [11.5, 12.5], then without opening or regrasping control it into the 18 N target band [17.5, 18.5]. Tension is a tolerance-band requirement: do not chase an exact 12.000 or 18.000 value once the public estimate is inside its band. Time is a strict continuous requirement: each stage must remain inside its band for one uninterrupted full 3.0-second window. Do not begin the 18 N stage until the full 12 N hold has completed. Do not end after only the first stage. Do not read or infer simulator true tension, actor state, reward, success, task metadata, private task fields, or direct environment objects.
 
-      Read get_tactile_tension_control_contract() and get_tactile_stage_memory() once. The control contract is the only source of local-motion, sampling, and holding limits. For each target from the task instruction, repeatedly call get_tactile_tension_estimate(). Move only with move_delta(dz=...), using the sign of the public estimate error and a bounded adjustment within the returned contract. Wait between estimates. Avoid oscillation near a target: keep the current pose while the estimate is inside the local hold band.
+      The task pre-move has already brought the open gripper to the public non-contact strap approach. Read the contract before acting. First call close_gripper(adaptive=True). Check its returned stable/contact result; if the grasp is not stable, print CAPX_FAILURE and stop. Wait exactly contract["estimator_settle_steps"] without moving so the physical grasp fixture and marker image settle, then call begin_tactile_tension_estimator() exactly once and require result["ok"] is true. The first cached estimator record may be baseline_pending; wait contract["observation_wait_steps"] once for the first post-baseline marker-RGB sample before making any move_delta. Do not reset the estimator or reopen the gripper between the two stages.
 
-      After maintaining a complete public hold window, call capture_tactile_stage_response(). Extract all frozen response-block fields, compute block RMS distances using each prototype median and the single shared pooled-calibration IQR, then retain the response only when it matches the intended stage more closely than the other stage. Print a concise CAPX_STAGE diagnostic with both distances and margin. The frozen memory confirms the stage but does not control the robot for you.
+      Call get_tactile_tension_control_contract(), get_tactile_tension_control_state(), and get_tactile_stage_memory() before controlling. The contract supplies public stage_targets_N, exact inclusive stage_bands_N, max_delta_z_m, estimator_settle_steps, proportional_delta_gain_m_per_N, observation_wait_steps, stage_hold_seconds, max_control_actions_per_stage, and the bounded invalid-estimate limits. stage_bands_N is the only source of truth for in-band control: use low, high = contract["stage_bands_N"][state["current_stage_index"]]. Do not derive a different band from the target or introduce any extra in-band threshold. The control state is a marker-RGB-derived checkpoint: completed_stage_ids records only complete uninterrupted public holds, while current_stage_index, current_target_N, current_stage_in_band_hold_seconds, and current_stage_action_count describe work still in progress. It does not contain true tension, reward, success, or task-private state.
 
-      Advance to the next target only after both the hold and its matching 10D response are valid. At the final target, remain in place until the full hold and final response are complete. If grasp, marker tracking, response quality, or action budget fails, print CAPX_FAILURE with the reason and stop. Return concise executable Python only.
+      Resume from the control state rather than assuming a stage completed. For the fixed public order 12 N then 18 N, skip only a stage whose corresponding memory_id is in completed_stage_ids. In every loop iteration use this exact order after reading state: first, if stage_id is already in completed_stage_ids, break the current stage loop; second, only if it is not completed, require current_stage_index == stage_index; third, read low, high directly from contract["stage_bands_N"][state["current_stage_index"]]. This order is mandatory because the adapter changes current_stage_index from 0 to 1 on the same frame that it appends the completed 12 N stage ID. Never treat that valid transition as an error. The 18 N target requires an additional positive move_delta(dz) after the 12 N checkpoint when its public estimate is below the 18 N band; no API automatically performs that upward pull. Its public control value is estimate["estimated_tension_N"]. Positive move_delta(dz) pulls upward and increases tension; negative dz relaxes the strap. When outside the exact contract band, use a proportional correction dz = clip((current_target_N - estimated_tension_N) * contract["proportional_delta_gain_m_per_N"], -contract["max_delta_z_m"], contract["max_delta_z_m"]). Do not impose a fixed minimum movement fraction and do not repeatedly use the maximum delta without rereading the estimate. After every move_delta, wait exactly contract["observation_wait_steps"] once so the native servo and marker tracker can settle, then reread the cached estimate and state. While an estimate is inside the band, do not move: the adapter accumulates the continuous hold from every public marker-RGB frame. Advance only when state shows the stage memory_id in completed_stage_ids. Any out-of-band or invalid sample resets that adapter-owned continuous hold; never add separated in-band segments together.
+
+      If estimate["ok"] is false, do not move. Wait once, reread estimate and state, and only continue while state["consecutive_invalid_samples"] is below contract["max_consecutive_invalid_samples"]. Otherwise print CAPX_FAILURE with the returned public status/message and stop. Never convert an invalid estimate into an infinite wait loop. This smoke contract has no per-stage action cap: max_control_actions_per_stage is null, so do not compare the count to it. If a future contract returns an integer cap, enforce it before commanding another move.
+
+      Immediately after each complete 3-second hold, call capture_tactile_stage_response() and require response["quality"]["valid"] is true. Do not guess the frozen-memory schema. It is exactly memory["stages"], a list with two records whose identifiers are stage["memory_id"] == "tension_strap_hold_12n.v1" and "tension_strap_hold_18n.v1". Each stage record has stage["response_blocks"], not "blocks". There is no stage "name" or "id" field to search for. Select each stage by its exact memory_id.
+
+      Build the 10 public response values in these three fixed blocks: normal_static = [response["hold"]["left"]["depth_mm"], response["hold"]["right"]["depth_mm"]]; normal_dynamic = [response["end_minus_start"]["left"]["depth_mm"], response["end_minus_start"]["right"]["depth_mm"]]; surface_spatial_static = [left/right marker_row_gradient_px, left/right marker_col_gradient_px, log(left marker_anisotropy_ratio), log(right marker_anisotropy_ratio)] from response["hold"]. For block index i, compare these values with stage["response_blocks"][i]["scaler"]["median"] and the same-index shared pooled-calibration IQR at memory["retrieval_scaler"]["response_blocks"][i]["iqr"]. The block distance is RMS((value - median) / IQR); the fused stage distance is the arithmetic mean of its three block distances. The response must be closer to tension_strap_hold_12n.v1 after the 12 N hold, and closer to tension_strap_hold_18n.v1 after the 18 N hold. Print CAPX_STAGE with the stage, both fused distances, and margin. The frozen response memory verifies the completed stage; it does not control motion for you.
+
+      Every submitted or regenerated code block must be independently executable. At the top of any block that uses them, retrieve contract, state, and memory again; never rely on variables created by an earlier code block. On failure, print CAPX_FAILURE and raise RuntimeError without catching or swallowing it. Do not wrap the main program in `except SystemExit: pass` or a broad exception handler that turns a failure into apparent success.
+
+      Advance only after both the physical hold and its matching 10D response are valid. At 18 N, remain at the final pose until its hold and response are complete, then end normally. If grasp, marker tracking, response quality, memory retrieval, or an action budget fails, print CAPX_FAILURE with the reason and stop. Return concise executable Python only.
     multi_turn_prompt: |
       Executed code:
       {executed_code}
@@ -61,23 +110,27 @@ env:
       Console stderr:
       {console_stderr}
 
-      This is failure-only recovery. Preserve a completed first stage; do not restart its hold or alter the frozen memory. Repair only the incomplete control stage using the public estimator and contract. Do not use private force signals or change the target sequence.
+      This is failure-only recovery. The appended public OpenTac state is the source of truth for completed marker-RGB holds. Preserve only stage IDs listed in completed_stage_ids; never infer that 12 N completed from the prior code alone. Do not reset its estimator, reopen the gripper, or alter the frozen memory. Repair only the current incomplete stage using the public estimator, control state, and contract. The documented functions are already injected as top-level names: do not import or instantiate API classes. The regenerated block must be independently executable: retrieve contract, state, and memory again instead of assuming prior local variables exist. Select frozen stages only through memory["stages"][*]["memory_id"] and use response_blocks, never guessed name/id/blocks fields. Do not use private force signals or change the 12 N then 18 N target sequence.
 trials: 1
 num_workers: 1
 record_video: true
 output_dir: ./outputs/vitaforge_tension_strap_stage_memory_control
 trial_timeout_seconds: 1200
 max_trial_retries: 1
-max_regenerations: 2
+max_regenerations: 1
+skip_multiturn_on_stage_action_budget: true
+stop_multiturn_when_regeneration_exhausted: true
 save_multiturn_prompts: true
 split_code_blocks_on_breakpoint: true
 multi_turn_on_failure_only: true
 filter_multiturn_console: true
-multiturn_console_max_lines: 35
-multiturn_console_max_chars: 5000
-multiturn_console_keep_recent_other: 5
-multiturn_executed_code_max_chars: 6000
-multiturn_remaining_code_max_chars: 3000
+multiturn_console_max_lines: 10
+multiturn_console_max_chars: 1000
+multiturn_console_keep_recent_other: 0
+multiturn_executed_code_max_chars: 3000
+multiturn_remaining_code_max_chars: 1000
+include_trial_memory_in_multiturn: true
+multiturn_trial_memory_max_chars: 1000
 tactile_memory:
   trial:
     enabled: false

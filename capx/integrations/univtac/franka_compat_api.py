@@ -506,6 +506,37 @@ class UniVTACFrankaCompatApi(ApiBase):
         current_pos, current_quat = self._current_tool_pose()
         target_pos = current_pos.copy()
         target_pos[2] = max(float(target_pos[2] + delta_z), self.min_safe_z)
+        bounded_delta_z = float(target_pos[2] - current_pos[2])
+        force_task_move = getattr(self._env, "move_force_task_vertical_delta", None)
+        if callable(force_task_move):
+            segment_limit = max(1e-6, self.local_delta_segment_m)
+            # ``current_pos`` may arrive as float32. Remove its sub-nanometre
+            # conversion noise before applying ceil so a configured 2 mm move
+            # with 1 mm segments remains exactly two tracker updates.
+            ratio = abs(bounded_delta_z) / segment_limit
+            segment_count = max(1, int(np.ceil(ratio - 1e-8)))
+            segment_delta_z = bounded_delta_z / segment_count
+            results: list[dict[str, Any]] = []
+            for _ in range(segment_count):
+                result = force_task_move(dz=segment_delta_z)
+                results.append(dict(result))
+                if not bool(result.get("ok", False)):
+                    return {
+                        **result,
+                        "operation": "opentac_tension_move_delta",
+                        "requested_delta_z_m": delta_z,
+                        "executed_delta_z_m": segment_delta_z * (len(results) - 1),
+                        "segment_count": segment_count,
+                        "segments_completed": len(results) - 1,
+                    }
+            return {
+                **results[-1],
+                "operation": "opentac_tension_move_delta",
+                "requested_delta_z_m": delta_z,
+                "executed_delta_z_m": bounded_delta_z,
+                "segment_count": segment_count,
+                "segments_completed": segment_count,
+            }
         return self._memory_match_execute_relative_pose(
             target_pos,
             current_quat,

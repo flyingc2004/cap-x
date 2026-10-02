@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import contextlib
+import contextvars
 import json
 import os
 import random
@@ -118,6 +120,179 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _llm_protocol() -> str:
+    """Return the configured wire protocol for model requests."""
+    value = os.getenv("CAPX_LLM_PROTOCOL", "chat_completions").strip().lower()
+    aliases = {
+        "chat": "chat_completions",
+        "chat_completions": "chat_completions",
+        "responses": "responses",
+    }
+    try:
+        return aliases[value]
+    except KeyError as exc:
+        raise ValueError(
+            "CAPX_LLM_PROTOCOL must be 'chat_completions' or 'responses', "
+            f"got {value!r}"
+        ) from exc
+
+
+# Trial execution registers a bounded collector around model calls. Keeping it
+# in the client means auxiliary VLM calls and ensemble members are accounted for
+# by the same mechanism as code-generation calls.
+_usage_collector: contextvars.ContextVar[tuple[list[dict[str, Any]], str] | None] = (
+    contextvars.ContextVar("capx_llm_usage_collector", default=None)
+)
+
+
+@contextlib.contextmanager
+def collect_llm_usage(events: list[dict[str, Any]], phase: str):
+    """Collect provider-reported usage for queries made in this context."""
+    token = _usage_collector.set((events, str(phase)))
+    try:
+        yield
+    finally:
+        _usage_collector.reset(token)
+
+
+def _usage_int(value: Any) -> int | None:
+    """Return a non-negative provider token count, preserving missing values."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(value)
+    return None
+
+
+def normalize_llm_usage(body: Any) -> dict[str, Any]:
+    """Normalize Chat Completions and Responses ``usage`` without estimation."""
+    raw_usage = body.get("usage") if isinstance(body, dict) else None
+    if not isinstance(raw_usage, dict):
+        return {
+            "provider_reported": False,
+            "input_tokens": None,
+            "output_tokens": None,
+            "reasoning_tokens": None,
+            "cached_input_tokens": None,
+            "total_tokens": None,
+        }
+
+    input_details = raw_usage.get("input_tokens_details")
+    if not isinstance(input_details, dict):
+        input_details = raw_usage.get("prompt_tokens_details")
+    if not isinstance(input_details, dict):
+        input_details = {}
+    output_details = raw_usage.get("output_tokens_details")
+    if not isinstance(output_details, dict):
+        output_details = raw_usage.get("completion_tokens_details")
+    if not isinstance(output_details, dict):
+        output_details = {}
+
+    return {
+        "provider_reported": True,
+        "input_tokens": _usage_int(
+            raw_usage.get("input_tokens", raw_usage.get("prompt_tokens"))
+        ),
+        "output_tokens": _usage_int(
+            raw_usage.get("output_tokens", raw_usage.get("completion_tokens"))
+        ),
+        "reasoning_tokens": _usage_int(output_details.get("reasoning_tokens")),
+        "cached_input_tokens": _usage_int(
+            input_details.get("cached_tokens", input_details.get("cache_read_input_tokens"))
+        ),
+        "total_tokens": _usage_int(raw_usage.get("total_tokens")),
+        # Preserve provider data for later billing reconciliation. It contains
+        # neither prompt text nor credentials.
+        "provider_usage": raw_usage,
+    }
+
+
+def _record_llm_usage(
+    *,
+    args: "LaunchArgs | ModelQueryArgs",
+    protocol: str,
+    payload_stats: dict[str, int],
+    body: Any,
+    latency_seconds: float,
+) -> dict[str, Any]:
+    usage = normalize_llm_usage(body)
+    event = {
+        "schema_version": "capx_llm_usage_query.v1",
+        "model": str(args.model),
+        "protocol": protocol,
+        "latency_seconds": round(float(latency_seconds), 6),
+        "request": {
+            **payload_stats,
+            "max_output_tokens_requested": int(args.max_tokens),
+        },
+        "usage": usage,
+    }
+    collector = _usage_collector.get()
+    if collector is not None:
+        events, phase = collector
+        events.append({"phase": phase, **event})
+    return event
+
+
+def _sum_known_token_field(events: list[dict[str, Any]], field: str) -> int | None:
+    values = [
+        value
+        for event in events
+        if isinstance(event.get("usage"), dict)
+        and isinstance((value := event["usage"].get(field)), int)
+    ]
+    return sum(values) if values else None
+
+
+def summarize_llm_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a JSON-safe per-trial usage artifact from recorded query events."""
+    normalized_events = [event for event in events if isinstance(event, dict)]
+    fields = (
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cached_input_tokens",
+        "total_tokens",
+    )
+    totals = {field: _sum_known_token_field(normalized_events, field) for field in fields}
+    by_model: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for event in normalized_events:
+        key = (str(event.get("model", "unknown")), str(event.get("protocol", "unknown")))
+        by_model.setdefault(key, []).append(event)
+
+    return {
+        "schema_version": "capx_llm_usage.v1",
+        "query_count": len(normalized_events),
+        "provider_reported_query_count": sum(
+            bool(event.get("usage", {}).get("provider_reported"))
+            for event in normalized_events
+            if isinstance(event.get("usage"), dict)
+        ),
+        "unreported_query_count": sum(
+            not bool(event.get("usage", {}).get("provider_reported"))
+            for event in normalized_events
+            if isinstance(event.get("usage"), dict)
+        ),
+        "totals": totals,
+        "by_model": [
+            {
+                "model": model,
+                "protocol": protocol,
+                "query_count": len(model_events),
+                "totals": {
+                    field: _sum_known_token_field(model_events, field) for field in fields
+                },
+            }
+            for (model, protocol), model_events in sorted(by_model.items())
+        ],
+        "queries": normalized_events,
+        "billing_note": (
+            "Counts are reported by the provider. No monetary estimate is computed "
+            "because endpoint-specific token prices are not configured."
+        ),
+    }
 
 
 @dataclass
@@ -254,6 +429,12 @@ def _payload_stats(payload: dict[str, Any]) -> dict[str, int]:
         "json_bytes": len(json.dumps(payload).encode("utf-8")),
     }
     messages = payload.get("messages")
+    if messages is None:
+        messages = payload.get("input")
+    if isinstance(messages, str):
+        stats["messages"] = 1
+        stats["text_chars"] = len(messages)
+        return stats
     if not isinstance(messages, list):
         return stats
     stats["messages"] = len(messages)
@@ -268,9 +449,9 @@ def _payload_stats(payload: dict[str, Any]) -> dict[str, int]:
                 if not isinstance(item, dict):
                     continue
                 item_type = item.get("type")
-                if item_type == "text":
+                if item_type in {"text", "input_text"}:
                     stats["text_chars"] += len(str(item.get("text", "")))
-                elif item_type == "image_url":
+                elif item_type in {"image_url", "input_image"}:
                     stats["image_items"] += 1
                     image_url = item.get("image_url")
                     if isinstance(image_url, dict):
@@ -338,18 +519,92 @@ def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
     ]
     """
 
-    for message in prompt:
-        for content in message["content"]:
-            if type(content) == str:
-                continue
-            if content.get("type") == "text":
-                content["type"] = "input_text"
-                content["text"] = content.pop("text")
+    converted: list[dict] = []
+    for message in copy.deepcopy(prompt):
+        content = message.get("content", "")
+        if isinstance(content, str):
+            message["content"] = [{"type": "input_text", "text": content}]
+        elif isinstance(content, list):
+            converted_content: list[dict] = []
+            for item in content:
+                if isinstance(item, str):
+                    converted_content.append({"type": "input_text", "text": item})
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                item = dict(item)
+                item_type = item.get("type")
+                if item_type in {"text", "input_text"}:
+                    converted_content.append(
+                        {"type": "input_text", "text": str(item.get("text", ""))}
+                    )
+                elif item_type in {"image_url", "input_image"}:
+                    image_url = item.get("image_url", "")
+                    if isinstance(image_url, dict):
+                        image_url = image_url.get("url", "")
+                    converted_content.append(
+                        {"type": "input_image", "image_url": str(image_url)}
+                    )
+            message["content"] = converted_content
+        else:
+            message["content"] = [{"type": "input_text", "text": str(content)}]
+        converted.append(message)
+    return converted
 
-            elif content.get("type") == "image_url":
-                content["type"] = "input_image"
-                content["image_url"] = content["image_url"]["url"]
-    return prompt
+
+def _responses_endpoint_url(server_url: str) -> str:
+    """Map an OpenAI-compatible chat endpoint to its Responses counterpart."""
+    normalized = server_url.rstrip("/")
+    suffix = "/chat/completions"
+    if normalized.endswith(suffix):
+        return normalized[: -len(suffix)] + "/responses"
+    return normalized
+
+
+def _responses_output(body: Any) -> tuple[str, str | None]:
+    """Extract visible text and optional reasoning from a Responses body."""
+    if not isinstance(body, dict):
+        raise RuntimeError(f"Unexpected Responses API format: {body!r}")
+
+    output_text = body.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text, None
+
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    output = body.get("output", [])
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "message":
+                content = item.get("content", [])
+                if isinstance(content, list):
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") in {"output_text", "text"}:
+                            value = part.get("text", "")
+                            if isinstance(value, str) and value:
+                                text_parts.append(value)
+            elif item_type == "reasoning":
+                summary = item.get("summary", [])
+                if isinstance(summary, list):
+                    for part in summary:
+                        if isinstance(part, dict):
+                            value = part.get("text", "")
+                            if isinstance(value, str) and value:
+                                reasoning_parts.append(value)
+
+    content = "\n".join(text_parts)
+    if not content.strip():
+        raise RuntimeError(
+            "Responses API returned no visible output text "
+            f"(status={body.get('status')!r}, output_items={len(output) if isinstance(output, list) else 0})."
+        )
+    reasoning = "\n".join(reasoning_parts) or None
+    return content, reasoning
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +612,7 @@ def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
+def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict[str, Any]:
     """Query vLLM server for code generation.
 
     Args:
@@ -367,13 +622,25 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         Model response content
     """
 
-    # Route OpenRouter models to the OpenRouter proxy server
-    if is_openrouter_model(args.model):
+    protocol = _llm_protocol()
+
+    # Route OpenRouter models to the OpenRouter proxy server.
+    if protocol == "responses":
+        server_url = _responses_endpoint_url(args.server_url)
+    elif is_openrouter_model(args.model):
         server_url = OPENROUTER_SERVER_URL
     else:
         server_url = args.server_url
 
-    if _is_kimi_k3_model(args.model):
+    if protocol == "responses":
+        payload = {
+            "model": args.model,
+            "input": _completions_to_responses_convert_prompt(prompt),
+            "max_output_tokens": args.max_tokens,
+        }
+        if _env_flag("CAPX_RESPONSES_SEND_REASONING_EFFORT", False):
+            payload["reasoning"] = {"effort": args.reasoning_effort}
+    elif _is_kimi_k3_model(args.model):
         payload = {
             "model": args.model,
             "temperature": args.temperature,
@@ -445,7 +712,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         "Accept": "application/json",
         "Accept-Encoding": os.getenv("CAPX_LLM_ACCEPT_ENCODING", "identity"),
     }
-    if _disable_thinking_requested(args):
+    if protocol != "responses" and _disable_thinking_requested(args):
         payload["enable_thinking"] = False
     if args.api_key:
         headers["Authorization"] = f"Bearer {args.api_key}"
@@ -459,15 +726,26 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     payload_stats = _payload_stats(payload)
     disable_proxy = _env_flag("CAPX_DISABLE_PROXY", False)
     trust_env = _env_flag("CAPX_LLM_TRUST_ENV", True) and not disable_proxy
+    if disable_proxy:
+        proxy_mode = "disabled"
+    elif trust_env:
+        proxy_mode = "environment"
+    else:
+        proxy_mode = "direct"
 
     # keep calling until it works
+    reasoning_log_value = payload.get(
+        "reasoning_effort", payload.get("reasoning", "<not-sent>")
+    )
     print(
         f"[capx-llm] querying model={args.model} url={server_url} "
         f"timeout={request_timeout:g}s max_tokens={args.max_tokens} "
         f"max_retries={max_retries} "
+        f"protocol={protocol} "
         f"disable_thinking={payload.get('enable_thinking') is False} "
-        f"reasoning_effort={payload.get('reasoning_effort', '<not-sent>')} "
+        f"reasoning_effort={reasoning_log_value} "
         f"trust_env={trust_env} "
+        f"proxy_mode={proxy_mode} "
         f"accept_encoding={headers['Accept-Encoding']}"
     )
     print(
@@ -575,33 +853,44 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         f"top_level_keys={sorted(body) if isinstance(body, dict) else type(body).__name__}",
         flush=True,
     )
-    out = {}
-    if args.debug:
-        print(json.dumps(body, indent=2))
-    try:
-        if args.model in GPT_MODELS and "codex" in args.model:
-            out["content"] = body["output_text"]
-            message = None
-        else:
-            message = body["choices"][0]["message"]
-            out["content"] = message["content"]
-    except (KeyError, IndexError) as exc:
-        raise RuntimeError(f"Unexpected response format: {body}") from exc
-    if not isinstance(out["content"], str) or not out["content"].strip():
-        message_fields = sorted(message) if isinstance(message, dict) else []
-        finish_reason = None
-        if isinstance(body, dict) and isinstance(body.get("choices"), list) and body["choices"]:
-            finish_reason = body["choices"][0].get("finish_reason")
-        raise RuntimeError(
-            "LLM endpoint returned empty message.content "
-            f"(finish_reason={finish_reason!r}, message_fields={message_fields}). "
-            "Check the provider's reasoning configuration and response schema."
-        )
-    if body.get("choices") is not None:
-        message = body.get("choices")[0].get("message", {})
-        out["reasoning"] = message.get("reasoning", message.get("reasoning_content"))
+    if protocol == "responses":
+        content, reasoning = _responses_output(body)
+        out = {"content": content, "reasoning": reasoning}
     else:
-        out["reasoning"] = None
+        out = {}
+        if args.debug:
+            print(json.dumps(body, indent=2))
+        try:
+            if args.model in GPT_MODELS and "codex" in args.model:
+                out["content"] = body["output_text"]
+                message = None
+            else:
+                message = body["choices"][0]["message"]
+                out["content"] = message["content"]
+        except (KeyError, IndexError) as exc:
+            raise RuntimeError(f"Unexpected response format: {body}") from exc
+        if not isinstance(out["content"], str) or not out["content"].strip():
+            message_fields = sorted(message) if isinstance(message, dict) else []
+            finish_reason = None
+            if isinstance(body, dict) and isinstance(body.get("choices"), list) and body["choices"]:
+                finish_reason = body["choices"][0].get("finish_reason")
+            raise RuntimeError(
+                "LLM endpoint returned empty message.content "
+                f"(finish_reason={finish_reason!r}, message_fields={message_fields}). "
+                "Check the provider's reasoning configuration and response schema."
+            )
+        if body.get("choices") is not None:
+            message = body.get("choices")[0].get("message", {})
+            out["reasoning"] = message.get("reasoning", message.get("reasoning_content"))
+        else:
+            out["reasoning"] = None
+    out["usage"] = _record_llm_usage(
+        args=args,
+        protocol=protocol,
+        payload_stats=payload_stats,
+        body=body,
+        latency_seconds=end_time - start_time,
+    )
     return out  # type: ignore[return-value]
 
 
@@ -625,6 +914,10 @@ def query_model_streaming(
     """
     if requests is None:
         raise RuntimeError("Streaming model queries require the optional 'requests' package")
+    if _llm_protocol() == "responses":
+        raise RuntimeError(
+            "Responses API streaming is not implemented; use non-streaming query_model()."
+        )
 
     if _is_kimi_k3_model(args.model):
         payload = {
@@ -792,7 +1085,13 @@ def query_model_ensemble(
         )
         try:
             result = query_model(query_args, copy.deepcopy(prompt))
-            return {"model": model, "temp": temp, "content": result["content"], "ok": True}
+            return {
+                "model": model,
+                "temp": temp,
+                "content": result["content"],
+                "usage": result.get("usage"),
+                "ok": True,
+            }
         except Exception as e:
             error_msg = str(e)
             print(f"[Multimodel Ensemble] {model} temp={temp} FAILED: {error_msg}")
@@ -802,7 +1101,10 @@ def query_model_ensemble(
     tasks = [(m, t) for m, temps in ENSEMBLE_CONFIGS for t in temps]
     responses = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
-        futures = {executor.submit(query_single, m, t): (m, t) for m, t in tasks}
+        futures = {
+            executor.submit(contextvars.copy_context().run, query_single, m, t): (m, t)
+            for m, t in tasks
+        }
         for future in concurrent.futures.as_completed(futures):
             resp = future.result()
             responses.append(resp)
@@ -917,6 +1219,7 @@ def query_model_ensemble(
     return {
         "content": final["content"],
         "reasoning": final.get("reasoning"),
+        "usage": final.get("usage"),
         "all_responses": responses,
         "ensemble_candidates_txt": candidates_txt,
         "ensemble_synthesis_txt": synthesis_txt,
@@ -951,7 +1254,13 @@ def query_single_model_ensemble(
         )
         try:
             result = query_model(query_args, copy.deepcopy(prompt))
-            return {"model": model, "temp": temp, "content": result["content"], "ok": True}
+            return {
+                "model": model,
+                "temp": temp,
+                "content": result["content"],
+                "usage": result.get("usage"),
+                "ok": True,
+            }
         except Exception as e:
             error_msg = str(e)
             print(f"[Single Model Ensemble] {model} temp={temp} FAILED: {error_msg}")
@@ -961,7 +1270,10 @@ def query_single_model_ensemble(
     temperatures = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     responses = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
-        futures = {executor.submit(query_single, t): t for t in temperatures}
+        futures = {
+            executor.submit(contextvars.copy_context().run, query_single, t): t
+            for t in temperatures
+        }
         for future in concurrent.futures.as_completed(futures):
             resp = future.result()
             responses.append(resp)
@@ -1077,6 +1389,7 @@ def query_single_model_ensemble(
     return {
         "content": final["content"],
         "reasoning": final.get("reasoning"),
+        "usage": final.get("usage"),
         "all_responses": responses,
         "ensemble_candidates_txt": candidates_txt,
         "ensemble_synthesis_txt": synthesis_txt,

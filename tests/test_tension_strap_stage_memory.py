@@ -16,6 +16,7 @@ from capx.integrations.univtac.native_tactile import (
 )
 from capx.integrations.opentac import OpenTacApi
 from capx.integrations.univtac.tactile_api import UniVTACTactileApi
+from capx.envs.trial import _should_query_multiturn_after_block
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +67,7 @@ class _Env:
         self.api_configs = {"opentac_api": {"tactile_stage_memory": memory}}
         self.trace: list[dict] = []
         self.snapshot: dict = {}
+        self.visualizations: list[tuple[dict, dict]] = []
 
     def refresh_native_observation(self, **_kwargs):
         return {}
@@ -86,6 +88,11 @@ class _Env:
 
     def set_tactile_trial_memory_snapshot(self, memory: dict) -> None:
         self.snapshot = memory
+
+    def set_tension_response_visualization(
+        self, response: dict, stage_memory: dict
+    ) -> None:
+        self.visualizations.append((response, stage_memory))
 
 
 def test_runtime_capture_has_public_10d_stage_response_without_stage_label() -> None:
@@ -114,6 +121,10 @@ def test_runtime_capture_has_public_10d_stage_response_without_stage_label() -> 
     assert "actor" not in repr(response).lower()
     assert "tension" not in repr(response).lower()
     assert any(record["event"] == "stage_response_capture" for record in env.trace)
+    assert len(env.visualizations) == 1
+    rendered_response, rendered_memory = env.visualizations[0]
+    assert rendered_response["capture_id"] == response["capture_id"]
+    assert rendered_memory["schema_version"] == "tactile_stage_memory.v1"
 
 
 def test_stage_response_rejects_insufficient_bilateral_contact() -> None:
@@ -194,14 +205,83 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
         "get_tactile_tension_control_contract",
         "begin_tactile_tension_estimator",
         "get_tactile_tension_estimate",
+        "get_tactile_tension_control_state",
         "get_tactile_stage_memory",
         "capture_tactile_stage_response",
     ]
     prompt = config["env"]["cfg"]["prompt"]
     assert "true tension" in prompt
     assert "pooled-calibration IQR" in prompt
+    assert "12 N" in prompt
+    assert "18 N" in prompt
+    assert "[11.5, 12.5]" in prompt
+    assert "Tension is a tolerance-band requirement" in prompt
+    assert "Time is a strict continuous requirement" in prompt
+    assert "never add separated in-band segments together" in prompt
+    assert 'memory["stages"]' in prompt
+    assert 'stage["memory_id"]' in prompt
+    assert 'stage["response_blocks"]' in prompt
+    assert "Every submitted or regenerated code block must be independently executable" in prompt
+    assert "already injected as top-level Python functions" in prompt
+    assert "Do not import API modules" in prompt
     assert "physical scorer" in OpenTacApi.__doc__
+    assert "stage_targets_N" in prompt
+    assert "stage_bands_N" in prompt
+    assert "Do not derive a different band" in prompt
+    assert "completed_stage_ids" in prompt
+    assert tactile["estimator_update_stride"] == 1
+    assert tactile["estimator_settle_steps"] == 30
+    assert tactile["proportional_delta_gain_m_per_N"] == pytest.approx(1.0 / 12000.0)
+    assert tactile["max_delta_z_m"] == pytest.approx(0.001)
+    assert tactile["max_control_actions_per_stage"] is None
+    assert low_level["api_configs"]["franka_control_api"]["local_delta_max_m"] == pytest.approx(0.001)
+    assert low_level["api_configs"]["franka_control_api"]["force_task_target_lead_m"] == pytest.approx(0.002)
+    assert tactile["max_estimate_age_steps"] == 3
+    assert tactile["max_consecutive_invalid_samples"] == 3
     assert config["tactile_memory"]["persistent"]["enabled"] is False
+    assert low_level["video_renderer"] == "task_native"
+    assert low_level["tension_response_panel"] == {"enabled": True, "history_points": 360}
+    assert low_level["task_config_overrides"] == {
+        "task_cfg_overrides": {"save_pre_move": False},
+        "record_video_during_reset": False,
+        "record_pre_move_frames": False,
+        "record_pre_move_tactile_timeline": False,
+        "video_frame_stride": 2,
+    }
+    assert config["skip_multiturn_on_stage_action_budget"] is True
+    assert config["max_regenerations"] == 1
+    assert config["stop_multiturn_when_regeneration_exhausted"] is True
+    assert config["multiturn_console_max_chars"] == 1000
+    assert config["multiturn_executed_code_max_chars"] == 3000
+    grasp = low_level["api_configs"]["franka_control_api"]["adaptive_gripper"]
+    assert grasp["target_depth_delta_mm"] == pytest.approx(6.4)
+    assert grasp["post_squeeze_qpos"] == pytest.approx(0.00015)
+    assert low_level["runtime_preflight"] == {
+        "enabled": True,
+        "tacex_root": "${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/ViTaForge_capx_tension/third_party/TacEx}",
+        "require_contact_gradient": True,
+        "require_attached_gelpad_asset": True,
+        "require_attachment_points": True,
+    }
+
+
+def test_stage_action_budget_is_terminal_for_failure_only_multiturn() -> None:
+    result = {
+        "sandbox_rc": 1,
+        "stdout": "CAPX_FAILURE action budget exhausted on stage 0",
+        "stderr": "RuntimeError: action budget exhausted on stage 0",
+        "task_completed": False,
+    }
+
+    assert not _should_query_multiturn_after_block(
+        result,
+        code_block_idx=1,
+        total_code_blocks=1,
+        config={
+            "multi_turn_on_failure_only": True,
+            "skip_multiturn_on_stage_action_budget": True,
+        },
+    )
 
 
 def test_univtac_tactile_api_does_not_expose_force_task_stage_memory() -> None:
@@ -241,6 +321,8 @@ def test_opentac_estimator_uses_only_public_marker_rgb_and_calibration(monkeypat
 
     contract = api.get_tactile_tension_control_contract()
     baseline = api.begin_tactile_tension_estimator()
+    env.tactile_buffer.append(_frame(6, 6.0))
+    api._on_post_task_step()
     estimate = api.get_tactile_tension_estimate()
 
     assert contract["allowed_translation_axes"] == ["z"]

@@ -1,4 +1,8 @@
-from capx.envs.trial import _clip_multiturn_code, _filter_console_for_multiturn
+from capx.envs.trial import (
+    _clip_multiturn_code,
+    _clip_multiturn_console,
+    _filter_console_for_multiturn,
+)
 
 
 def test_filter_console_for_multiturn_keeps_structured_tactile_lines() -> None:
@@ -35,6 +39,25 @@ def test_filter_console_for_multiturn_limits_recent_other_lines() -> None:
     assert "ordinary 6" in filtered
     assert "ordinary 7" in filtered
     assert "omitted_other=6" in filtered
+
+
+def test_filter_console_for_multiturn_bounds_one_huge_error_line() -> None:
+    raw = "CAPX_FAILURE " + ("diagnostic=" + "x" * 5000) + " final_reason=budget"
+
+    filtered = _filter_console_for_multiturn(raw, max_lines=4, max_chars=600)
+
+    assert len(filtered) <= 600
+    assert "CAPX_FAILURE" in filtered
+    assert "final_reason=budget" in filtered
+    assert "line clipped" in filtered
+
+
+def test_hard_console_clip_applies_after_filtering() -> None:
+    clipped = _clip_multiturn_console("before" + "x" * 4000 + "after", 500, "stdout")
+
+    assert len(clipped) <= 560
+    assert "console clipped" in clipped
+    assert clipped.endswith("after")
 
 
 def test_clip_multiturn_code_keeps_recent_suffix() -> None:

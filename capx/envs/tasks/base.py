@@ -522,6 +522,7 @@ class CodeExecutionEnvBase(Env):
         clear: bool = True,
         wrist_camera: bool = False,
         capture_initial_frame: bool = True,
+        stream_dir: str | None = None,
     ) -> None:
         import inspect
 
@@ -531,10 +532,26 @@ class CodeExecutionEnvBase(Env):
             kwargs["wrist_camera"] = wrist_camera
         if "capture_initial_frame" in sig.parameters:
             kwargs["capture_initial_frame"] = capture_initial_frame
+        if "stream_dir" in sig.parameters:
+            kwargs["stream_dir"] = stream_dir
         self.low_level_env.enable_video_capture(enabled, **kwargs)
 
     def get_video_frames(self, *, clear: bool = False) -> list[np.ndarray]:
         return self.low_level_env.get_video_frames(clear=clear)
+
+    def begin_video_turn(self, turn_index: int) -> None:
+        begin = getattr(self.low_level_env, "begin_video_turn", None)
+        if callable(begin):
+            begin(turn_index)
+
+    def end_video_turn(self) -> None:
+        end = getattr(self.low_level_env, "end_video_turn", None)
+        if callable(end):
+            end()
+
+    def finalize_streamed_video(self, output_dir: str) -> bool:
+        finalize = getattr(self.low_level_env, "finalize_streamed_video", None)
+        return bool(finalize(output_dir)) if callable(finalize) else False
 
     def get_video_frame_count(self) -> int:
         if hasattr(self.low_level_env, "get_video_frame_count"):

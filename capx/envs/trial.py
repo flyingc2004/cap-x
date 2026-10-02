@@ -32,9 +32,11 @@ from capx.envs.tasks.base import CodeExecutionEnvBase
 from capx.llm.client import (
     VLM_MODELS,
     ModelQueryArgs,
+    collect_llm_usage,
     query_model as _query_model,
     query_model_ensemble as _query_model_ensemble,
     query_single_model_ensemble as _query_single_model_ensemble,
+    summarize_llm_usage,
 )
 from capx.utils.launch_utils import (
     TrialSummary,
@@ -200,6 +202,22 @@ def _filter_console_for_multiturn(
     other: list[str] = []
     progress_dropped = 0
     empty_dropped = 0
+    # A simulator can emit a large state dictionary as one "important" line.
+    # Keep its failure prefix and its latest fields, but never let a single
+    # diagnostic dominate the recovery context.
+    max_chars = max(512, int(max_chars))
+    line_limit = max(256, min(1200, max_chars // 2))
+
+    def clip_line(line: str) -> str:
+        if len(line) <= line_limit:
+            return line
+        head = max(96, line_limit // 2)
+        tail = max(96, line_limit - head)
+        return (
+            f"{line[:head]} ... [line clipped: omitted {len(line) - head - tail} chars] ... "
+            f"{line[-tail:]}"
+        )
+
     for raw_line in normalized.splitlines():
         line = raw_line.strip()
         if not line:
@@ -208,10 +226,11 @@ def _filter_console_for_multiturn(
         if _is_console_progress_noise(line):
             progress_dropped += 1
             continue
+        clipped_line = clip_line(line)
         if _is_console_important_for_multiturn(line):
-            important.append(line)
+            important.append(clipped_line)
         else:
-            other.append(line)
+            other.append(clipped_line)
 
     max_lines = max(1, int(max_lines))
     keep_recent_other = max(0, int(keep_recent_other))
@@ -235,7 +254,6 @@ def _filter_console_for_multiturn(
         sections.extend(kept_other)
     filtered = "\n".join(sections)
 
-    max_chars = max(2000, int(max_chars))
     if len(filtered) > max_chars:
         filtered = (
             f"[console-filter] truncated_to_last_chars={max_chars}\n"
@@ -278,6 +296,18 @@ def _clip_multiturn_code(text: str, max_chars: int, label: str) -> str:
     )
 
 
+def _clip_multiturn_console(text: str, max_chars: int, label: str) -> str:
+    """Hard-stop a recovery log even when upstream filtering is bypassed."""
+    text = str(text or "")
+    limit = max(256, int(max_chars))
+    if len(text) <= limit:
+        return text
+    return (
+        f"[console clipped: omitted {len(text) - limit} chars]\n"
+        + text[-limit:]
+    )
+
+
 def _should_query_multiturn_after_block(
     info_step: dict[str, Any],
     *,
@@ -292,6 +322,12 @@ def _should_query_multiturn_after_block(
     stdout = str(info_step.get("stdout", "") or "")
     stderr = str(info_step.get("stderr", "") or "")
     combined = f"{stdout}\n{stderr}"
+    if bool(config.get("skip_multiturn_on_stage_action_budget", False)) and (
+        "action budget exhausted" in combined.lower()
+    ):
+        # This is a terminal public control state. A regenerated block cannot
+        # create new physical budget, so do not spend another LLM request.
+        return False
     try:
         sandbox_rc = int(info_step.get("sandbox_rc", 0) or 0)
     except (TypeError, ValueError):
@@ -354,6 +390,12 @@ def _trial_video_dir(
     )
 
 
+def _trial_video_stream_dir(config: dict[str, Any], trial: int) -> str | None:
+    if not config.get("output_dir"):
+        return None
+    return os.path.join(config["output_dir"], ".video_streams", f"trial_{trial:02d}")
+
+
 def _save_trial_video(
     env: CodeExecutionEnvBase,
     config: dict[str, Any],
@@ -367,11 +409,14 @@ def _save_trial_video(
     """Save recorded video frames from the environment, if available."""
     if not config["record_video"] or not hasattr(env, "get_video_frames"):
         return
+    base_dir = _trial_video_dir(config, trial, info_step, reward)
+    finalize_stream = getattr(env, "finalize_streamed_video", None)
+    if callable(finalize_stream) and bool(finalize_stream(base_dir)):
+        return
     frames = env.get_video_frames(clear=True)
     if not frames or not config["output_dir"]:
         return
 
-    base_dir = _trial_video_dir(config, trial, info_step, reward)
     suffix = f"{reward:.3f}"
     if suffix_extra:
         suffix += f"_{suffix_extra}"
@@ -403,11 +448,14 @@ def _save_turn_and_combined_videos(
     if not hasattr(env, "get_video_frames"):
         return
 
+    base_dir = _trial_video_dir(config, trial, info_step, reward)
+    finalize_stream = getattr(env, "finalize_streamed_video", None)
+    if callable(finalize_stream) and bool(finalize_stream(base_dir)):
+        return
+
     all_frames = env.get_video_frames(clear=True)
     if not all_frames:
         return
-
-    base_dir = _trial_video_dir(config, trial, info_step, reward)
 
     # all_frames may be a list (Robosuite) or a dict of lists (R1Pro multi-camera).
     # Normalise to a list for slicing; dict case is handled by _write_multi_video.
@@ -613,7 +661,7 @@ def _build_trial_working_memory_runtime_context(
     env: CodeExecutionEnvBase,
     config: dict[str, Any],
 ) -> str | None:
-    """Return bounded, agent-authored trial state for a repair turn."""
+    """Return bounded public API runtime state for a repair turn."""
     if not config.get("include_trial_memory_in_multiturn", False):
         return None
     provider = getattr(env, "get_runtime_memory_context", None)
@@ -625,8 +673,8 @@ def _build_trial_working_memory_runtime_context(
     if not context:
         return None
     return (
-        "Public trial-local tactile memory snapshot. It is agent-authored state, "
-        "not a task label; preserve completed work and use it for continuation:\n"
+        "Public trial-local API state. It is not a task label; preserve only "
+        "explicitly completed work and use it for continuation:\n"
         f"```json\n{context}\n```"
     )
 
@@ -1001,7 +1049,12 @@ def _handle_multi_turn_step(
         config,
         info_step["stderr"],
     )
-    if config.get("filter_multiturn_console", False):
+    # A config that declares a console character budget must receive bounded
+    # recovery logs even if a launcher accidentally omits the boolean flag.
+    # Full stdout/stderr remain in the trial artifact for offline diagnosis.
+    if config.get("filter_multiturn_console", False) or (
+        "multiturn_console_max_chars" in config
+    ):
         console_stdout = _filter_console_for_multiturn(
             console_stdout,
             max_lines=int(config.get("multiturn_console_max_lines", 80)),
@@ -1013,6 +1066,14 @@ def _handle_multi_turn_step(
             max_lines=int(config.get("multiturn_console_max_lines", 80)),
             max_chars=int(config.get("multiturn_console_max_chars", 12000)),
             keep_recent_other=int(config.get("multiturn_console_keep_recent_other", 12)),
+        )
+    console_limit = config.get("multiturn_console_max_chars")
+    if console_limit is not None:
+        console_stdout = _clip_multiturn_console(
+            console_stdout, int(console_limit), "stdout"
+        )
+        console_stderr = _clip_multiturn_console(
+            console_stderr, int(console_limit), "stderr"
         )
     complete_multi_turn_prompt = multi_turn_prompt.format(
         executed_code=executed_code,
@@ -1175,6 +1236,7 @@ def _run_single_trial(
     record_during_reset = should_record and bool(
         getattr(env, "record_video_during_reset", False)
     )
+    stream_dir = _trial_video_stream_dir(config, trial) if should_record else None
 
     # --- 1. Reset environment ---
     print(f"[capx-trial] trial={trial} reset begin", flush=True)
@@ -1184,6 +1246,7 @@ def _run_single_trial(
             clear=True,
             wrist_camera=use_wrist,
             capture_initial_frame=False,
+            stream_dir=stream_dir,
         )
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
     print(f"[capx-trial] trial={trial} reset end", flush=True)
@@ -1198,12 +1261,18 @@ def _run_single_trial(
 
     if should_record and hasattr(env, "enable_video_capture") and not record_during_reset:
         # Video differencing needs frame recording even without record_video
-        env.enable_video_capture(True, clear=True, wrist_camera=use_wrist)
+        env.enable_video_capture(
+            True,
+            clear=True,
+            wrist_camera=use_wrist,
+            stream_dir=stream_dir,
+        )
 
     # --- Shared trial state ---
     code_blocks: list[str] = []
     code_block_metadata: list[dict[str, Any]] = []
     all_responses: list[dict[str, Any]] = []
+    llm_usage_events: list[dict[str, Any]] = []
     stderr_history: list[str] = []
     num_regenerations = 0
     num_finishes = 0
@@ -1214,6 +1283,11 @@ def _run_single_trial(
     ensemble_data = None
     multiturn_ensemble_data: list[dict[str, Any]] = []
     tactile_code_memory_trace: list[dict[str, Any]] = []
+
+    if partial_artifacts is not None:
+        # This mutable list is updated even if a SIGINT/watchdog fires while a
+        # model request is in flight, so partial artifacts retain known usage.
+        partial_artifacts["llm_usage_events"] = llm_usage_events
 
     # Per-turn frame tracking (for video differencing and per-turn video saving)
     turn_frame_ranges: list[tuple[int, int]] = []
@@ -1238,9 +1312,10 @@ def _run_single_trial(
 
     # --- 2. Capture initial visual feedback ---
     print(f"[capx-trial] trial={trial} initial visual begin", flush=True)
-    visual_feedback_imgs, visual_feedback_base64_history, task_description = (
-        _capture_initial_visual_feedback(env, obs, config, args, visual_differencing_args)
-    )
+    with collect_llm_usage(llm_usage_events, "initial_visual"):
+        visual_feedback_imgs, visual_feedback_base64_history, task_description = (
+            _capture_initial_visual_feedback(env, obs, config, args, visual_differencing_args)
+        )
     print(f"[capx-trial] trial={trial} initial visual end", flush=True)
 
     # Seed wrist base64 history with initial wrist image
@@ -1264,7 +1339,8 @@ def _run_single_trial(
         ensemble_data = None
     else:
         print(f"[capx-trial] trial={trial} initial code query begin", flush=True)
-        raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
+        with collect_llm_usage(llm_usage_events, "initial_code"):
+            raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
         print(f"[capx-trial] trial={trial} initial code query end", flush=True)
 
     # Initialize partial artifacts for timeout recovery
@@ -1274,6 +1350,7 @@ def _run_single_trial(
             "code_blocks": code_blocks,
             "code_block_metadata": code_block_metadata,
             "all_responses": all_responses,
+            "llm_usage_events": llm_usage_events,
             "visual_feedback_imgs": visual_feedback_imgs,
             "info_step": info_step,
             "reward": reward,
@@ -1310,6 +1387,7 @@ def _run_single_trial(
             final_code=_annotate_code_blocks(code_blocks, code_block_metadata),
             raw_code=raw_code,
             all_responses=all_responses,
+            llm_usage_events=llm_usage_events,
         )
         print(
             f"[capx-trial] trial={trial} in-progress artifact save end",
@@ -1341,6 +1419,9 @@ def _run_single_trial(
             partial_artifacts["current_frame_start"] = frame_start
 
         _set_code_block_action_budget(env, config, code_block_idx)
+        begin_video_turn = getattr(env, "begin_video_turn", None)
+        if recording_frames and callable(begin_video_turn):
+            begin_video_turn(code_block_idx - 1)
         try:
             print(
                 f"[capx-trial] trial={trial} execute code block "
@@ -1350,6 +1431,9 @@ def _run_single_trial(
             obs_next, reward, terminated, truncated, info_step = env.step(code)
         finally:
             _clear_code_block_action_budget(env)
+            end_video_turn = getattr(env, "end_video_turn", None)
+            if recording_frames and callable(end_video_turn):
+                end_video_turn()
 
         # Record frame index after step
         frame_end = env.get_video_frame_count() if recording_frames else 0
@@ -1384,7 +1468,19 @@ def _run_single_trial(
         ):
             query_multi_turn = False
             print(
-                "[capx-trial] multi-turn decision skipped after clean block; continuing",
+                "[capx-trial] multi-turn decision skipped after terminal block; continuing",
+                flush=True,
+            )
+
+        max_regenerations = int(config.get("max_regenerations", MULTITURN_LIMIT))
+        if (
+            query_multi_turn
+            and bool(config.get("stop_multiturn_when_regeneration_exhausted", False))
+            and num_regenerations >= max_regenerations
+        ):
+            query_multi_turn = False
+            print(
+                "[capx-trial] multi-turn decision skipped: regeneration budget exhausted",
                 flush=True,
             )
 
@@ -1403,24 +1499,24 @@ def _run_single_trial(
                         frame_start, frame_end,
                     )
 
-            decision, new_code, mt_reasoning, mt_ensemble, decision_prompt = _handle_multi_turn_step(
-                env, obs, args, config, visual_differencing_args,
-                multi_turn_prompt, code_blocks, code_block_idx, info_step,
-                task_description, visual_feedback_imgs, visual_feedback_base64_history,
-                stderr_history,
-                turn_frames=turn_frames,
-                wrist_turn_frames=wrist_turn_frames,
-                wrist_base64_history=wrist_base64_history,
-                tactile_code_memory_trace=tactile_code_memory_trace,
-                repair_turn_count=num_regenerations,
-            )
+            with collect_llm_usage(llm_usage_events, "multi_turn"):
+                decision, new_code, mt_reasoning, mt_ensemble, decision_prompt = _handle_multi_turn_step(
+                    env, obs, args, config, visual_differencing_args,
+                    multi_turn_prompt, code_blocks, code_block_idx, info_step,
+                    task_description, visual_feedback_imgs, visual_feedback_base64_history,
+                    stderr_history,
+                    turn_frames=turn_frames,
+                    wrist_turn_frames=wrist_turn_frames,
+                    wrist_base64_history=wrist_base64_history,
+                    tactile_code_memory_trace=tactile_code_memory_trace,
+                    repair_turn_count=num_regenerations,
+                )
 
             if mt_ensemble is not None:
                 mt_ensemble["regeneration"] = num_regenerations + 1
                 multiturn_ensemble_data.append(mt_ensemble)
 
             if decision == "regenerate":
-                max_regenerations = int(config.get("max_regenerations", MULTITURN_LIMIT))
                 if num_regenerations >= max_regenerations:
                     all_responses.append({
                         "multi_turn_prompt": decision_prompt if config.get("save_multiturn_prompts", False) else None,
@@ -1485,6 +1581,7 @@ def _run_single_trial(
             info_step.get("task_completed", False), final_code, raw_code,
             all_responses, ["-" * 100, "Generated program:", final_code],
             visual_feedback_imgs,
+            llm_usage_events=llm_usage_events,
         )
 
         # Only save intermediate video if NOT doing per-turn saving
@@ -1517,6 +1614,14 @@ def _run_single_trial(
         num_regenerations, num_finishes, num_code_blocks,
         stderr_override=stderr,
     )
+    llm_usage = summarize_llm_usage(llm_usage_events)
+    total_tokens = llm_usage["totals"]["total_tokens"]
+    log_lines.append(
+        "  LLM usage (provider-reported): "
+        f"queries={llm_usage['query_count']}, "
+        f"reported={llm_usage['provider_reported_query_count']}, "
+        f"total_tokens={total_tokens if total_tokens is not None else 'unavailable'}"
+    )
 
     code_path = _save_trial_artifacts(
         config, trial, info_step["sandbox_rc"], reward,
@@ -1524,6 +1629,7 @@ def _run_single_trial(
         all_responses, log_lines, visual_feedback_imgs,
         ensemble_data=ensemble_data,
         multiturn_ensemble_data=multiturn_ensemble_data,
+        llm_usage_events=llm_usage_events,
     )
 
     # Save per-turn and combined videos
@@ -1582,6 +1688,7 @@ def _run_single_trial(
         num_regenerations=num_regenerations,
         num_finishes=num_finishes,
         num_code_blocks=num_code_blocks,
+        llm_usage=llm_usage,
     )
 
 
