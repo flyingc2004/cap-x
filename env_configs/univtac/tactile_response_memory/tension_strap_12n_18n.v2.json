@@ -1,0 +1,150 @@
+{
+  "schema_version": "tactile_stage_memory.v1",
+  "scope": "external_tension_strap_public_response",
+  "protocol_id": "external_strap_12n_18n_hold_response.v2",
+  "response_schema_version": "tactile_stage_response.v1",
+  "capture": {
+    "sampling_rate_hz": 60,
+    "hold_seconds": 3.0,
+    "window_steps": 180,
+    "edge_window_steps": 30,
+    "min_bilateral_contact_ratio": 0.8,
+    "contact_area_threshold": 0.001
+  },
+  "retrieval_rule": {
+    "block_distance": "rms((response-prototype_median)/shared_calibration_iqr)",
+    "fused_distance": "mean(block_distance)",
+    "owner": "generated_code",
+    "note": "The API exposes prototypes only; generated code calculates retrieval distances."
+  },
+  "retrieval_scaler": {
+    "method": "pooled_calibration_iqr",
+    "response_blocks": [
+      {
+        "name": "normal_static",
+        "median": [6.42372190952301, 6.768580627441406],
+        "iqr": [0.03200938701629408, 0.011885631084441961]
+      },
+      {
+        "name": "normal_dynamic",
+        "median": [0.02280426025390625, -0.006431698799134189],
+        "iqr": [0.008212637901305442, 0.004542040824890847]
+      },
+      {
+        "name": "surface_spatial_static",
+        "median": [9.957336625354955, 10.69105722863751, 8.640746399287583, 9.159930850752561, 0.14210973713556363, 0.15530859191599794],
+        "iqr": [0.7622007105079049, 0.734452891629866, 0.6352284889434721, 0.6218971409766141, 0.0026932754527433933, 0.0007818438673245498]
+      }
+    ]
+  },
+  "provenance": {
+    "source_analysis": "UniVTAC/analysis/artifacts/tension_strap_12n_18n_v2",
+    "calibration_seed_split": [0, 2, 4, 6, 8],
+    "calibration_episode_count": 5,
+    "alignment": {
+      "method": "public_ee_z_plateau_transition.v2",
+      "stationary_threshold_m_per_frame": 0.00002,
+      "smoothing_frames": 12,
+      "min_transition_lift_m": 0.001,
+      "settle_frames_after_second_plateau": 6,
+      "uses_public_ee_only_for_offline_alignment": true
+    },
+    "uses_actor_state": false,
+    "uses_success_label": false,
+    "uses_true_tension": false
+  },
+  "stages": [
+    {
+      "memory_id": "tension_strap_hold_12n.v1",
+      "target_stage": "12n",
+      "response_blocks": [
+        {
+          "name": "normal_static",
+          "fields": [
+            {"path": "hold.left.depth_mm", "transform": "identity"},
+            {"path": "hold.right.depth_mm", "transform": "identity"}
+          ],
+          "scaler": {
+            "median": [6.423063182830811, 6.768996953964233],
+            "iqr": [0.003468370437621715, 0.0013101100921613096]
+          }
+        },
+        {
+          "name": "normal_dynamic",
+          "fields": [
+            {"path": "end_minus_start.left.depth_mm", "transform": "identity"},
+            {"path": "end_minus_start.right.depth_mm", "transform": "identity"}
+          ],
+          "scaler": {
+            "median": [0.023385429382324574, -0.008418083190919745],
+            "iqr": [0.00035867691040003535, 0.00023050308227645644]
+          }
+        },
+        {
+          "name": "surface_spatial_static",
+          "fields": [
+            {"path": "hold.left.marker_row_gradient_px", "transform": "identity"},
+            {"path": "hold.right.marker_row_gradient_px", "transform": "identity"},
+            {"path": "hold.left.marker_col_gradient_px", "transform": "identity"},
+            {"path": "hold.right.marker_col_gradient_px", "transform": "identity"},
+            {"path": "hold.left.marker_anisotropy_ratio", "transform": "log"},
+            {"path": "hold.right.marker_anisotropy_ratio", "transform": "log"}
+          ],
+          "scaler": {
+            "median": [9.948489742809091, 10.679977553263878, 8.632435991811128, 9.150041040373392, 0.14176297950283653, 0.15458936476979598],
+            "iqr": [0.06520758181394548, 0.06436285623051674, 0.054786312280104, 0.05523431618139085, 0.00032502713305535, 0.00003296400198787852]
+          }
+        }
+      ]
+    },
+    {
+      "memory_id": "tension_strap_hold_18n.v1",
+      "target_stage": "18n",
+      "response_blocks": [
+        {
+          "name": "normal_static",
+          "fields": [
+            {"path": "hold.left.depth_mm", "transform": "identity"},
+            {"path": "hold.right.depth_mm", "transform": "identity"}
+          ],
+          "scaler": {
+            "median": [6.453536081314086, 6.757685899734497],
+            "iqr": [0.003801155090332742, 0.0011374950408935547]
+          }
+        },
+        {
+          "name": "normal_dynamic",
+          "fields": [
+            {"path": "end_minus_start.left.depth_mm", "transform": "identity"},
+            {"path": "end_minus_start.right.depth_mm", "transform": "identity"}
+          ],
+          "scaler": {
+            "median": [0.01513738632202255, -0.004027605056762695],
+            "iqr": [0.0011689186096219828, 0.0007851123809832217]
+          }
+        },
+        {
+          "name": "surface_spatial_static",
+          "fields": [
+            {"path": "hold.left.marker_row_gradient_px", "transform": "identity"},
+            {"path": "hold.right.marker_row_gradient_px", "transform": "identity"},
+            {"path": "hold.left.marker_col_gradient_px", "transform": "identity"},
+            {"path": "hold.right.marker_col_gradient_px", "transform": "identity"},
+            {"path": "hold.left.marker_anisotropy_ratio", "transform": "log"},
+            {"path": "hold.right.marker_anisotropy_ratio", "transform": "log"}
+          ],
+          "scaler": {
+            "median": [10.67992460272692, 11.38685163721093, 9.242580410575169, 9.748173522865304, 0.14454455273030964, 0.15536989151184802],
+            "iqr": [0.07494357834338139, 0.07654865712373393, 0.06191115459162333, 0.06463541519751814, 0.000319983378120614, 0.00002439918645644195]
+          }
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "The two stage windows are aligned offline from public EE-z plateaus with the intervening upward pull excluded.",
+    "All response features are derived only from bilateral depth and marker frames.",
+    "This snapshot is frozen from calibration seeds 0,2,4,6,8; runtime must not refit it.",
+    "The retained v1 sidecar used the superseded adjacent-window segmentation and is not the active control memory."
+  ]
+}

@@ -20,7 +20,7 @@ from capx.envs.trial import _should_query_multiturn_after_block
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MEMORY_PATH = REPO_ROOT / "env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v1.json"
+MEMORY_PATH = REPO_ROOT / "env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v2.json"
 CONFIG_PATH = REPO_ROOT / "env_configs/univtac/tension_strap_stage_memory_control.yaml"
 
 
@@ -163,12 +163,12 @@ def test_stage_memory_loader_accepts_sidecar_and_has_no_auto_retrieval_function(
     env = _Env([_frame(step, 6.0) for step in range(6)], _memory())
     env.api_configs = {
         "opentac_api": {
-            "tactile_stage_memory_path": "env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v1.json"
+            "tactile_stage_memory_path": "env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v2.json"
         }
     }
     api = OpenTacApi(env)
 
-    assert api.get_tactile_stage_memory()["protocol_id"] == "external_strap_12n_18n_hold_response.v1"
+    assert api.get_tactile_stage_memory()["protocol_id"] == "external_strap_12n_18n_hold_response.v2"
     assert "capture_tactile_stage_response" in api.functions()
     assert "get_tactile_stage_memory" in api.functions()
     assert "score_tactile_stage_response" not in api.functions()

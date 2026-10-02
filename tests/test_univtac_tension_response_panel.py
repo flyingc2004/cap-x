@@ -19,7 +19,7 @@ from capx.envs.simulators.univtac import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MEMORY_PATH = REPO_ROOT / "env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v1.json"
+MEMORY_PATH = REPO_ROOT / "env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v2.json"
 
 
 def _response(*, valid: bool = True) -> dict:

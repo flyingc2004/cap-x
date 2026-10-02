@@ -29,7 +29,7 @@ env:
         opentac_api:
           llm_visible_functions: [get_tactile_tension_control_contract, begin_tactile_tension_estimator, get_tactile_tension_estimate, get_tactile_stage_memory, capture_tactile_stage_response]
           tension_calibration_path: task_config/force_task_rgb/tension_strap_dual_stage.json
-          tactile_stage_memory_path: ${oc.env:CAPX_TENSION_STRAP_STAGE_MEMORY,env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v1.json}
+          tactile_stage_memory_path: ${oc.env:CAPX_TENSION_STRAP_STAGE_MEMORY,env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v2.json}
       expose_actor_pose: false
       privileged: false
       enable_render: true

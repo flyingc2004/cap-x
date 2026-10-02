@@ -62,7 +62,7 @@ env:
         opentac_api:
           llm_visible_functions: [get_tactile_tension_control_contract, begin_tactile_tension_estimator, get_tactile_tension_estimate, get_tactile_tension_control_state, get_tactile_stage_memory, capture_tactile_stage_response]
           tension_calibration_path: task_config/force_task_rgb/tension_strap_dual_stage.json
-          tactile_stage_memory_path: env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v1.json
+          tactile_stage_memory_path: env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v2.json
           max_delta_z_m: 0.001
           observation_wait_steps: 2
           observation_dt_s: 0.016666666666666666

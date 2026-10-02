@@ -26,7 +26,10 @@ of this UniVTAC entry point.
 entry for ViTaForge's public `tension_strap` task. The companion
 `tension_strap_stage_memory_probe.yaml` is retained for probe/retrieval
 debugging. Both use the frozen external 12N/18N response-memory sidecar:
-`tactile_response_memory/tension_strap_12n_18n.v1.json`.
+`tactile_response_memory/tension_strap_12n_18n.v2.json`. The v2 snapshot
+uses the public EE-z plateau/transition alignment from the expert replay; the
+retained v1 sidecar is an audit-only adjacent-window snapshot and is not used
+by the active control configuration.
 
 The sidecar contains only calibration-derived public depth/marker response
 prototypes and a pooled calibration IQR for comparable cross-stage distances.
