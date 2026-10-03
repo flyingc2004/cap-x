@@ -198,6 +198,7 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     tactile = low_level["api_configs"]["opentac_api"]
 
     assert low_level["task_name"] == "tension_strap"
+    assert low_level["task_config"] == "tension_strap"
     assert low_level["force_task"] is True
     assert config["env"]["cfg"]["apis"] == ["FrankaControlApi", "OpenTacApi"]
     assert tactile["llm_visible_functions"] == [
@@ -243,6 +244,7 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
         "record_pre_move_frames": False,
         "record_pre_move_tactile_timeline": False,
         "video_frame_stride": 2,
+        "force_task_adapter_pre_move": True,
     }
     assert config["max_regenerations"] == 1
     assert config["stop_multiturn_when_regeneration_exhausted"] is True

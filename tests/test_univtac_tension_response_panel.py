@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from types import ModuleType
 
 import numpy as np
 import pytest
@@ -275,3 +277,59 @@ def test_force_task_vertical_delta_keeps_an_accumulated_command_target() -> None
     assert second["motion_path"] == "force_task_accumulated_ik_to_absolute_qpos"
     assert first["command_target_ee_z_m"] == pytest.approx(0.2001)
     assert second["command_target_ee_z_m"] == pytest.approx(0.2002)
+
+
+def test_force_task_adapter_owns_non_contact_strap_premove(monkeypatch) -> None:
+    class _Pose:
+        def __init__(self, p, q) -> None:
+            self.p = np.asarray(p, dtype=float)
+            self.q = np.asarray(q, dtype=float)
+
+    transforms = ModuleType("envs.utils.transforms")
+    transforms.Pose = _Pose
+    monkeypatch.setitem(sys.modules, "envs", ModuleType("envs"))
+    monkeypatch.setitem(sys.modules, "envs.utils", ModuleType("envs.utils"))
+    monkeypatch.setitem(sys.modules, "envs.utils.transforms", transforms)
+
+    class _Manager:
+        def get_gripper_center_pose(self):
+            return SimpleNamespace(q=np.asarray([1.0, 0.0, 0.0, 0.0]))
+
+        def gripper_center_to_ee(self, pose):
+            return pose
+
+    class _Atom:
+        def move_to_pose(self, pose):
+            return pose
+
+    class _Task:
+        def __init__(self) -> None:
+            self.base = np.asarray([0.5, 0.0, 0.0])
+            self._robot_manager = _Manager()
+            self.atom = _Atom()
+            self.plan_success = True
+            self.moves: list[tuple[str, np.ndarray]] = []
+            self.base_pre_move_called = False
+
+        def move(self, pose, *, tag, **_kwargs):
+            self.moves.append((tag, pose.p.copy()))
+
+        def pre_move(self):
+            self.base_pre_move_called = True
+
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._force_task_mode = True
+    env.task_name = "tension_strap"
+    env._task_config = {"force_task_adapter_pre_move": True}
+    env._task = _Task()
+
+    env._install_force_task_adapter_pre_move()
+    env._task.pre_move()
+
+    assert [tag for tag, _pose in env._task.moves] == [
+        "capx_adapter_above_strap",
+        "capx_adapter_approach_strap",
+    ]
+    assert env._task.base_pre_move_called is True
+    assert env._task.moves[0][1][2] == pytest.approx(0.224)
+    assert env._task.moves[1][1][2] == pytest.approx(0.174)

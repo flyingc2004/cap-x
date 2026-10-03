@@ -8,7 +8,7 @@ env:
       _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
       univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/sdc/ljz/ViTaForge_capx_tension}
       task_name: tension_strap
-      task_config: tension_strap_capx_control
+      task_config: tension_strap
       force_task: true
       force_task_seed: ${oc.env:CAPX_FORCE_TASK_SEED,1}
       seed_base: ${oc.env:CAPX_FORCE_TASK_SEED,1}

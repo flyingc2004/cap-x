@@ -8,7 +8,7 @@ env:
       _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
       univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/sdc/ljz/ViTaForge_capx_tension}
       task_name: tension_strap
-      task_config: tension_strap_capx_control
+      task_config: tension_strap
       force_task: true
       force_task_seed: ${oc.env:CAPX_FORCE_TASK_SEED,1}
       seed_base: ${oc.env:CAPX_FORCE_TASK_SEED,1}
@@ -21,7 +21,7 @@ env:
       tension_response_panel:
         enabled: true
         history_points: 360
-      # Pre-move is benchmark initialization, not agent behavior.  Rendering
+      # Adapter pre-move is benchmark initialization, not agent behavior. Rendering
       # the 1600x1200 dashboard and extracting a tactile timeline at every
       # pre-move physics step consumed most of the outer process watchdog.
       # Start recording at the post-reset agent state instead.  The task runs
@@ -34,6 +34,7 @@ env:
         record_pre_move_frames: false
         record_pre_move_tactile_timeline: false
         video_frame_stride: 2
+        force_task_adapter_pre_move: true
       runtime_preflight:
         enabled: true
         tacex_root: ${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/ViTaForge_capx_tension/third_party/TacEx}
@@ -83,7 +84,7 @@ env:
 
       Task objective: keep the same grasp throughout two ordered tension stages. First control the public estimated_tension_N into the 12 N target band [11.5, 12.5], then without opening or regrasping control it into the 18 N target band [17.5, 18.5]. Tension is a tolerance-band requirement: do not chase an exact 12.000 or 18.000 value once the public estimate is inside its band. Time is a strict continuous requirement: each stage must remain inside its band for one uninterrupted full 3.0-second window. Do not begin the 18 N stage until the full 12 N hold has completed. Do not end after only the first stage. Do not read or infer simulator true tension, actor state, reward, success, task metadata, private task fields, or direct environment objects.
 
-      The task pre-move has already brought the open gripper to the public non-contact strap approach. First call close_gripper(adaptive=True). Treat bilateral contact as grasp evidence; stable=false alone is not a reason to abort when the result reports bilateral contact. Wait contract["estimator_settle_steps"] without moving, then call begin_tactile_tension_estimator() once. Do not open or regrasp between the ordered 12 N and 18 N stages unless your own code decides that the physical grasp is lost.
+      The CaP-X adapter has already brought the open gripper to the public non-contact strap approach. First call close_gripper(adaptive=True). Treat bilateral contact as grasp evidence; stable=false alone is not a reason to abort when the result reports bilateral contact. Wait contract["estimator_settle_steps"] without moving, then call begin_tactile_tension_estimator() once. Do not open or regrasp between the ordered 12 N and 18 N stages unless your own code decides that the physical grasp is lost.
 
       Call get_tactile_tension_control_contract() and get_tactile_stage_memory() before control. The contract gives public target bands, sampling cadence, hold duration, motion safety range, and proportional gain. The adapter does not track stage progress, action counts, failure counts, or recovery decisions. Maintain your own local stage index, in-band elapsed time, and any retry/recovery state in the generated code. Control the two public stages in the fixed order: first 12 N, then 18 N. Read the exact band from contract["stage_bands_N"][stage_index]; do not derive another band. Positive move_delta(dz) pulls upward and increases tension; negative dz relaxes the strap. The 18 N stage requires an additional upward motion after the 12 N hold; no API performs this automatically.
 

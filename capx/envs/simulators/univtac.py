@@ -2295,9 +2295,6 @@ class UniVTACLowLevelEnv(BaseEnv):
                 task_config_file,
                 seed=self.force_task_seed,
             )
-            # Preserve the final public tactile response until generated code
-            # returns; the task's physical scorer still remains authoritative.
-            env_cfg.capx_defer_terminal_on_success = True
         self._task = task_module.Task(env_cfg, mode="eval")
         self.record_video_during_reset = bool(
             self._task_config.get(
@@ -2506,7 +2503,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         return self.univtac_root / "task_config" / f"{self.task_config_name}.yml"
 
     def _install_task_runtime_patches(self) -> None:
-        """Install small CaP-X-only task patches without touching UniVTAC policies."""
+        """Install CaP-X runtime hooks without changing task source files."""
         skip_task_pre_move = bool(self._task_config.get("skip_task_pre_move", False))
         skip_pre_move_render = bool(self._task_config.get("skip_pre_move_render", False))
         debug_pre_move = _env_flag("UNIVTAC_DEBUG_PREMOVE") or bool(
@@ -2515,6 +2512,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._record_action_frames = bool(self._task_config.get("record_action_frames", True))
         self._record_pre_move_frames = bool(self._task_config.get("record_pre_move_frames", True))
         self._video_frame_stride = max(1, int(self._task_config.get("video_frame_stride", 1)))
+
+        self._install_force_task_adapter_pre_move()
 
         if skip_task_pre_move:
             def _capx_noop_pre_move():
@@ -2614,6 +2613,55 @@ class UniVTACLowLevelEnv(BaseEnv):
             self._task.pre_move = _capx_pre_move
             self._task.move = _capx_move
             self._task.delay = _capx_delay
+
+    def _install_force_task_adapter_pre_move(self) -> None:
+        """Install the CaP-X-only non-contact approach for the strap task.
+
+        ``tension_strap`` intentionally keeps its upstream ``pre_move`` to a
+        simple open-gripper action.  The force-task adapter owns this optional
+        approach wrapper so the task's physics, expert path, and termination
+        semantics remain byte-for-byte independent of CaP-X.  The approach is
+        benchmark initialization: it never closes the gripper, pulls the
+        strap, or exposes its position to generated code.
+        """
+        if not self._force_task_mode or self.task_name != "tension_strap":
+            return
+        if not bool(self._task_config.get("force_task_adapter_pre_move", True)):
+            return
+
+        original_pre_move = self._task.pre_move
+
+        def _capx_force_task_pre_move(*args: Any, **kwargs: Any):
+            task = self._task
+            manager = getattr(task, "_robot_manager", None)
+            atom = getattr(task, "atom", None)
+            base = getattr(task, "base", None)
+            if manager is None or atom is None or base is None:
+                return original_pre_move(*args, **kwargs)
+            try:
+                from envs.utils.transforms import Pose
+
+                center = np.asarray(base, dtype=float).reshape(3) + np.asarray(
+                    [0.0, 0.0, 0.174], dtype=float
+                )
+                orientation = manager.get_gripper_center_pose().q
+                for dz, tag in ((0.05, "capx_adapter_above_strap"), (0.0, "capx_adapter_approach_strap")):
+                    target = Pose(center + np.asarray([0.0, 0.0, dz]), orientation)
+                    task.move(
+                        atom.move_to_pose(manager.gripper_center_to_ee(target)),
+                        tag=tag,
+                        time_dilation_factor=0.5,
+                        delay=False,
+                    )
+                    if not bool(getattr(task, "plan_success", True)):
+                        return None
+            except Exception as exc:
+                raise RuntimeError(
+                    "CaP-X force-task pre-move could not reach the public strap approach"
+                ) from exc
+            return original_pre_move(*args, **kwargs)
+
+        self._task.pre_move = _capx_force_task_pre_move
 
     def _append_debug_record(self, label: str) -> dict[str, Any]:
         record = self._debug_snapshot(label)
