@@ -74,9 +74,6 @@ def test_runtime_demo_renders_current_and_both_frozen_medians() -> None:
         visualization=visualization,
         control_diagnostics={
             "latest_estimate": {"estimated_tension_N": 12.1},
-            "current_stage_index": 0,
-            "current_stage_in_band_hold_seconds": 1.5,
-            "stage_action_counts": [5, 0],
         },
         history=[
             {
@@ -148,8 +145,6 @@ def test_task_native_tension_renderer_uses_the_runtime_demo_layout() -> None:
 
     env._opentac_tension_estimator_diagnostics = {
         "latest_estimate": {"estimated_tension_N": 12.1},
-        "current_stage_index": 0,
-        "current_stage_in_band_hold_seconds": 1.5,
     }
     env._tension_response_video_history = [
         {

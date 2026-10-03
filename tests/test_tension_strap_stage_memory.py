@@ -16,7 +16,6 @@ from capx.integrations.univtac.native_tactile import (
 )
 from capx.integrations.opentac import OpenTacApi
 from capx.integrations.univtac.tactile_api import UniVTACTactileApi
-from capx.envs.trial import _should_query_multiturn_after_block
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -205,7 +204,6 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
         "get_tactile_tension_control_contract",
         "begin_tactile_tension_estimator",
         "get_tactile_tension_estimate",
-        "get_tactile_tension_control_state",
         "get_tactile_stage_memory",
         "capture_tactile_stage_response",
     ]
@@ -217,7 +215,7 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert "[11.5, 12.5]" in prompt
     assert "Tension is a tolerance-band requirement" in prompt
     assert "Time is a strict continuous requirement" in prompt
-    assert "never add separated in-band segments together" in prompt
+    assert "never join separated in-band intervals" in prompt
     assert 'memory["stages"]' in prompt
     assert 'stage["memory_id"]' in prompt
     assert 'stage["response_blocks"]' in prompt
@@ -225,19 +223,17 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert "already injected as top-level Python functions" in prompt
     assert "Do not import API modules" in prompt
     assert "physical scorer" in OpenTacApi.__doc__
-    assert "stage_targets_N" in prompt
+    assert "public target bands" in prompt
     assert "stage_bands_N" in prompt
-    assert "Do not derive a different band" in prompt
-    assert "completed_stage_ids" in prompt
+    assert "do not derive another band" in prompt
+    assert "adapter does not track stage progress" in prompt.lower()
     assert tactile["estimator_update_stride"] == 1
     assert tactile["estimator_settle_steps"] == 30
     assert tactile["proportional_delta_gain_m_per_N"] == pytest.approx(1.0 / 12000.0)
     assert tactile["max_delta_z_m"] == pytest.approx(0.001)
-    assert tactile["max_control_actions_per_stage"] is None
     assert low_level["api_configs"]["franka_control_api"]["local_delta_max_m"] == pytest.approx(0.001)
     assert low_level["api_configs"]["franka_control_api"]["force_task_target_lead_m"] == pytest.approx(0.002)
     assert tactile["max_estimate_age_steps"] == 3
-    assert tactile["max_consecutive_invalid_samples"] == 3
     assert config["tactile_memory"]["persistent"]["enabled"] is False
     assert low_level["video_renderer"] == "task_native"
     assert low_level["tension_response_panel"] == {"enabled": True, "history_points": 360}
@@ -248,7 +244,6 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
         "record_pre_move_tactile_timeline": False,
         "video_frame_stride": 2,
     }
-    assert config["skip_multiturn_on_stage_action_budget"] is True
     assert config["max_regenerations"] == 1
     assert config["stop_multiturn_when_regeneration_exhausted"] is True
     assert config["multiturn_console_max_chars"] == 1000
@@ -263,25 +258,6 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
         "require_attached_gelpad_asset": True,
         "require_attachment_points": True,
     }
-
-
-def test_stage_action_budget_is_terminal_for_failure_only_multiturn() -> None:
-    result = {
-        "sandbox_rc": 1,
-        "stdout": "CAPX_FAILURE action budget exhausted on stage 0",
-        "stderr": "RuntimeError: action budget exhausted on stage 0",
-        "task_completed": False,
-    }
-
-    assert not _should_query_multiturn_after_block(
-        result,
-        code_block_idx=1,
-        total_code_blocks=1,
-        config={
-            "multi_turn_on_failure_only": True,
-            "skip_multiturn_on_stage_action_budget": True,
-        },
-    )
 
 
 def test_univtac_tactile_api_does_not_expose_force_task_stage_memory() -> None:
@@ -326,7 +302,7 @@ def test_opentac_estimator_uses_only_public_marker_rgb_and_calibration(monkeypat
     estimate = api.get_tactile_tension_estimate()
 
     assert contract["allowed_translation_axes"] == ["z"]
-    assert baseline["status"] == "baseline_ready"
+    assert baseline["started"] is True
     assert estimate["estimated_tension_N"] == 13.25
     assert "true_tension" not in estimate
     assert "reward" not in estimate

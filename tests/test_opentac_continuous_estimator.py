@@ -21,10 +21,8 @@ class _ObserverEnv:
                 "stage_tolerance_N": 0.5,
                 "observation_dt_s": 0.1,
                 "stage_hold_seconds": 0.3,
-                "max_control_actions_per_stage": 8,
                 "estimator_update_stride": 1,
                 "max_estimate_age_steps": 3,
-                "max_consecutive_invalid_samples": 3,
             }
         }
         self.post_step: dict[str, Any] = {}
@@ -107,43 +105,24 @@ def _api(monkeypatch, env: _ObserverEnv) -> OpenTacApi:
     return api
 
 
-def test_control_contract_allows_an_explicitly_unbounded_stage_action_count(monkeypatch) -> None:
-    env = _ObserverEnv()
-    env.api_configs["opentac_api"]["max_control_actions_per_stage"] = None
-
-    contract = _api(monkeypatch, env).get_tactile_tension_control_contract()
-
-    assert contract["max_control_actions_per_stage"] is None
-
-
-def test_estimator_updates_every_task_step_and_advances_public_checkpoints(monkeypatch) -> None:
+def test_estimator_updates_every_task_step_without_owning_control_progress(monkeypatch) -> None:
     env = _ObserverEnv()
     api = _api(monkeypatch, env)
 
     baseline = api.begin_tactile_tension_estimator()
-    assert baseline["status"] == "baseline_ready"
-    assert len(env.post_step) == len(env.post_action) == 1
+    assert baseline["started"] is True
+    assert len(env.post_step) == 1
+    assert env.post_action == {}
 
     for _ in range(3):
         env.tick(12.0)
-    state = api.get_tactile_tension_control_state()
-    assert state["completed_stage_ids"] == ["tension_strap_hold_12n.v1"]
-    assert state["current_target_N"] == 18.0
-
-    env.finish_action()
-    assert api.get_tactile_tension_control_state()["current_stage_action_count"] == 1
-
-    for _ in range(3):
-        env.tick(18.0)
-    state = api.get_tactile_tension_control_state()
-    assert state["completed_stage_ids"] == [
-        "tension_strap_hold_12n.v1",
-        "tension_strap_hold_18n.v1",
-    ]
-    assert state["current_target_N"] is None
-    assert api._tracker.update_count == 6  # One flow update per task step.
-    assert any(record["event"] == "tension_stage_checkpoint" for record in env.trace)
-    assert env.diagnostics["completed_stage_ids"] == state["completed_stage_ids"]
+    estimate = api.get_tactile_tension_estimate()
+    assert estimate["available"] is True
+    assert estimate["estimated_tension_N"] == 12.0
+    assert api._tracker.update_count == 3  # One flow update per task step.
+    assert "completed_stage_ids" not in env.diagnostics
+    assert "current_stage_index" not in env.diagnostics
+    assert "consecutive_invalid_samples" not in env.diagnostics
 
 
 def test_control_contract_exposes_exact_stage_bands(monkeypatch) -> None:
@@ -155,41 +134,40 @@ def test_control_contract_exposes_exact_stage_bands(monkeypatch) -> None:
     assert contract["stage_targets_N"] == [12.0, 18.0]
     assert contract["stage_bands_N"] == [[11.5, 12.5], [17.5, 18.5]]
     assert "stage_tolerance_N" not in contract
+    assert "max_control_actions_per_stage" not in contract
+    assert "max_consecutive_invalid_samples" not in contract
 
 
 def test_estimate_is_cached_and_stale_without_new_task_steps(monkeypatch) -> None:
     env = _ObserverEnv()
     api = _api(monkeypatch, env)
     api.begin_tactile_tension_estimator()
-    assert api.get_tactile_tension_estimate()["status"] == "baseline_pending"
+    assert api.get_tactile_tension_estimate()["available"] is False
     assert api._tracker.update_count == 0
     env.tick(12.0)
     tracker_updates = api._tracker.update_count
 
     estimate = api.get_tactile_tension_estimate()
-    assert estimate["ok"] is True
+    assert estimate["available"] is True
     assert api._tracker.update_count == tracker_updates
 
     env.step += 4
     stale = api.get_tactile_tension_estimate()
-    assert stale["ok"] is False
-    assert stale["status"] == "stale_estimate"
+    assert stale["available"] is False
+    assert stale["estimated_tension_N"] is None
     assert stale["observation_age_steps"] == 4
     assert api._tracker.update_count == tracker_updates
 
 
-def test_restarting_an_active_estimator_preserves_public_progress(monkeypatch) -> None:
+def test_restarting_an_active_estimator_preserves_the_marker_baseline(monkeypatch) -> None:
     env = _ObserverEnv()
     api = _api(monkeypatch, env)
     api.begin_tactile_tension_estimator()
     env.tick(12.0)
-    env.finish_action()
 
     resumed = api.begin_tactile_tension_estimator()
-    state = api.get_tactile_tension_control_state()
 
-    assert resumed["status"] == "already_active"
-    assert state["current_stage_action_count"] == 1
+    assert resumed["started"] is True
     assert api._tracker.update_count == 1
 
 
@@ -200,16 +178,13 @@ def test_multiple_steps_in_one_action_keep_marker_updates_incremental(monkeypatc
 
     for tension in (4.0, 8.0, 12.0):
         env.tick(tension)
-    env.finish_action()
-
     estimate = api.get_tactile_tension_estimate()
-    assert estimate["ok"] is True
+    assert estimate["available"] is True
     assert estimate["estimated_tension_N"] == 12.0
     assert api._tracker.update_count == 3
-    assert api.get_tactile_tension_control_state()["current_stage_action_count"] == 1
 
 
-def test_tracking_failures_are_bounded_and_reset_clears_observers(monkeypatch) -> None:
+def test_tracking_unavailable_is_only_a_temporary_numeric_observation(monkeypatch) -> None:
     env = _ObserverEnv()
     api = _api(monkeypatch, env)
     api.begin_tactile_tension_estimator()
@@ -217,23 +192,22 @@ def test_tracking_failures_are_bounded_and_reset_clears_observers(monkeypatch) -
 
     for _ in range(3):
         env.tick(0.0)
-    state = api.get_tactile_tension_control_state()
-    assert state["latest_estimate"]["status"] == "tracking_unavailable"
-    assert state["consecutive_invalid_samples"] == 3
-    assert "marker correspondences unavailable" in state["last_error"]
-    assert sum(record["event"] == "tension_estimate_invalid" for record in env.trace) == 2
+    estimate = api.get_tactile_tension_estimate()
+    assert estimate["available"] is False
+    assert estimate["estimated_tension_N"] is None
+    assert "status" not in estimate
+    assert "message" not in estimate
 
     context = api.runtime_memory_context()
-    assert "tracking_unavailable" in context
+    assert '"available":false' in context
+    assert "consecutive_invalid_samples" not in context
     assert "true_tension" not in context
     assert "actor" not in context
 
     api.reset_episode()
     assert env.post_step == {}
-    assert env.post_action == {}
-    reset_state = api.get_tactile_tension_control_state()
-    assert reset_state["estimator_active"] is False
-    assert reset_state["completed_stage_ids"] == []
+    with np.testing.assert_raises_regex(RuntimeError, "begin_tactile_tension_estimator"):
+        api.get_tactile_tension_estimate()
 
 
 def test_force_task_move_splits_one_public_delta_into_marker_trackable_segments() -> None:

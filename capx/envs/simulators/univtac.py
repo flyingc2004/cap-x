@@ -3090,11 +3090,6 @@ class UniVTACLowLevelEnv(BaseEnv):
             "estimated_tension_N": _panel_optional_float(
                 latest_estimate.get("estimated_tension_N")
             ),
-            "stage_index": int(diagnostics.get("current_stage_index", 0) or 0),
-            "hold_seconds": _panel_optional_float(
-                diagnostics.get("current_stage_in_band_hold_seconds")
-            )
-            or 0.0,
         }
         if self._tension_response_video_history and (
             self._tension_response_video_history[-1].get("step") == sample["step"]
@@ -3973,29 +3968,6 @@ def _render_tension_strap_demo_frame(
     latest = diagnostics.get("latest_estimate", {})
     latest = latest if isinstance(latest, dict) else {}
     estimate = _panel_optional_float(latest.get("estimated_tension_N"))
-    stage_index = int(diagnostics.get("current_stage_index", 0) or 0)
-    completed_stage_ids = diagnostics.get("completed_stage_ids", [])
-    completed_stage_ids = (
-        [str(item) for item in completed_stage_ids]
-        if isinstance(completed_stage_ids, list)
-        else []
-    )
-    hold_seconds = _panel_optional_float(
-        diagnostics.get("current_stage_in_band_hold_seconds")
-    ) or 0.0
-    action_counts = diagnostics.get("stage_action_counts", [])
-    action_count = (
-        int(action_counts[stage_index])
-        if isinstance(action_counts, list) and stage_index < len(action_counts)
-        else 0
-    )
-    stage_label = "12N target hold" if stage_index == 0 else "18N target hold"
-    stage_color = (125, 205, 255) if stage_index == 0 else (255, 205, 125)
-    if stage_index == 1 and "tension_strap_hold_12n.v1" in completed_stage_ids:
-        stage_label = "12N complete -> 18N target hold"
-    if stage_index >= 2:
-        stage_label, stage_color = "both target holds complete", (135, 225, 170)
-
     cv2.rectangle(
         canvas, (0, 0), (_TENSION_DEMO_WIDTH, _TENSION_DEMO_HEADER_HEIGHT), (10, 12, 15), -1
     )
@@ -4003,11 +3975,19 @@ def _render_tension_strap_demo_frame(
         canvas, "CaP-X / OpenTac runtime replay | public GelSight response", 22, 29,
         scale=0.78, thickness=2,
     )
-    _tension_demo_text(canvas, stage_label, 22, 58, scale=0.65, color=stage_color, thickness=2)
+    _tension_demo_text(
+        canvas,
+        "Public marker-RGB tension estimate | stage progress is agent-owned",
+        22,
+        58,
+        scale=0.56,
+        color=(125, 205, 255),
+        thickness=2,
+    )
     estimate_text = "waiting for marker-RGB estimate" if estimate is None else f"estimate {estimate:.3f} N"
     _tension_demo_text(
         canvas,
-        f"{estimate_text} | current-stage hold {hold_seconds:.2f}s / 3.00s | control actions {action_count}",
+        f"{estimate_text} | no adapter stage counter or failure counter",
         730,
         56,
         scale=0.44,
@@ -4047,8 +4027,8 @@ def _render_tension_strap_demo_frame(
     )
     cards = (
         (current_title, current, (221, 228, 237), bool(current)),
-        ("12N target hold memory", stage_values.get("12N"), (117, 194, 255), stage_index == 0),
-        ("18N target hold memory", stage_values.get("18N"), (255, 179, 117), stage_index == 1),
+        ("12N target hold memory", stage_values.get("12N"), (117, 194, 255), False),
+        ("18N target hold memory", stage_values.get("18N"), (255, 179, 117), False),
     )
     for index, (title, values, color, active) in enumerate(cards):
         _tension_demo_response_card(
@@ -4067,7 +4047,7 @@ def _render_tension_strap_demo_frame(
     for index, (key, title, unit, color) in enumerate(chart_specs):
         _tension_demo_plot(
             canvas, history or [], key, 16 + index * 392, chart_y,
-            380 if index < 3 else 392, chart_height, title, unit, color, stage_index,
+            380 if index < 3 else 392, chart_height, title, unit, color,
         )
     return np.ascontiguousarray(canvas)
 
@@ -4179,12 +4159,10 @@ def _tension_demo_plot(
     title: str,
     unit: str,
     color: tuple[int, int, int],
-    stage_index: int,
 ) -> None:
     cv2.rectangle(canvas, (x, y), (x + width, y + height), (33, 38, 43), -1)
     cv2.rectangle(canvas, (x, y), (x + width, y + height), (92, 101, 111), 1)
-    background = (44, 63, 93) if stage_index == 0 else (90, 59, 42)
-    cv2.rectangle(canvas, (x + 1, y + 1), (x + width - 1, y + height - 1), background, -1)
+    cv2.rectangle(canvas, (x + 1, y + 1), (x + width - 1, y + height - 1), (37, 45, 54), -1)
     values = [_panel_optional_float(row.get(key)) for row in history if isinstance(row, dict)]
     values = [value for value in values if value is not None]
     _tension_demo_text(canvas, title, x + 8, y + 19, scale=0.40)
