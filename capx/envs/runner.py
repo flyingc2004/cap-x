@@ -26,6 +26,7 @@ from capx.envs.trial import (
     _build_log_lines,
     _run_single_trial,
     _save_env_debug_artifacts,
+    _save_visual_checkpoint_artifacts,
     _save_tactile_artifacts,
     _save_tactile_code_memory_trace,
     _save_trial_video,
@@ -522,6 +523,10 @@ def _build_aborted_summary(
         ensemble_data=pa.get("ensemble_data"),
         multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
         llm_usage_events=pa.get("llm_usage_events", []),
+    )
+    _save_visual_checkpoint_artifacts(
+        code_path,
+        pa.get("visual_checkpoint_records", []),
     )
     # Ignore repeated Ctrl-C while serializing the buffered frames.  The first
     # interrupt has already been handled; a second should not corrupt the only

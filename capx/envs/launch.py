@@ -203,9 +203,12 @@ def _run_web_ui(args: LaunchArgs, config: dict[str, Any]) -> None:
 def main(args: LaunchArgs) -> None:
     """Load config and dispatch to web UI or headless trial execution."""
     from capx.envs.runner import _run_headless_trials, _start_api_servers, _stop_api_servers
+    from capx.llm.client import preflight_image_input
 
     start_time = time.time()
     env_factory, config, api_servers = _load_config(args)
+    if config.get("visual_feedback_require_image_input", False):
+        preflight_image_input(args)
     server_procs = _start_api_servers(api_servers)
 
     try:

@@ -2213,6 +2213,18 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._current_obs = obs
         return self._render_video_frame(obs)
 
+    def render_head(self) -> np.ndarray | None:
+        """Return the raw public head RGB frame for multimodal prompting.
+
+        This intentionally bypasses the task-native video renderer, whose
+        diagnostic panels are useful to humans but are not visual scene input.
+        """
+        obs = self._read_native_observation(include_camera=True, include_tactile=False)
+        head = obs.get("observation", {}).get("head", {}).get("rgb")
+        if head is None:
+            return None
+        return _as_uint8_rgb(head)
+
     def render_wrist(self) -> np.ndarray | None:
         obs = self._read_native_observation(include_camera=True, include_tactile=False)
         wrist = obs.get("observation", {}).get("wrist", {}).get("rgb")

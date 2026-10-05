@@ -509,6 +509,12 @@ class CodeExecutionEnvBase(Env):
     def render(self, mode: str = "rgb_array"):
         return self.low_level_env.render(mode=mode)
 
+    def render_head(self) -> np.ndarray | None:
+        """Render the raw head-camera frame when the low-level env supports it."""
+        if hasattr(self.low_level_env, "render_head"):
+            return self.low_level_env.render_head()
+        return None
+
     def render_wrist(self) -> np.ndarray | None:
         if hasattr(self.low_level_env, "render_wrist"):
             return self.low_level_env.render_wrist()

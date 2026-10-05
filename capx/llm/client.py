@@ -10,6 +10,7 @@ import concurrent.futures
 import copy
 import contextlib
 import contextvars
+import base64
 import json
 import os
 import random
@@ -246,6 +247,16 @@ def _sum_known_token_field(events: list[dict[str, Any]], field: str) -> int | No
     return sum(values) if values else None
 
 
+def _sum_request_field(events: list[dict[str, Any]], field: str) -> int:
+    """Sum request transport metrics that are always locally observable."""
+    return sum(
+        int(event.get("request", {}).get(field, 0))
+        for event in events
+        if isinstance(event.get("request"), dict)
+        and isinstance(event["request"].get(field), (int, float))
+    )
+
+
 def summarize_llm_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
     """Build a JSON-safe per-trial usage artifact from recorded query events."""
     normalized_events = [event for event in events if isinstance(event, dict)]
@@ -257,6 +268,12 @@ def summarize_llm_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
         "total_tokens",
     )
     totals = {field: _sum_known_token_field(normalized_events, field) for field in fields}
+    request_fields = (
+        "image_items",
+        "image_bytes",
+        "image_url_chars",
+        "json_bytes",
+    )
     by_model: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for event in normalized_events:
         key = (str(event.get("model", "unknown")), str(event.get("protocol", "unknown")))
@@ -276,6 +293,10 @@ def summarize_llm_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(event.get("usage"), dict)
         ),
         "totals": totals,
+        "request_totals": {
+            field: _sum_request_field(normalized_events, field)
+            for field in request_fields
+        },
         "by_model": [
             {
                 "model": model,
@@ -283,6 +304,10 @@ def summarize_llm_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "query_count": len(model_events),
                 "totals": {
                     field: _sum_known_token_field(model_events, field) for field in fields
+                },
+                "request_totals": {
+                    field: _sum_request_field(model_events, field)
+                    for field in request_fields
                 },
             }
             for (model, protocol), model_events in sorted(by_model.items())
@@ -426,6 +451,7 @@ def _payload_stats(payload: dict[str, Any]) -> dict[str, int]:
         "text_chars": 0,
         "image_items": 0,
         "image_url_chars": 0,
+        "image_bytes": 0,
         "json_bytes": len(json.dumps(payload).encode("utf-8")),
     }
     messages = payload.get("messages")
@@ -456,7 +482,19 @@ def _payload_stats(payload: dict[str, Any]) -> dict[str, int]:
                     image_url = item.get("image_url")
                     if isinstance(image_url, dict):
                         image_url = image_url.get("url", "")
-                    stats["image_url_chars"] += len(str(image_url))
+                    image_url = str(image_url)
+                    stats["image_url_chars"] += len(image_url)
+                    # Direct visual feedback uses data URLs.  Record decoded
+                    # image bytes separately from prompt JSON bytes so a run's
+                    # token and image transport costs remain auditable.
+                    if image_url.startswith("data:") and "," in image_url:
+                        encoded = image_url.split(",", 1)[1]
+                        try:
+                            stats["image_bytes"] += len(base64.b64decode(encoded))
+                        except (ValueError, TypeError):
+                            # Leave malformed images to the provider/API; the
+                            # stats path must never hide the original error.
+                            pass
     return stats
 
 
@@ -559,6 +597,81 @@ def _responses_endpoint_url(server_url: str) -> str:
     if normalized.endswith(suffix):
         return normalized[: -len(suffix)] + "/responses"
     return normalized
+
+
+_IMAGE_PREFLIGHT_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/"
+    "u2uM8QAAAABJRU5ErkJggg=="
+)
+
+
+def preflight_image_input(args: "LaunchArgs | ModelQueryArgs") -> None:
+    """Fail early when an explicitly visual run cannot accept ``input_image``.
+
+    The regular text preflight only proves connectivity.  This tiny request is
+    used solely by configurations that explicitly require direct image input,
+    preventing an unlisted private model name from silently running text-only.
+    """
+    protocol = _llm_protocol()
+    server_url = _responses_endpoint_url(args.server_url) if protocol == "responses" else args.server_url
+    image_item: dict[str, Any]
+    if protocol == "responses":
+        image_item = {"type": "input_image", "image_url": _IMAGE_PREFLIGHT_DATA_URL}
+        payload: dict[str, Any] = {
+            "model": args.model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Reply with IMAGE_OK."},
+                        image_item,
+                    ],
+                }
+            ],
+            "max_output_tokens": 8,
+        }
+    else:
+        image_item = {"type": "image_url", "image_url": {"url": _IMAGE_PREFLIGHT_DATA_URL}}
+        payload = {
+            "model": args.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Reply with IMAGE_OK."},
+                        image_item,
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": 8,
+            "stream": False,
+        }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Encoding": os.getenv("CAPX_LLM_ACCEPT_ENCODING", "identity"),
+    }
+    if args.api_key:
+        headers["Authorization"] = f"Bearer {args.api_key}"
+    timeout = float(os.getenv("CAPX_LLM_TIMEOUT_SECONDS", "200"))
+    response = _post_json(server_url, headers=headers, payload=payload, timeout=timeout)
+    try:
+        response.raise_for_status()
+    except Exception as exc:
+        raise LLMQueryError(
+            status_code=int(getattr(response, "status_code", 0)),
+            server_url=server_url,
+            response_preview=_response_preview(response),
+            retry_after=getattr(response, "headers", {}).get("retry-after"),
+        ) from exc
+    print(
+        f"[capx-llm] image preflight ok model={args.model} protocol={protocol} "
+        f"status={getattr(response, 'status_code', 'unknown')}",
+        flush=True,
+    )
 
 
 def _responses_output(body: Any) -> tuple[str, str | None]:
@@ -753,6 +866,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict
         f"messages={payload_stats['messages']} "
         f"text_chars={payload_stats['text_chars']} "
         f"image_items={payload_stats['image_items']} "
+        f"image_bytes={payload_stats['image_bytes']} "
         f"image_url_chars={payload_stats['image_url_chars']} "
         f"json_bytes={payload_stats['json_bytes']}"
     )

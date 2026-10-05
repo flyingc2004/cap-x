@@ -1,0 +1,133 @@
+# Visual-assist variant of the public OpenTac tension-strap benchmark.
+# Stage completion remains numerical: raw RGB is an anomaly guard only.
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    stream_user_code_output: false
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/sdc/ljz/ViTaForge_capx_tension}
+      task_name: tension_strap
+      task_config: tension_strap
+      force_task: true
+      force_task_seed: ${oc.env:CAPX_FORCE_TASK_SEED,1}
+      seed_base: ${oc.env:CAPX_FORCE_TASK_SEED,1}
+      device: cuda:0
+      live_preview_enabled: true
+      live_preview_path: ${oc.env:CAPX_LIVE_PREVIEW_PATH,/tmp/capx_tension_strap_preview.jpg}
+      live_preview_stride: 5
+      live_preview_jpeg_quality: 85
+      video_renderer: task_native
+      tension_response_panel:
+        enabled: true
+        history_points: 360
+      task_config_overrides:
+        task_cfg_overrides:
+          save_pre_move: false
+        record_video_during_reset: false
+        record_pre_move_frames: false
+        record_pre_move_tactile_timeline: false
+        video_frame_stride: 2
+        force_task_adapter_pre_move: true
+      runtime_preflight:
+        enabled: true
+        tacex_root: ${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/ViTaForge_capx_tension/third_party/TacEx}
+        require_contact_gradient: true
+        require_attached_gelpad_asset: true
+        require_attachment_points: true
+      api_configs:
+        franka_control_api:
+          llm_api_profile: opentac_tension_control
+          llm_visible_functions: [move_delta, open_gripper, close_gripper, get_robot_state, wait_steps]
+          tactile_adaptive_gripper_enabled: true
+          use_native_pose_planner: false
+          local_delta_max_m: 0.001
+          local_delta_segment_m: 0.001
+          force_task_target_lead_m: 0.002
+          min_safe_z: 0.10
+          max_gripper_servo_steps: 160
+          adaptive_gripper:
+            target_depth_delta_mm: 6.4
+            min_stable_contact_area: 0.006
+            post_squeeze_qpos: 0.00015
+            post_squeeze_steps: 4
+            hold_steps: 8
+        opentac_api:
+          llm_visible_functions: [get_tactile_tension_control_contract, begin_tactile_tension_estimator, get_tactile_tension_estimate, capture_tactile_stage_response]
+          tension_calibration_path: task_config/force_task_rgb/tension_strap_dual_stage.json
+          tactile_stage_memory_path: env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v2.json
+          max_delta_z_m: 0.001
+          observation_wait_steps: 2
+          observation_dt_s: 0.016666666666666666
+          stage_hold_seconds: 3.0
+          estimator_settle_steps: 30
+          proportional_delta_gain_m_per_N: 0.00008333333333333333
+          stage_targets_N: [12.0, 18.0]
+          stage_tolerance_N: 0.5
+          estimator_update_stride: 1
+          max_estimate_age_steps: 3
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis: [FrankaControlApi, OpenTacApi]
+    prompt: |
+      Complete this public tension-strap task using only the documented top-level functions from FrankaControlApi and OpenTacApi. Do not import API modules, instantiate API classes, access the environment, task fields, actor state, true simulator tension, reward, success, metadata, or private observations.
+
+      The task is two ordered numerical tension holds with the same continuous grasp: first hold the public estimated tension in the first band returned by get_tactile_tension_control_contract(), then, without opening or regrasping, increase tension and hold the second returned band. Each hold must remain inside its own band for the full continuous duration returned by the contract. Do not use an image to estimate Newtons or decide that a stage is complete. Only available estimated_tension_N plus your own continuous in-band timer can complete a stage.
+
+      The adapter has already placed an open gripper at the public non-contact strap approach. First close_gripper(adaptive=True), require bilateral_contact, wait contract["estimator_settle_steps"] without motion, and call begin_tactile_tension_estimator() once. Print exactly CAPX_VISUAL_CHECKPOINT grasp_ready after that setup. Then use breakpoint_code_block() on its own line.
+
+      In the next block, retrieve a fresh contract. Use only get_tactile_tension_estimate() and its available / estimated_tension_N fields for local proportional z control. Positive move_delta(dz=...) pulls upward and increases tension; negative dz relaxes it. Read the first target band from contract["stage_bands_N"][0]. At contract["sampling_cadence_steps"], sample the estimate; add contract["sampling_cadence_seconds"] to your local in-band timer only for an available estimate inside the band. Reset the timer for every unavailable or out-of-band sample. Outside the band, move once by a clipped proportional delta using contract["proportional_delta_gain_m_per_N"] and contract["max_delta_z_m"], then observe again. Inside the band, do not move. When the first continuous hold finishes, call capture_tactile_stage_response() only as a diagnostic, print exactly CAPX_VISUAL_CHECKPOINT hold_12n_complete, and put breakpoint_code_block() on its own line. Do not require any 10D response distance or visual condition as a gate.
+
+      In the third block, retrieve a fresh contract and continue the same grasp. Control the second band from contract["stage_bands_N"][1] by the same numerical rule. It requires additional upward motion after the first hold; do not release, reopen, or return to the approach pose. When its continuous numerical hold finishes, call capture_tactile_stage_response() for diagnostics and end normally. Do not invent arbitrary per-stage action-count limits; the benchmark's global timeout and the contract's per-move safety limit already bound execution.
+
+      The initial prompt contains raw public head/wrist RGB. After grasp_ready and hold_12n_complete, the runner may attach a previous-versus-current raw camera comparison. Vision is an anomaly guard only: it may identify visible grasp loss, strap slackness, drift, or a sudden abnormal change. If vision looks concerning while the numerical estimate remains available, do not reverse or complete a stage based on the image. Instead use a smaller subsequent numerical adjustment or wait/re-observe. If the grasp is visibly lost and no bilateral grasp remains, print CAPX_FAILURE and raise RuntimeError. At a normal visual checkpoint, answer the runner's follow-up with CONTINUE so the next existing code block executes.
+
+      Every block must be independently executable. Retrieve contract again at the start of any block that needs it. Keep stdout concise. On a deliberate physical failure print CAPX_FAILURE and raise RuntimeError; do not swallow errors. Return concise executable Python only, with exactly the three ordered blocks described above.
+    multi_turn_prompt: |
+      Executed code:
+      {executed_code}
+
+      Console stdout:
+      {console_stdout}
+
+      Console stderr:
+      {console_stderr}
+
+      This is a checkpoint-or-failure continuation. At a normal CAPX_VISUAL_CHECKPOINT, preserve the numerical plan and answer CONTINUE so the next existing block runs. Regenerate only after a genuine execution failure or a clearly visible physical anomaly. The simulator is already at the executed state, so regenerated code must be a short self-contained continuation and must retrieve a fresh contract rather than relying on earlier Python variables. Raw RGB can identify grasp/strap anomalies but cannot estimate Newtons, complete a hold, reset a numerical timer, reveal true tension, or override estimated_tension_N. Do not use actor state, true tension, reward, success, task metadata, or frozen-memory distances. Do not reopen or regrasp between normal 12N and 18N progression.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/vitaforge_tension_strap_stage_memory_control_visual
+trial_timeout_seconds: 1200
+max_trial_retries: 1
+max_regenerations: 1
+stop_multiturn_when_regeneration_exhausted: true
+save_multiturn_prompts: true
+split_code_blocks_on_breakpoint: true
+multi_turn_on_failure_only: true
+multiturn_requires_checkpoint_or_failure: true
+filter_multiturn_console: true
+multiturn_console_max_lines: 10
+multiturn_console_max_chars: 1000
+multiturn_console_keep_recent_other: 0
+multiturn_executed_code_max_chars: 3000
+multiturn_remaining_code_max_chars: 1000
+use_visual_feedback: true
+use_wrist_camera: true
+visual_feedback_allow_unlisted_model: true
+visual_feedback_require_image_input: true
+visual_feedback_raw_camera_views: true
+visual_feedback_max_image_side_px: 512
+visual_feedback_jpeg_quality: 80
+visual_checkpoint_markers: [grasp_ready, hold_12n_complete]
+include_trial_memory_in_multiturn: true
+multiturn_trial_memory_max_chars: 1000
+tactile_memory:
+  trial:
+    enabled: false
+    include_in_multiturn: false
+  persistent:
+    enabled: false

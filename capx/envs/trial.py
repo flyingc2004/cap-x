@@ -21,10 +21,11 @@ import os
 import re
 import signal
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
@@ -59,6 +60,148 @@ if TYPE_CHECKING:
 
 
 MULTITURN_LIMIT = 10
+
+
+def _visual_feedback_enabled(config: dict[str, Any], args: "LaunchArgs") -> bool:
+    """Return whether this run is permitted to send direct image input."""
+    return bool(config.get("use_visual_feedback", False)) and (
+        args.model in VLM_MODELS
+        or bool(config.get("visual_feedback_allow_unlisted_model", False))
+    )
+
+
+def _visual_checkpoint_marker(
+    info_step: dict[str, Any], config: dict[str, Any]
+) -> str | None:
+    """Extract a configured agent checkpoint emitted by the executed block."""
+    allowed = {str(item) for item in config.get("visual_checkpoint_markers", [])}
+    if not allowed:
+        return None
+    matches = re.findall(
+        r"(?m)^CAPX_VISUAL_CHECKPOINT\s+([A-Za-z0-9_-]+)\s*$",
+        str(info_step.get("stdout", "") or ""),
+    )
+    for marker in reversed(matches):
+        if marker in allowed:
+            return marker
+    return None
+
+
+def _resize_visual_image(image: Image.Image, max_side: int) -> Image.Image:
+    image = image.convert("RGB")
+    limit = max(32, int(max_side))
+    if max(image.size) <= limit:
+        return image
+    scale = limit / float(max(image.size))
+    size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+    return image.resize(size, Image.Resampling.LANCZOS)
+
+
+def _encode_visual_image(
+    image: Image.Image,
+    *,
+    max_side: int,
+    jpeg_quality: int,
+) -> tuple[str, Image.Image]:
+    resized = _resize_visual_image(image, max_side)
+    buffer = io.BytesIO()
+    resized.save(buffer, format="JPEG", quality=max(20, min(95, int(jpeg_quality))))
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}", resized
+
+
+def _capture_raw_visual_snapshot(
+    env: CodeExecutionEnvBase,
+    config: dict[str, Any],
+) -> dict[str, Image.Image]:
+    """Capture raw public cameras without the task-native diagnostic renderer."""
+    head_renderer = getattr(env, "render_head", None)
+    if not callable(head_renderer):
+        raise RuntimeError("CAPX_VISUAL_INPUT_ERROR: head camera renderer is unavailable")
+    head = head_renderer()
+    if head is None:
+        raise RuntimeError("CAPX_VISUAL_INPUT_ERROR: head camera frame is unavailable")
+    snapshot = {"head": Image.fromarray(np.asarray(head)).convert("RGB")}
+    if bool(config.get("use_wrist_camera", False)):
+        wrist_renderer = getattr(env, "render_wrist", None)
+        wrist = wrist_renderer() if callable(wrist_renderer) else None
+        if wrist is None:
+            raise RuntimeError("CAPX_VISUAL_INPUT_ERROR: wrist camera frame is unavailable")
+        snapshot["wrist"] = Image.fromarray(np.asarray(wrist)).convert("RGB")
+    return snapshot
+
+
+def _labeled_visual_tile(image: Image.Image, label: str) -> Image.Image:
+    header = 22
+    tile = Image.new("RGB", (image.width, image.height + header), (20, 25, 32))
+    tile.paste(image, (0, header))
+    ImageDraw.Draw(tile).text((6, 4), label, fill=(235, 240, 245))
+    return tile
+
+
+def _compose_visual_snapshot(snapshot: dict[str, Image.Image]) -> Image.Image:
+    """Build a compact head/wrist prompt image for the first code query."""
+    tiles = [_labeled_visual_tile(snapshot["head"], "Head RGB")]
+    if "wrist" in snapshot:
+        tiles.append(_labeled_visual_tile(snapshot["wrist"], "Wrist RGB"))
+    height = max(tile.height for tile in tiles)
+    width = sum(tile.width for tile in tiles)
+    canvas = Image.new("RGB", (width, height), (10, 14, 20))
+    x = 0
+    for tile in tiles:
+        canvas.paste(tile, (x, 0))
+        x += tile.width
+    return canvas
+
+
+def _compose_visual_transition(
+    previous: dict[str, Image.Image], current: dict[str, Image.Image]
+) -> Image.Image:
+    """Show previous/current raw camera views in one bounded VLM image."""
+    cameras = ["head"] + (["wrist"] if "wrist" in current else [])
+    rows: list[list[Image.Image]] = []
+    for title, snapshot in (("Previous", previous), ("Current", current)):
+        rows.append(
+            [
+                _labeled_visual_tile(snapshot[camera], f"{title} {camera.title()} RGB")
+                for camera in cameras
+            ]
+        )
+    row_width = max(sum(tile.width for tile in row) for row in rows)
+    row_height = max(max(tile.height for tile in row) for row in rows)
+    canvas = Image.new("RGB", (row_width, row_height * len(rows)), (10, 14, 20))
+    for row_index, row in enumerate(rows):
+        x = 0
+        y = row_index * row_height
+        for tile in row:
+            canvas.paste(tile, (x, y))
+            x += tile.width
+    return canvas
+
+
+def _save_visual_checkpoint_artifacts(
+    code_path: str | None,
+    checkpoints: list[dict[str, Any]],
+) -> None:
+    """Persist prompt snapshots separately from large serialized LLM prompts."""
+    if not code_path or not checkpoints:
+        return
+    output_dir = Path(code_path).parent / "visual_checkpoints"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest: list[dict[str, Any]] = []
+    for index, checkpoint in enumerate(checkpoints):
+        image = checkpoint["image"]
+        filename = f"{index:02d}_{checkpoint['label']}.jpg"
+        image.save(output_dir / filename, quality=90)
+        manifest.append(
+            {
+                key: value
+                for key, value in checkpoint.items()
+                if key != "image"
+            }
+            | {"file": filename}
+        )
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
 # ---------------------------------------------------------------------------
 # Shared formatting helpers
@@ -316,6 +459,11 @@ def _should_query_multiturn_after_block(
     config: dict[str, Any],
 ) -> bool:
     """Return whether a multi-turn decision should be requested after a block."""
+    # A visual checkpoint is an explicit, bounded request from the generated
+    # program.  It is intentionally allowed even in failure-only mode, while
+    # ordinary successful intermediate blocks continue without another query.
+    if _visual_checkpoint_marker(info_step, config) is not None:
+        return True
     if not config.get("multi_turn_on_failure_only", False):
         return True
 
@@ -353,6 +501,13 @@ def _should_query_multiturn_after_block(
     )
     if any(token in combined for token in failure_tokens):
         return True
+
+    if config.get("multiturn_requires_checkpoint_or_failure", False):
+        # Some visual-control protocols reserve model calls for explicit
+        # physical checkpoints and genuine execution failures.  A clean final
+        # block that simply did not finish must not create an unbounded extra
+        # planning turn.
+        return False
 
     # If the generated program ran out of blocks without task completion, give
     # the agent one chance to decide whether to repair, continue, or finish.
@@ -673,7 +828,7 @@ def _build_trial_working_memory_runtime_context(
     if not context:
         return None
     return (
-        "Public trial-local API state. It is not a task label; preserve only "
+        "Public agent-authored trial-local API state. It is not a task label; preserve only "
         "explicitly completed work and use it for continuation:\n"
         f"```json\n{context}\n```"
     )
@@ -689,17 +844,51 @@ def _capture_initial_visual_feedback(
     config: dict[str, Any],
     args: LaunchArgs,
     visual_differencing_args: ModelQueryArgs,
-) -> tuple[list, list[str], str]:
+) -> tuple[list, list[str], str, list[dict[str, Image.Image]]]:
     """Capture the initial environment image and optionally describe it.
 
     Returns:
-        (visual_feedback_imgs, visual_feedback_base64_history, task_description)
+        (visual_feedback_imgs, visual_feedback_base64_history, task_description,
+        raw_visual_snapshots)
     """
     visual_feedback_imgs: list = []
     visual_feedback_base64_history: list[str] = []
+    raw_visual_snapshots: list[dict[str, Image.Image]] = []
     task_description = ""
 
     use_wrist = config.get("use_wrist_camera", False)
+
+    # Direct visual prompting for this adapter uses only raw public camera
+    # pixels.  In particular, do not feed the task-native video dashboard,
+    # which contains diagnostic numerical panels intended for human review.
+    if _visual_feedback_enabled(config, args) and config.get(
+        "visual_feedback_raw_camera_views", False
+    ):
+        snapshot = _capture_raw_visual_snapshot(env, config)
+        prompt_image = _compose_visual_snapshot(snapshot)
+        image_base64, saved_image = _encode_visual_image(
+            prompt_image,
+            max_side=int(config.get("visual_feedback_max_image_side_px", 512)),
+            jpeg_quality=int(config.get("visual_feedback_jpeg_quality", 80)),
+        )
+        visual_feedback_imgs.append(saved_image)
+        visual_feedback_base64_history.append(image_base64)
+        raw_visual_snapshots.append(snapshot)
+        task_description = copy.deepcopy(obs["full_prompt"][-1]["content"][0]["text"])
+        obs["full_prompt"][-1]["content"][0]["text"] += (
+            "\n\nIncluded below are raw public head and wrist RGB views. "
+            "They may be used only to assess grasp/strap state and visual anomalies; "
+            "they are not a source of Newton-valued tension or stage completion."
+        )
+        obs["full_prompt"][-1]["content"].append(
+            {"type": "image_url", "image_url": {"url": image_base64}}
+        )
+        return (
+            visual_feedback_imgs,
+            visual_feedback_base64_history,
+            task_description,
+            raw_visual_snapshots,
+        )
 
     needs_visual = (
         (config["use_visual_feedback"] and args.model in VLM_MODELS)
@@ -707,7 +896,12 @@ def _capture_initial_visual_feedback(
         or config.get("use_video_differencing", False)
     )
     if not (needs_visual and hasattr(env, "render")):
-        return visual_feedback_imgs, visual_feedback_base64_history, task_description
+        return (
+            visual_feedback_imgs,
+            visual_feedback_base64_history,
+            task_description,
+            raw_visual_snapshots,
+        )
 
     initial_base64, initial_img = _get_visual_feedback(env)
     visual_feedback_imgs.append(initial_img)
@@ -758,7 +952,12 @@ def _capture_initial_visual_feedback(
         if args.debug:
             print(description)
 
-    return visual_feedback_imgs, visual_feedback_base64_history, task_description
+    return (
+        visual_feedback_imgs,
+        visual_feedback_base64_history,
+        task_description,
+        raw_visual_snapshots,
+    )
 
 
 def _describe_initial_scene(
@@ -1013,6 +1212,8 @@ def _handle_multi_turn_step(
     wrist_base64_history: list[str] | None = None,
     tactile_code_memory_trace: list[dict[str, Any]] | None = None,
     repair_turn_count: int = 0,
+    raw_visual_snapshots: list[dict[str, Image.Image]] | None = None,
+    visual_checkpoint_records: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str | None, str | None, dict | None, list | None]:
     """Execute one multi-turn decision step.
 
@@ -1030,6 +1231,7 @@ def _handle_multi_turn_step(
         where decision is "regenerate", "finish", or "continue".
     """
     use_wrist = config.get("use_wrist_camera", False)
+    checkpoint_marker = _visual_checkpoint_marker(info_step, config)
 
     executed_code = "\n".join(code_blocks[:code_block_idx])
     remaining_code = "\n\n".join(code_blocks[code_block_idx:])
@@ -1117,13 +1319,51 @@ def _handle_multi_turn_step(
     if info_step["stderr"] != "":
         stderr_history.append(info_step["stderr"])
 
-    # Capture visual feedback if applicable
+    # Capture visual feedback if applicable.  The OpenTac visual-assist path
+    # deliberately observes only at explicit program checkpoints or failures,
+    # never after every local control delta.
     visual_feedback_base64 = None
+    direct_raw_visual = _visual_feedback_enabled(config, args) and bool(
+        config.get("visual_feedback_raw_camera_views", False)
+    )
     needs_visual = (
         (config["use_visual_feedback"] and args.model in VLM_MODELS)
         or (config["use_img_differencing"] and visual_differencing_args.model in VLM_MODELS)
     )
-    if needs_visual and hasattr(env, "render"):
+    if direct_raw_visual:
+        snapshot = _capture_raw_visual_snapshot(env, config)
+        previous = raw_visual_snapshots[-1] if raw_visual_snapshots else snapshot
+        prompt_image = _compose_visual_transition(previous, snapshot)
+        visual_feedback_base64, saved_image = _encode_visual_image(
+            prompt_image,
+            max_side=int(config.get("visual_feedback_max_image_side_px", 512)),
+            jpeg_quality=int(config.get("visual_feedback_jpeg_quality", 80)),
+        )
+        visual_feedback_imgs.append(saved_image)
+        visual_feedback_base64_history.append(visual_feedback_base64)
+        if raw_visual_snapshots is not None:
+            raw_visual_snapshots.append(snapshot)
+        if visual_checkpoint_records is not None:
+            low_level = getattr(env, "low_level_env", None)
+            visual_checkpoint_records.append(
+                {
+                    "label": checkpoint_marker or "failure_recovery",
+                    "step": getattr(low_level, "_sim_step_count", None),
+                    "image": saved_image,
+                    "image_width": saved_image.width,
+                    "image_height": saved_image.height,
+                    "image_bytes": len(visual_feedback_base64),
+                }
+            )
+        checkpoint_label = checkpoint_marker or "failure recovery"
+        complete_multi_turn_prompt += (
+            f"\n\nRaw public head/wrist RGB checkpoint: {checkpoint_label}. "
+            "The attached image shows previous (top) and current (bottom) views. "
+            "Use vision only to inspect grasp retention, strap slackness, displacement, "
+            "or anomalies. estimated_tension_N and continuous numerical hold logic are "
+            "authoritative: an image must never complete, reset, or override a force stage."
+        )
+    elif needs_visual and hasattr(env, "render"):
         vf_base64, vf_img = _get_visual_feedback(env)
         visual_feedback_imgs.append(vf_img)
         visual_feedback_base64_history.append(vf_base64)
@@ -1154,6 +1394,10 @@ def _handle_multi_turn_step(
     # Only pass visual feedback to prompt if visual_feedback is enabled
     if not config["use_visual_feedback"]:
         visual_feedback_base64 = None
+    elif direct_raw_visual:
+        # Set above from raw head/wrist views.  Do not replace this with the
+        # task-native dashboard returned by env.render().
+        pass
     elif needs_visual and hasattr(env, "render"):
         visual_feedback_base64 = visual_feedback_base64_history[-1] if visual_feedback_base64_history else None
 
@@ -1313,9 +1557,15 @@ def _run_single_trial(
     # --- 2. Capture initial visual feedback ---
     print(f"[capx-trial] trial={trial} initial visual begin", flush=True)
     with collect_llm_usage(llm_usage_events, "initial_visual"):
-        visual_feedback_imgs, visual_feedback_base64_history, task_description = (
+        (
+            visual_feedback_imgs,
+            visual_feedback_base64_history,
+            task_description,
+            raw_visual_snapshots,
+        ) = (
             _capture_initial_visual_feedback(env, obs, config, args, visual_differencing_args)
         )
+    visual_checkpoint_records: list[dict[str, Any]] = []
     print(f"[capx-trial] trial={trial} initial visual end", flush=True)
 
     # Seed wrist base64 history with initial wrist image
@@ -1352,6 +1602,7 @@ def _run_single_trial(
             "all_responses": all_responses,
             "llm_usage_events": llm_usage_events,
             "visual_feedback_imgs": visual_feedback_imgs,
+            "visual_checkpoint_records": visual_checkpoint_records,
             "info_step": info_step,
             "reward": reward,
             "terminated": terminated,
@@ -1510,6 +1761,8 @@ def _run_single_trial(
                     wrist_base64_history=wrist_base64_history,
                     tactile_code_memory_trace=tactile_code_memory_trace,
                     repair_turn_count=num_regenerations,
+                    raw_visual_snapshots=raw_visual_snapshots,
+                    visual_checkpoint_records=visual_checkpoint_records,
                 )
 
             if mt_ensemble is not None:
@@ -1631,6 +1884,7 @@ def _run_single_trial(
         multiturn_ensemble_data=multiturn_ensemble_data,
         llm_usage_events=llm_usage_events,
     )
+    _save_visual_checkpoint_artifacts(code_path, visual_checkpoint_records)
 
     # Save per-turn and combined videos
     if recording_frames and turn_frame_ranges:

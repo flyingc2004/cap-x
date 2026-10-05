@@ -192,6 +192,27 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "use_wrist_camera": args.use_wrist_camera
         if args.use_wrist_camera is not None
         else configs_dict.get("use_wrist_camera", False),
+        # Visual input is normally restricted to known model identifiers.  A
+        # config may explicitly opt a private gateway deployment into image
+        # input after its own endpoint preflight succeeds.
+        "visual_feedback_allow_unlisted_model": bool(
+            configs_dict.get("visual_feedback_allow_unlisted_model", False)
+        ),
+        "visual_feedback_require_image_input": bool(
+            configs_dict.get("visual_feedback_require_image_input", False)
+        ),
+        "visual_feedback_raw_camera_views": bool(
+            configs_dict.get("visual_feedback_raw_camera_views", False)
+        ),
+        "visual_feedback_max_image_side_px": int(
+            configs_dict.get("visual_feedback_max_image_side_px", 512)
+        ),
+        "visual_feedback_jpeg_quality": int(
+            configs_dict.get("visual_feedback_jpeg_quality", 80)
+        ),
+        "visual_checkpoint_markers": list(
+            configs_dict.get("visual_checkpoint_markers", [])
+        ),
         "use_multimodel": args.use_multimodel
         if args.use_multimodel is not None
         else configs_dict.get("use_multimodel", False),
@@ -206,6 +227,33 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "split_code_blocks_on_breakpoint": configs_dict.get(
             "split_code_blocks_on_breakpoint",
             False,
+        ),
+        "multi_turn_on_failure_only": bool(
+            configs_dict.get("multi_turn_on_failure_only", False)
+        ),
+        "multiturn_requires_checkpoint_or_failure": bool(
+            configs_dict.get("multiturn_requires_checkpoint_or_failure", False)
+        ),
+        "stop_multiturn_when_regeneration_exhausted": bool(
+            configs_dict.get("stop_multiturn_when_regeneration_exhausted", False)
+        ),
+        "filter_multiturn_console": bool(
+            configs_dict.get("filter_multiturn_console", False)
+        ),
+        "multiturn_console_max_lines": int(
+            configs_dict.get("multiturn_console_max_lines", 80)
+        ),
+        "multiturn_console_max_chars": int(
+            configs_dict.get("multiturn_console_max_chars", 12000)
+        ),
+        "multiturn_console_keep_recent_other": int(
+            configs_dict.get("multiturn_console_keep_recent_other", 12)
+        ),
+        "multiturn_executed_code_max_chars": int(
+            configs_dict.get("multiturn_executed_code_max_chars", 12000)
+        ),
+        "multiturn_remaining_code_max_chars": int(
+            configs_dict.get("multiturn_remaining_code_max_chars", 8000)
         ),
         "max_code_block_actions": int(
             os.getenv(
