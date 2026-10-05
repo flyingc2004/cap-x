@@ -478,7 +478,7 @@ close_gripper(adaptive=True)
     assert payload == "home_pose()\nopen_gripper(adaptive=True)"
 
 
-def test_extract_code_uses_first_python_fence_only() -> None:
+def test_extract_code_preserves_all_python_fences_in_order() -> None:
     content = """
 ```python
 print("first")
@@ -489,7 +489,7 @@ print("second")
 ```
 """
 
-    assert _extract_code(content) == ['print("first")']
+    assert _extract_code(content) == ['print("first")', 'print("second")']
 
 
 def test_normalize_extracted_code_removes_model_block_marker_and_dedents() -> None:

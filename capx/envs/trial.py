@@ -78,7 +78,7 @@ def _visual_checkpoint_marker(
     if not allowed:
         return None
     matches = re.findall(
-        r"(?m)^CAPX_VISUAL_CHECKPOINT\s+([A-Za-z0-9_-]+)\s*$",
+        r"(?:^|[\r\n])\s*CAPX_VISUAL_CHECKPOINT\s+([A-Za-z0-9_-]+)(?=$|[\r\n])",
         str(info_step.get("stdout", "") or ""),
     )
     for marker in reversed(matches):

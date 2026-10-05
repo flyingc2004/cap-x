@@ -423,26 +423,27 @@ def _inject_tactile_code_memory_prompt(
 
 
 def _extract_code(content: str) -> list[str]:
-    """Extract Python code from Markdown fenced code block.
+    """Extract one or more Python blocks from Markdown fences.
 
     Args:
         content: Raw model response
 
     Returns:
-        Extracted Python code list
+        Extracted Python code list, preserving the order of separate fences.
     """
-    fenced = re.search(
+    fenced_blocks = re.findall(
         r"```(?:python|py)\s*\n(.*?)```",
         content,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    if fenced is not None:
-        content = fenced.group(1)
+    if fenced_blocks:
+        normalized = [
+            _normalize_extracted_code(block)
+            for block in fenced_blocks
+        ]
+        return [block for block in normalized if block.strip()]
 
     content = _normalize_extracted_code(content)
-    # NOTE: might gen empty code block at the end
-    # content_list = content.split("breakpoint_code_block()")
-
     return [content]
 
 

@@ -15,7 +15,7 @@ from capx.envs.trial import (
 )
 from capx.llm import client
 from capx.llm.client import preflight_image_input
-from capx.utils.launch_utils import _load_config
+from capx.utils.launch_utils import _extract_code, _load_config
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +87,12 @@ def test_visual_checkpoint_is_the_only_successful_failure_only_trigger() -> None
         total_code_blocks=3,
         config=config,
     )
+    assert _should_query_multiturn_after_block(
+        {**clean, "stdout": "Step 9\rCAPX_VISUAL_CHECKPOINT grasp_ready\r"},
+        code_block_idx=1,
+        total_code_blocks=3,
+        config=config,
+    )
     assert not _should_query_multiturn_after_block(
         clean,
         code_block_idx=3,
@@ -149,7 +155,31 @@ def test_visual_yaml_keeps_numerical_stage_authority() -> None:
     assert config["visual_checkpoint_markers"] == ["grasp_ready", "hold_12n_complete"]
     assert "Do not use an image to estimate Newtons or decide that a stage is complete" in prompt
     assert "Do not invent arbitrary per-stage action-count limits" in prompt
+    assert 'contract["stage_hold_seconds"]' in prompt
+    assert "do not use hold_duration_seconds" in prompt
     assert "max_code_block_actions" not in config
+
+
+def test_three_fenced_stage_program_is_not_silently_truncated() -> None:
+    response = """
+```python
+print('setup')
+breakpoint_code_block()
+```
+```python
+print('hold 12')
+breakpoint_code_block()
+```
+```python
+print('hold 18')
+```
+"""
+
+    assert _extract_code(response) == [
+        "print('setup')\nbreakpoint_code_block()",
+        "print('hold 12')\nbreakpoint_code_block()",
+        "print('hold 18')",
+    ]
 
 
 def test_config_loader_preserves_visual_and_failure_only_controls() -> None:
