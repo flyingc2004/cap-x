@@ -397,6 +397,9 @@ class TactileAdaptiveGripperController:
             "contact": bool(summary["contact"]),
             "left_contact": bool(summary["left_contact"]),
             "right_contact": bool(summary["right_contact"]),
+            "bilateral_contact": bool(
+                summary["left_contact"] and summary["right_contact"]
+            ),
             "contact_area": float(summary["contact_area"]),
             "left_contact_area": float(summary["left"].get("contact_area", 0.0)),
             "right_contact_area": float(summary["right"].get("contact_area", 0.0)),

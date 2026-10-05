@@ -110,6 +110,7 @@ def test_adaptive_close_uses_coarse_then_fine_and_holds_for_stability() -> None:
     result = controller.close(target_force=0.35, max_steps=20)
 
     assert result["stable"] is True
+    assert result["bilateral_contact"] is True
     np.testing.assert_allclose([item[0] for item in rig.commands[:3]], [0.80, 0.60, 0.55])
     assert rig.commands[3][0] == pytest.approx(0.55)
     assert rig.commands[4][0] == pytest.approx(0.55)

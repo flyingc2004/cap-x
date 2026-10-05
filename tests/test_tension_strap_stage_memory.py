@@ -230,6 +230,10 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert "adapter does not track stage progress" in prompt.lower()
     assert tactile["estimator_update_stride"] == 1
     assert tactile["estimator_settle_steps"] == 30
+    assert 'contract["sampling_cadence_steps"]' in prompt
+    assert 'contract["sampling_cadence_seconds"]' in prompt
+    assert 'grasp["bilateral_contact"]' in prompt
+    assert "is a boolean, never a dictionary" in prompt
     assert tactile["proportional_delta_gain_m_per_N"] == pytest.approx(1.0 / 12000.0)
     assert tactile["max_delta_z_m"] == pytest.approx(0.001)
     assert low_level["api_configs"]["franka_control_api"]["local_delta_max_m"] == pytest.approx(0.001)

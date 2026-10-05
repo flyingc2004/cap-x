@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pytest
 
 from capx.integrations.opentac import OpenTacApi
 from capx.integrations.univtac.franka_compat_api import UniVTACFrankaCompatApi
@@ -133,6 +134,10 @@ def test_control_contract_exposes_exact_stage_bands(monkeypatch) -> None:
 
     assert contract["stage_targets_N"] == [12.0, 18.0]
     assert contract["stage_bands_N"] == [[11.5, 12.5], [17.5, 18.5]]
+    assert contract["sampling_cadence_steps"] == contract["observation_wait_steps"]
+    assert contract["sampling_cadence_seconds"] == pytest.approx(
+        contract["observation_wait_steps"] * contract["observation_dt_s"]
+    )
     assert "stage_tolerance_N" not in contract
     assert "max_control_actions_per_stage" not in contract
     assert "max_consecutive_invalid_samples" not in contract
@@ -187,6 +192,8 @@ def test_multiple_steps_in_one_action_keep_marker_updates_incremental(monkeypatc
 def test_tracking_unavailable_is_only_a_temporary_numeric_observation(monkeypatch) -> None:
     env = _ObserverEnv()
     api = _api(monkeypatch, env)
+    preview_updates: list[int] = []
+    monkeypatch.setattr(api, "_publish_live_stage_response", lambda: preview_updates.append(env.step))
     api.begin_tactile_tension_estimator()
     env.fail_tracking = True
 
@@ -203,9 +210,24 @@ def test_tracking_unavailable_is_only_a_temporary_numeric_observation(monkeypatc
     assert "consecutive_invalid_samples" not in context
     assert "true_tension" not in context
     assert "actor" not in context
+    assert preview_updates == [1, 2, 3]
+    assert env.diagnostics["private_debug"] == {
+        "valid_sample_count": 0,
+        "invalid_sample_count": 3,
+        "last_failure": {
+            "status": "tracking_unavailable",
+            "message": "marker correspondences unavailable",
+            "step": 3,
+        },
+    }
 
     api.reset_episode()
     assert env.post_step == {}
+    assert env.diagnostics["private_debug"] == {
+        "valid_sample_count": 0,
+        "invalid_sample_count": 0,
+        "last_failure": None,
+    }
     with np.testing.assert_raises_regex(RuntimeError, "begin_tactile_tension_estimator"):
         api.get_tactile_tension_estimate()
 

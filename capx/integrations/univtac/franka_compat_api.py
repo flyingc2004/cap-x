@@ -1162,8 +1162,11 @@ class UniVTACFrankaCompatApi(ApiBase):
             hold_steps: Number of no-op confirmation commands after squeezing.
 
         Returns:
-            Result containing ``stable``, contact state, and stop reason. The
-            caller remains responsible for pose adjustment, retry, and lift.
+            Result containing ``stable``, ``contact``, ``left_contact``,
+            ``right_contact``, ``bilateral_contact``, and ``reason``. All
+            five contact/stability fields are top-level booleans;
+            ``contact`` is not a nested mapping. The caller remains
+            responsible for pose adjustment, retry, and lift.
         """
         requested_max_steps = int(max_steps)
         max_steps = self._limit_gripper_servo_steps(requested_max_steps)

@@ -382,7 +382,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._post_action_observers.pop(str(name), None)
 
     def set_opentac_tension_estimator_diagnostics(self, diagnostics: dict[str, Any]) -> None:
-        """Store public OpenTac estimator diagnostics for the trial artifact."""
+        """Store OpenTac diagnostics for the private trial artifact only."""
         self._opentac_tension_estimator_diagnostics = _jsonable(dict(diagnostics))
 
     def _notify_post_step_observers(self) -> None:

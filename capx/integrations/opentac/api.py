@@ -51,6 +51,13 @@ class OpenTacApi(ApiBase):
         self._latest_estimate: dict[str, Any] | None = None
         self._last_observed_step: int | None = None
         self._stage_memory_cache: dict[str, Any] | None = None
+        # This remains diagnostic-only: public observations and LLM context
+        # continue to expose only available/estimated_tension_N.
+        self._tracker_debug: dict[str, Any] = {
+            "valid_sample_count": 0,
+            "invalid_sample_count": 0,
+            "last_failure": None,
+        }
 
     def functions(self) -> dict[str, Any]:
         full = {
@@ -78,6 +85,11 @@ class OpenTacApi(ApiBase):
         self._latest_estimate = None
         self._last_observed_step = None
         self._stage_memory_cache = None
+        self._tracker_debug = {
+            "valid_sample_count": 0,
+            "invalid_sample_count": 0,
+            "last_failure": None,
+        }
         self._publish_diagnostics()
 
     def get_tactile_tension_control_contract(self) -> dict[str, Any]:
@@ -85,17 +97,31 @@ class OpenTacApi(ApiBase):
 
         It exposes only public action safety, sampling cadence, and target
         bands. The runtime physical scorer is never exposed.
+
+        Returns:
+            A JSON-safe ``opentac_tension_control_contract.v1`` mapping. For
+            one control sample, call ``wait_steps`` with
+            ``sampling_cadence_steps`` and add
+            ``sampling_cadence_seconds`` to a local in-band timer.
+            ``observation_wait_steps`` and ``observation_dt_s`` are the
+            corresponding primitive quantities retained for diagnostics.
         """
         config = self._runtime_config()
         stage_targets = _float_list(config.get("stage_targets_N", [12.0, 18.0]))
         stage_tolerance = float(config.get("stage_tolerance_N", 0.5))
+        observation_wait_steps = int(config.get("observation_wait_steps", 2))
+        observation_dt_s = float(config.get("observation_dt_s", 1.0 / 60.0))
         contract = {
             "schema_version": _CONTROL_SCHEMA,
             "control_frame": "world",
             "allowed_translation_axes": ["z"],
             "max_delta_z_m": float(config.get("max_delta_z_m", 0.002)),
-            "observation_wait_steps": int(config.get("observation_wait_steps", 2)),
-            "observation_dt_s": float(config.get("observation_dt_s", 1.0 / 60.0)),
+            "observation_wait_steps": observation_wait_steps,
+            "observation_dt_s": observation_dt_s,
+            # Stable agent-facing aliases. Earlier prompts described a
+            # sampling cadence but exposed only its component factors.
+            "sampling_cadence_steps": observation_wait_steps,
+            "sampling_cadence_seconds": observation_wait_steps * observation_dt_s,
             "stage_hold_seconds": float(config.get("stage_hold_seconds", 3.0)),
             "estimator_settle_steps": int(config.get("estimator_settle_steps", 30)),
             "proportional_delta_gain_m_per_N": float(
@@ -283,6 +309,9 @@ class OpenTacApi(ApiBase):
         if self._tracker is None:
             return
         self._sample_estimator()
+        # The 10D response panel is a direct tactile diagnostic. It must keep
+        # advancing even when marker-flow tracking cannot emit a tension value.
+        self._publish_live_stage_response()
 
     def _sample_estimator(self, *, force: bool = False) -> None:
         if self._tracker is None or self._calibration is None or self._reference_images is None:
@@ -314,6 +343,10 @@ class OpenTacApi(ApiBase):
             return
 
         self._estimate_count += 1
+        self._tracker_debug["valid_sample_count"] = int(
+            self._tracker_debug["valid_sample_count"]
+        ) + 1
+        self._tracker_debug["last_failure"] = None
         record = {
             "schema_version": _ESTIMATE_SCHEMA,
             "available": True,
@@ -325,7 +358,6 @@ class OpenTacApi(ApiBase):
         }
         self._latest_estimate = record
         self._publish_diagnostics()
-        self._publish_live_stage_response()
 
     def _publish_live_stage_response(self) -> None:
         """Refresh the video-only rolling 10D preview from public frames.
@@ -367,8 +399,16 @@ class OpenTacApi(ApiBase):
             # into a false environment/control failure.
             return
 
-    def _record_invalid_estimate(self, _status: str, _message: str, step: int | None) -> None:
-        """Cache an unavailable sample without imposing a recovery policy."""
+    def _record_invalid_estimate(self, status: str, message: str, step: int | None) -> None:
+        """Cache an unavailable sample without exposing tracker internals to the LLM."""
+        self._tracker_debug["invalid_sample_count"] = int(
+            self._tracker_debug["invalid_sample_count"]
+        ) + 1
+        self._tracker_debug["last_failure"] = {
+            "status": str(status),
+            "message": str(message),
+            "step": step,
+        }
         self._latest_estimate = {
             "schema_version": _ESTIMATE_SCHEMA,
             "available": False,
@@ -414,6 +454,10 @@ class OpenTacApi(ApiBase):
                 "schema_version": _ESTIMATE_SCHEMA,
                 "estimator_active": self._tracker is not None,
                 "latest_estimate": latest,
+                # Saved only in univtac_debug.json. This deliberately does
+                # not appear in get_tactile_tension_estimate() or the bounded
+                # multi-turn context exposed to generated code.
+                "private_debug": _jsonable(self._tracker_debug),
             }
         )
 
