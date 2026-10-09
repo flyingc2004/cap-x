@@ -228,6 +228,55 @@ def test_estimator_audit_is_public_bounded_and_contains_motion_context(monkeypat
     assert "true_tension" not in sample
 
 
+def test_private_force_audit_records_every_physics_step_and_scorer(monkeypatch) -> None:
+    env = _ObserverEnv()
+    env.api_configs["opentac_api"]["private_force_audit"] = {
+        "enabled": True,
+        "sample_stride": 1,
+    }
+    rows: list[dict[str, Any]] = []
+    env.append_opentac_tension_calibration_audit = rows.append
+    env.read_private_tension_for_posthoc_audit = lambda: {
+        "true_tension_N": env.tension + 0.4,
+        "source": "task_cached_physics_measurement",
+        "scorer": {
+            "stage_index": 0,
+            "current_continuous_hold_seconds": env.step * 0.1,
+            "completed_steps": [],
+            "grasped": True,
+        },
+    }
+    api = _api(monkeypatch, env)
+    api.reset_episode()
+    assert len(env.post_step) == 1
+
+    env.tick(11.7)
+    assert rows[0]["step"] == 1
+    assert rows[0]["estimated_tension_N"] is None
+    assert rows[0]["true_tension_N"] == pytest.approx(12.1)
+    api._on_post_task_step()
+    assert len(rows) == 1
+
+    api.begin_tactile_tension_estimator()
+    env.tick(12.0)
+    env.fail_tracking = True
+    env.tick(12.0)
+
+    assert [row["step"] for row in rows] == [1, 2, 3]
+    assert rows[1]["schema_version"] == "opentac_tension_calibration_audit.v2"
+    assert rows[1]["estimated_tension_N"] == pytest.approx(12.0)
+    assert rows[1]["true_tension_N"] == pytest.approx(12.4)
+    assert rows[1]["true_in_bands"] == [True, False]
+    assert rows[1]["physical_scorer"]["current_continuous_hold_seconds"] == pytest.approx(0.2)
+    assert rows[2]["estimated_tension_N"] is None
+    assert rows[2]["physical_scorer"]["stage_index"] == 0
+    assert "true_tension_N" not in str(api.functions())
+    assert "true_tension_N" not in api.runtime_memory_context()
+
+    api.reset_episode()
+    assert len(env.post_step) == 1
+
+
 def test_tracking_unavailable_is_only_a_temporary_numeric_observation(monkeypatch) -> None:
     env = _ObserverEnv()
     api = _api(monkeypatch, env)

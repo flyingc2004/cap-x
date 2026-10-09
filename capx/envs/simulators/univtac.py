@@ -1404,6 +1404,10 @@ class UniVTACLowLevelEnv(BaseEnv):
         # does not add a second expensive elastic-resultant solve per step.
         cached = getattr(task, "measured", None)
         cached_step = getattr(task, "_measure_step", None)
+        lifecycle = getattr(task, "_stage_scorer", None)
+        scorer = lifecycle.snapshot() if lifecycle is not None else {}
+        if scorer:
+            scorer["grasped"] = bool(getattr(task, "_grip_released", False))
         if isinstance(cached, dict) and cached_step == step:
             cached_tension = cached.get("tension_N")
             if cached_tension is not None and np.isfinite(float(cached_tension)):
@@ -1411,6 +1415,7 @@ class UniVTACLowLevelEnv(BaseEnv):
                     "true_tension_N": max(0.0, float(cached_tension)),
                     "step": step,
                     "source": "task_cached_physics_measurement",
+                    "scorer": scorer,
                 }
         points = np.asarray(task.strap.vertex_positions, dtype=np.float64).copy()
         measurement = task.resultant.measure(points, task.upper_mask)
@@ -1421,6 +1426,7 @@ class UniVTACLowLevelEnv(BaseEnv):
             "true_tension_N": max(0.0, -float(elastic_force[2])),
             "step": step,
             "source": "direct_elastic_resultant",
+            "scorer": scorer,
         }
 
     def append_opentac_tension_calibration_audit(self, record: dict[str, Any]) -> None:
@@ -4029,9 +4035,13 @@ def _summarize_opentac_tension_calibration_audit(records: list[dict[str, Any]]) 
     true_available = 0
     estimate_available = 0
     stage_bands: list[list[float]] = []
+    last_physical_scorer: dict[str, Any] = {}
     for row in records:
         if not isinstance(row, dict):
             continue
+        scorer = row.get("physical_scorer")
+        if isinstance(scorer, dict) and scorer:
+            last_physical_scorer = scorer
         if row.get("true_tension_N") is not None:
             true_available += 1
         if row.get("estimate_available") is True:
@@ -4089,6 +4099,7 @@ def _summarize_opentac_tension_calibration_audit(records: list[dict[str, Any]]) 
         "paired_sample_count": int(len(paired)),
         "true_tension_available_count": int(true_available),
         "estimate_available_count": int(estimate_available),
+        "last_physical_scorer": last_physical_scorer,
         "paired_coverage": float(len(paired) / total) if total else 0.0,
         "overall": error_metrics(paired),
         "by_true_tension_band": by_target,

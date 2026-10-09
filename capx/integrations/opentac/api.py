@@ -71,6 +71,7 @@ class OpenTacApi(ApiBase):
         }
         self._estimator_audit_index = 0
         self._private_force_audit_index = 0
+        self._last_private_audit_step: int | None = None
 
     def functions(self) -> dict[str, Any]:
         full = {
@@ -108,7 +109,10 @@ class OpenTacApi(ApiBase):
         }
         self._estimator_audit_index = 0
         self._private_force_audit_index = 0
+        self._last_private_audit_step = None
         self._publish_diagnostics()
+        if self._private_force_audit_enabled():
+            self._register_observers()
 
     def get_tactile_tension_control_contract(self) -> dict[str, Any]:
         """Return the public local-control contract for the force task.
@@ -351,12 +355,13 @@ class OpenTacApi(ApiBase):
         self._observer_registered = False
 
     def _on_post_task_step(self) -> None:
-        if not self._estimator_started:
-            return
-        self._sample_estimator()
-        # The 10D response panel is a direct tactile diagnostic. It must keep
-        # advancing even when marker-flow tracking cannot emit a tension value.
-        self._publish_live_stage_response()
+        if self._estimator_started:
+            self._sample_estimator()
+            # The 10D response panel is a direct tactile diagnostic. It must keep
+            # advancing even when marker-flow tracking cannot emit a tension value.
+            self._publish_live_stage_response()
+        if self._private_force_audit_enabled():
+            self._append_private_force_audit(self._latest_estimate or self._unavailable_record())
 
     def _sample_estimator(self, *, force: bool = False) -> None:
         if not self._estimator_started or self._calibration is None:
@@ -431,7 +436,6 @@ class OpenTacApi(ApiBase):
             record["tracking"] = _public_tracking_summary(tracking)
         self._latest_estimate = record
         self._append_estimator_audit("estimate", record, features=features)
-        self._append_private_force_audit(record)
         self._publish_diagnostics()
 
     def _publish_live_stage_response(self) -> None:
@@ -492,8 +496,11 @@ class OpenTacApi(ApiBase):
             "step": step,
         }
         self._append_estimator_audit("unavailable", self._latest_estimate)
-        self._append_private_force_audit(self._latest_estimate)
         self._publish_diagnostics()
+
+    def _private_force_audit_enabled(self) -> bool:
+        config = self._runtime_config().get("private_force_audit", {})
+        return isinstance(config, dict) and bool(config.get("enabled", False))
 
     def _append_estimator_audit(
         self,
@@ -550,9 +557,13 @@ class OpenTacApi(ApiBase):
         Its rows go only to a post-execution artifact, never to generated code,
         the LLM context, stage progression, console events, or the video panel.
         """
-        config = self._runtime_config().get("private_force_audit", {})
-        if not isinstance(config, dict) or not bool(config.get("enabled", False)):
+        if not self._private_force_audit_enabled():
             return
+        config = self._runtime_config()["private_force_audit"]
+        step = self._step_count()
+        if step is not None and step == self._last_private_audit_step:
+            return
+        self._last_private_audit_step = step
         self._private_force_audit_index += 1
         stride = max(1, int(config.get("sample_stride", 1)))
         if self._private_force_audit_index % stride:
@@ -560,6 +571,7 @@ class OpenTacApi(ApiBase):
 
         true_tension: float | None = None
         true_tension_source: str | None = None
+        scorer: dict[str, Any] = {}
         audit_error: str | None = None
         reader = getattr(self._env, "read_private_tension_for_posthoc_audit", None)
         if callable(reader):
@@ -567,12 +579,17 @@ class OpenTacApi(ApiBase):
                 private = reader()
                 if not isinstance(private, dict):
                     raise RuntimeError("private tension reader returned a non-mapping")
+                if private.get("step") is not None and private["step"] != step:
+                    raise RuntimeError("private tension reader returned a different step")
                 value = private.get("true_tension_N")
                 if value is None or not np.isfinite(float(value)):
                     raise RuntimeError("private tension reader returned a non-finite value")
                 true_tension = float(value)
                 source = private.get("source")
                 true_tension_source = str(source) if source is not None else None
+                scorer = private.get("scorer", {})
+                if not isinstance(scorer, dict):
+                    scorer = {}
             except Exception as exc:
                 # Audit availability must not change a live trial outcome.
                 audit_error = str(exc)
@@ -592,11 +609,24 @@ class OpenTacApi(ApiBase):
         if estimated_tension is not None and true_tension is not None:
             error = estimated_tension - true_tension
         contract = self.get_tactile_tension_control_contract()
+        sample_step = estimate.get("sample_step")
+        sample_age = (
+            max(0, step - sample_step)
+            if isinstance(step, int) and isinstance(sample_step, int)
+            else None
+        )
+        if sample_age is not None and sample_age > int(contract["max_estimate_age_steps"]):
+            estimate_available = False
+            estimated_tension = None
+            error = None
+        bands = contract["stage_bands_N"]
         payload: dict[str, Any] = {
-            "schema_version": "opentac_tension_calibration_audit.v1",
+            "schema_version": "opentac_tension_calibration_audit.v2",
             "source": "private_physics_posthoc_only",
             "audit_index": self._private_force_audit_index,
-            "step": self._step_count(),
+            "step": step,
+            "sample_step": sample_step,
+            "estimate_age_steps": sample_age,
             "action_count": int(getattr(self._env, "get_action_count", lambda: 0)()),
             "estimator": {
                 "mode": self._estimator_mode_name or self._estimator_mode(),
@@ -608,7 +638,16 @@ class OpenTacApi(ApiBase):
             "true_tension_source": true_tension_source,
             "error_N": error,
             "absolute_error_N": None if error is None else abs(error),
-            "evaluation_bands_N": contract["stage_bands_N"],
+            "evaluation_bands_N": bands,
+            "true_in_bands": [
+                low <= true_tension <= high if true_tension is not None else None
+                for low, high in bands
+            ],
+            "estimated_in_bands": [
+                low <= estimated_tension <= high if estimated_tension is not None else None
+                for low, high in bands
+            ],
+            "physical_scorer": _jsonable(scorer),
             "status": (
                 "paired"
                 if error is not None

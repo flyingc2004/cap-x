@@ -19,6 +19,32 @@ from capx.integrations.univtac.rgbd_perception import (
 )
 
 
+def test_private_tension_audit_reuses_current_task_measurement() -> None:
+    scorer = types.SimpleNamespace(snapshot=lambda: {
+        "stage_index": 0,
+        "current_continuous_hold_seconds": 1.25,
+        "completed_steps": [],
+    })
+    task = types.SimpleNamespace(
+        strap=object(),
+        resultant=object(),
+        upper_mask=object(),
+        measured={"tension_N": 12.1},
+        _measure_step=42,
+        _stage_scorer=scorer,
+        _grip_released=True,
+    )
+    env = types.SimpleNamespace(_task=task, get_step_count=lambda: 42)
+
+    result = UniVTACLowLevelEnv.read_private_tension_for_posthoc_audit(env)
+
+    assert result["step"] == 42
+    assert result["true_tension_N"] == pytest.approx(12.1)
+    assert result["source"] == "task_cached_physics_measurement"
+    assert result["scorer"]["current_continuous_hold_seconds"] == pytest.approx(1.25)
+    assert result["scorer"]["grasped"] is True
+
+
 def _frame(*, valid_depth: bool = True) -> RgbdFrame:
     depth = np.ones((8, 8), dtype=np.float32)
     if not valid_depth:

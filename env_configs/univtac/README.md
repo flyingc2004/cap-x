@@ -45,13 +45,16 @@ action recommendation. `UniVTACTactileApi` remains unchanged for UniVTAC
 tasks.
 
 Both active tension-control YAMLs enable a private **post-hoc calibration
-audit**. It is deliberately outside the LLM/API surface: each estimator sample
-is paired with the force-task physics label only after the simulator step has
-finished. A completed CaP-X trial therefore contains:
+audit**. It is deliberately outside the LLM/API surface: every post-reset
+physics step records the force-task label after the simulator step has finished.
+Before the public estimator starts, its estimate is null. A saved CaP-X trial
+therefore contains:
 
-- `opentac_tension_calibration_audit.jsonl`: one estimate/true-force pair per
-  sampled step, including `estimated_tension_N`, `true_tension_N`, signed and
-  absolute error, and availability status;
+- `opentac_tension_calibration_audit.jsonl`: one row per physics step with
+  `step`, `sample_step`, `estimate_age_steps`, `estimated_tension_N`,
+  `true_tension_N`, in-band flags, and the environment's `physical_scorer`
+  snapshot (stage index, continuous hold seconds, completed steps). This
+  identifies the exact step where a true-force hold resets;
 - `opentac_tension_calibration_audit_summary.json`: paired coverage plus
   overall and true-force-near-12N/18N MAE, RMSE, bias, and P95 absolute error.
 
