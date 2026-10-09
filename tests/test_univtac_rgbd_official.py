@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import yaml
 
-from capx.envs.tasks.exceptions import RecoverableTaskFailure
+from capx.envs.tasks.exceptions import HardStopTrial, RecoverableTaskFailure
 from capx.envs.simulators.univtac import UniVTACLowLevelEnv
 from capx.integrations.univtac.franka_compat_api import UniVTACFrankaCompatApi
 from capx.integrations.univtac.rgbd_perception import (
@@ -514,6 +514,54 @@ def test_official_protocol_budget_and_early_stop() -> None:
     assert status["stopped"] is True
     assert status["reason"] == "early_stop"
     assert env.protocol_action_allowed() is False
+
+
+def test_wait_steps_applies_official_protocol_checks() -> None:
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._official_task_protocol = True
+    env._protocol_stopped = False
+    env._protocol_stop_reason = None
+    env.max_steps = 300
+    env._task = types.SimpleNamespace(
+        take_action_cnt=0,
+        step_count=1,
+        logger=None,
+        eval_success=False,
+        delay=lambda *_args, **_kwargs: None,
+        check_success=lambda: False,
+        check_early_stop=lambda: True,
+    )
+    env._update_after_action = lambda: None
+
+    with pytest.raises(RuntimeError, match="native task protocol stopped: early_stop"):
+        env.wait_steps(1)
+
+    assert env._protocol_stop_reason == "early_stop"
+
+
+def test_wait_steps_enforces_adapter_trial_deadline() -> None:
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._official_task_protocol = True
+    env._protocol_stopped = False
+    env._protocol_stop_reason = None
+    env._trial_deadline_time = 0.0
+    env._trial_deadline_seconds = 7.0
+    env._code_block_action_start = None
+    env._code_block_action_limit = None
+    env._code_block_index = None
+    env.max_steps = 300
+    env._task = types.SimpleNamespace(
+        take_action_cnt=0,
+        plan_success=True,
+        delay=lambda *_args, **_kwargs: pytest.fail(
+            "deadline must stop before task.delay"
+        ),
+    )
+
+    with pytest.raises(HardStopTrial, match="trial deadline reached before wait_steps"):
+        env.wait_steps(1)
+
+    assert env._protocol_stop_reason == "trial_timeout"
 
 
 def test_perception_artifacts_are_saved_under_trial_directory(tmp_path) -> None:

@@ -29,6 +29,7 @@ class _ObserverEnv:
         self.post_step: dict[str, Any] = {}
         self.post_action: dict[str, Any] = {}
         self.trace: list[dict[str, Any]] = []
+        self.estimator_trace: list[dict[str, Any]] = []
         self.diagnostics: dict[str, Any] = {}
 
     def get_step_count(self) -> int:
@@ -48,6 +49,15 @@ class _ObserverEnv:
 
     def append_tactile_working_memory_trace(self, record: dict[str, Any]) -> None:
         self.trace.append(record)
+
+    def append_opentac_tension_estimator_trace(self, record: dict[str, Any]) -> None:
+        self.estimator_trace.append(record)
+
+    def get_robot_state(self) -> dict[str, Any]:
+        return {"ee_pos": [0.5, 0.0, 0.2], "gripper_qpos": 0.01}
+
+    def get_action_count(self) -> int:
+        return self.step
 
     def set_opentac_tension_estimator_diagnostics(self, record: dict[str, Any]) -> None:
         self.diagnostics = record
@@ -138,6 +148,15 @@ def test_control_contract_exposes_exact_stage_bands(monkeypatch) -> None:
     assert contract["sampling_cadence_seconds"] == pytest.approx(
         contract["observation_wait_steps"] * contract["observation_dt_s"]
     )
+    assert contract["force_filter_time_constant_s"] == pytest.approx(0.15)
+    assert contract["force_filter_alpha"] == pytest.approx(
+        1.0
+        - np.exp(
+            -contract["sampling_cadence_seconds"]
+            / contract["force_filter_time_constant_s"]
+        )
+    )
+    assert contract["controller_deadband_N"] == pytest.approx(0.02)
     assert "stage_tolerance_N" not in contract
     assert "max_control_actions_per_stage" not in contract
     assert "max_consecutive_invalid_samples" not in contract
@@ -187,6 +206,26 @@ def test_multiple_steps_in_one_action_keep_marker_updates_incremental(monkeypatc
     assert estimate["available"] is True
     assert estimate["estimated_tension_N"] == 12.0
     assert api._tracker.update_count == 3
+
+
+def test_estimator_audit_is_public_bounded_and_contains_motion_context(monkeypatch) -> None:
+    env = _ObserverEnv()
+    env.api_configs["opentac_api"]["estimator_audit_stride"] = 2
+    api = _api(monkeypatch, env)
+
+    api.begin_tactile_tension_estimator()
+    for tension in (8.0, 12.0, 18.0):
+        env.tick(tension)
+
+    assert env.estimator_trace[0]["event"] == "baseline"
+    samples = [item for item in env.estimator_trace if item["event"] == "estimate"]
+    assert len(samples) == 1
+    sample = samples[0]
+    assert sample["estimate"]["estimated_tension_N"] == 12.0
+    assert sample["robot"]["ee_pos"] == [0.5, 0.0, 0.2]
+    assert sample["robot"]["gripper_qpos"] == 0.01
+    assert sample["marker_flow_features"] == [12.0]
+    assert "true_tension" not in sample
 
 
 def test_tracking_unavailable_is_only_a_temporary_numeric_observation(monkeypatch) -> None:

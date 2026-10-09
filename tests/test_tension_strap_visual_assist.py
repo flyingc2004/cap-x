@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import yaml
 
 from capx.envs.trial import (
@@ -149,9 +150,20 @@ def test_visual_yaml_keeps_numerical_stage_authority() -> None:
         "get_tactile_tension_estimate",
         "capture_tactile_stage_response",
     ]
+    assert low_level["api_configs"]["opentac_api"]["tension_estimator_mode"] == (
+        "public_depth_marker_regression_v1"
+    )
+    assert low_level["api_configs"]["opentac_api"]["tension_calibration_path"].endswith(
+        "tension_calibration/tension_strap_public_tactile_force_69seed.v1.json"
+    )
     assert "get_tactile_stage_memory" not in prompt
     assert config["use_visual_feedback"] is True
     assert config["visual_feedback_require_image_input"] is True
+    assert low_level["video_stream_fps"] == pytest.approx(15.0)
+    assert low_level["task_config_overrides"]["runtime_task_mode"] == "eval_test"
+    assert low_level["task_config_overrides"]["render_frequency"] == 2
+    assert low_level["task_config_overrides"]["video_frequency"] == 0
+    assert low_level["task_config_overrides"]["video_frame_stride"] == 8
     assert config["visual_checkpoint_markers"] == ["grasp_ready", "hold_12n_complete"]
     assert "Do not use an image to estimate Newtons or decide that a stage is complete" in prompt
     assert "Do not invent arbitrary per-stage action-count limits" in prompt

@@ -1,0 +1,42 @@
+{
+  "schema_version": "tension_strap_tactile_force_calibration.v1",
+  "calibration_id": "tension_strap_public_tactile_force_69seed.v1",
+  "input_contract": {
+    "public_inputs": ["bilateral tactile depth", "bilateral marker coordinates"],
+    "excludes": ["true tension", "actor state", "extension", "reward", "success", "time"],
+    "feature_schema_version": "tension_strap_marker_depth_force_features.v1",
+    "far_plane_mm": 34.0,
+    "feature_transform": "robust_median_iqr_then_linear_and_square"
+  },
+  "feature_names": [
+    "left_indentation_p98_mm", "left_marker_mean_dx_px", "left_marker_mean_dy_px", "left_marker_median_dx_px", "left_marker_median_dy_px", "left_marker_mean_displacement_px", "left_marker_p90_displacement_px", "left_marker_coherence", "left_marker_row_gradient_dx_px", "left_marker_row_gradient_dy_px", "left_marker_column_gradient_dx_px", "left_marker_column_gradient_dy_px", "left_marker_log_anisotropy",
+    "right_indentation_p98_mm", "right_marker_mean_dx_px", "right_marker_mean_dy_px", "right_marker_median_dx_px", "right_marker_median_dy_px", "right_marker_mean_displacement_px", "right_marker_p90_displacement_px", "right_marker_coherence", "right_marker_row_gradient_dx_px", "right_marker_row_gradient_dy_px", "right_marker_column_gradient_dx_px", "right_marker_column_gradient_dy_px", "right_marker_log_anisotropy"
+  ],
+  "scaler": {
+    "median": [6.394466552734375, 8.86094355583191, 0.2497820407152176, 9.778678894042969, 0.07363128662109375, 12.323999571169196, 21.445357873331332, 0.6926403523280413, 0.5481571318611262, 10.648006197005984, 11.942686045228555, 0.5710837904455627, 0.3323111647178467, 6.8344080352783205, -4.180479109287262, 1.7181598246097565, -5.734748840332031, 1.5996780395507812, 10.8492047786497, 18.042693109171623, 0.39988479114695996, 0.7927771447196834, 10.078978644476997, 14.563380589978449, 0.6257324199958387, 0.5920913102148989],
+    "iqr": [0.09513446807861303, 5.75766858458519, 0.08610096573829651, 6.329158782958984, 0.07361793518066406, 7.360067570859602, 11.28057362741741, 0.0787564473892004, 0.27176122816782167, 7.6106426148187545, 5.859033977339418, 0.610899249673477, 0.21586711683400434, 0.02120620727539091, 4.881084524095058, 0.134600430727005, 5.093379974365234, 0.13982391357421875, 6.006392938849409, 10.703818589249078, 0.17536131118345744, 0.11895964259193026, 6.234702360062373, 6.345467161545024, 0.17352561950683587, 0.2611690656766019]
+  },
+  "regression": {
+    "ridge_alpha": 0.01,
+    "bias": 10.603250716318573,
+    "weights": [-0.40575119956729944, 0.4601309335980999, -0.07393557300274654, 0.20362997779158443, 0.002292329349767941, 0.043544037532356486, 0.3768054237103067, 0.9679583735138667, -0.09594088549767132, -0.016085964497696902, 0.03697539469271634, 0.2977269638080114, -0.7653644571562879, -0.03733602955958844, -1.3352763123897988, 0.23465362856596336, -1.2136162819986238, 0.011199703406698408, 0.07261645833906494, 0.3358230162667501, 1.8064105407283497, -0.13497343093746406, 0.04405372066703668, 0.01216453489771295, 0.0230301538004832, -0.5504279772617664, 0.23542375695586415, -0.2507321187716867, -0.001725641320004091, 0.2985541793533218, -0.0016150330035272548, -0.03074884031379921, 0.4128199632793846, -0.15808914052435935, 0.22561291004195824, 0.02213979751172661, 0.2834742076909469, -0.03362586087773513, 0.00637726063726289, -0.045367191864936436, 0.27878458407215817, -0.029576939861549682, 0.022124030277202226, -0.0082143784321002, 0.2207264088530515, 0.5848594051435609, 0.38696176586641706, 0.05844043229169481, 0.16714165643970383, 0.025652712614901405, -0.07216053923781948, -0.13312110110643136]
+  },
+  "training": {
+    "accepted_seeds": [1000, 1001, 1002, 1003, 1004, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 1032, 1033, 1034, 1035, 1036, 1037, 1038, 1039, 1040, 1041, 1042, 1043, 1044, 1045, 1046, 1047, 1048, 1049, 1050, 1051, 1052, 1053, 1054, 1055, 1056, 1057, 1058, 1059, 1060, 1061, 1062, 1063, 1064, 1065, 1066, 1067, 1068, 1069, 1070, 1071],
+    "samples": 8375,
+    "sampling": {
+      "force_range_N": [0.25, 20.0],
+      "force_bin_width_N": 1.0,
+      "max_samples_per_seed_force_bin": 12,
+      "reason": "prevent 60 Hz episodes and prolonged hold plateaus from dominating 12 Hz episodes"
+    }
+  },
+  "held_out_evaluation": {
+    "protocol": "seed % 5 == 0, trained without held-out seeds before scoring",
+    "mae_N": 0.005708,
+    "rmse_N": 0.008587,
+    "p95_absolute_error_N": 0.016049,
+    "scope": "expert-grasp distribution only; not an arbitrary CaP-X grasp generalization claim"
+  },
+  "private_label_use": "offline supervision only; no labels or true force values are stored in this sidecar"
+}

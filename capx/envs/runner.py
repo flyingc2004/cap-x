@@ -349,18 +349,20 @@ def _run_single_trial_with_timeout(
     raise_on_timeout: bool = False,
 ) -> TrialSummary:
     """Run a single trial with a wall-clock timeout via SIGALRM."""
-    timeout_seconds = max(1, int(timeout_s))
+    timeout_seconds = max(0, int(timeout_s))
     timed_out = False
 
     def _timeout_handler(signum: int, frame) -> None:  # type: ignore[override]
         nonlocal timed_out
         timed_out = True
-        raise TimeoutError(f"Trial {trial} exceeded {timeout_seconds} seconds")
+        if timeout_seconds:
+            raise TimeoutError(f"Trial {trial} exceeded {timeout_seconds} seconds")
+        raise TimeoutError(f"Trial {trial} model request exceeded its hard deadline")
 
     previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(timeout_seconds)
     set_deadline = getattr(env, "set_trial_deadline", None)
-    if callable(set_deadline):
+    if timeout_seconds and callable(set_deadline):
         set_deadline(max(1, timeout_seconds - 2))
     partial_artifacts: dict[str, Any] = {}
     try:
@@ -368,19 +370,22 @@ def _run_single_trial_with_timeout(
             env, trial, args, config, multi_turn_prompt, partial_artifacts=partial_artifacts
         )
     except KeyboardInterrupt as exc:
-        # A manual interrupt is common while inspecting a long Isaac run.  The
-        # simulator has already accumulated frames in memory, so flush them
-        # before propagating Ctrl-C and stopping the batch.
-        print(
-            f"[capx-runner] Ctrl-C received during trial {trial}; "
-            "saving partial artifacts before exit...",
-            flush=True,
-        )
-        _build_interrupted_summary(env, trial, partial_artifacts, config, exc)
-        print(
-            f"[capx-runner] trial {trial} partial artifacts saved; exiting with code 130",
-            flush=True,
-        )
+        # timeout --foreground can forward the same terminal SIGINT a second
+        # time. Mask it before logging or constructing the partial summary.
+        previous_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            print(
+                f"[capx-runner] Ctrl-C received during trial {trial}; "
+                "saving partial artifacts before exit...",
+                flush=True,
+            )
+            _build_interrupted_summary(env, trial, partial_artifacts, config, exc)
+            print(
+                f"[capx-runner] trial {trial} partial artifacts saved; exiting with code 130",
+                flush=True,
+            )
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
         raise
     except LLMQueryError as exc:
         print(
@@ -416,7 +421,10 @@ def _run_single_trial_with_timeout(
         if raise_on_timeout:
             raise TimeoutError(f"Trial {trial} timed out") from exc
 
-        print(f"Trial {trial} timed out after {timeout_seconds} seconds")
+        if timeout_seconds:
+            print(f"Trial {trial} timed out after {timeout_seconds} seconds")
+        else:
+            print(f"Trial {trial} model request timed out")
         return _build_timeout_summary(env, trial, timeout_seconds, partial_artifacts, config, exc)
     finally:
         signal.alarm(0)
@@ -443,7 +451,11 @@ def _build_timeout_summary(
         exc,
         sandbox_rc=1,
         truncated=False,
-        prefix=f"Trial {trial} timed out after {timeout_seconds} seconds.",
+        prefix=(
+            f"Trial {trial} timed out after {timeout_seconds} seconds."
+            if timeout_seconds
+            else f"Trial {trial} model request timed out."
+        ),
         error_label="Timeout Error",
         video_suffix="timeout",
     )
@@ -510,49 +522,53 @@ def _build_aborted_summary(
         prefix=prefix,
     )
 
-    code_path = _save_trial_artifacts(
-        config, trial,
-        sandbox_rc=sandbox_rc,
-        reward=reward,
-        task_completed=info_step.get("task_completed", False),
-        final_code=final_code,
-        raw_code=raw_code,
-        all_responses=pa.get("all_responses", []),
-        log_lines=log_lines,
-        visual_feedback_imgs=pa.get("visual_feedback_imgs", []),
-        ensemble_data=pa.get("ensemble_data"),
-        multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
-        llm_usage_events=pa.get("llm_usage_events", []),
-    )
-    _save_visual_checkpoint_artifacts(
-        code_path,
-        pa.get("visual_checkpoint_records", []),
-    )
-    # Ignore repeated Ctrl-C while serializing the buffered frames.  The first
-    # interrupt has already been handled; a second should not corrupt the only
-    # copy of the partial video.
+    # Ignore repeated Ctrl-C for the entire save, and close the video writer
+    # first. An open MP4 has no moov atom and cannot be played after exit.
+    code_path: str | None = None
     previous_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
-        if config.get("record_video", False):
-            turn_frame_ranges = list(pa.get("turn_frame_ranges", []))
-            current_frame_start = pa.get("current_frame_start")
-            if current_frame_start is not None and hasattr(env, "get_video_frame_count"):
-                frame_count = int(env.get_video_frame_count())
-                start = int(current_frame_start)
-                if frame_count > start and (
-                    not turn_frame_ranges or turn_frame_ranges[-1] != (start, frame_count)
-                ):
-                    turn_frame_ranges.append((start, frame_count))
+        try:
+            if config.get("record_video", False):
+                turn_frame_ranges = list(pa.get("turn_frame_ranges", []))
+                current_frame_start = pa.get("current_frame_start")
+                if current_frame_start is not None and hasattr(env, "get_video_frame_count"):
+                    frame_count = int(env.get_video_frame_count())
+                    start = int(current_frame_start)
+                    if frame_count > start and (
+                        not turn_frame_ranges or turn_frame_ranges[-1] != (start, frame_count)
+                    ):
+                        turn_frame_ranges.append((start, frame_count))
 
-            if pa.get("recording_frames", False) and turn_frame_ranges:
-                _save_turn_and_combined_videos(
-                    env, config, trial, info_step, reward, turn_frame_ranges,
-                )
-            else:
-                _save_trial_video(
-                    env, config, trial, info_step, reward, num_code_blocks,
-                    suffix_extra=video_suffix,
-                )
+                if pa.get("recording_frames", False) and turn_frame_ranges:
+                    _save_turn_and_combined_videos(
+                        env, config, trial, info_step, reward, turn_frame_ranges,
+                    )
+                else:
+                    _save_trial_video(
+                        env, config, trial, info_step, reward, num_code_blocks,
+                        suffix_extra=video_suffix,
+                    )
+        except Exception as artifact_exc:
+            print(f"WARNING: Failed to save interrupted trial video: {artifact_exc}")
+
+        code_path = _save_trial_artifacts(
+            config, trial,
+            sandbox_rc=sandbox_rc,
+            reward=reward,
+            task_completed=info_step.get("task_completed", False),
+            final_code=final_code,
+            raw_code=raw_code,
+            all_responses=pa.get("all_responses", []),
+            log_lines=log_lines,
+            visual_feedback_imgs=pa.get("visual_feedback_imgs", []),
+            ensemble_data=pa.get("ensemble_data"),
+            multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
+            llm_usage_events=pa.get("llm_usage_events", []),
+        )
+        _save_visual_checkpoint_artifacts(
+            code_path,
+            pa.get("visual_checkpoint_records", []),
+        )
         _save_tactile_artifacts(env, config, trial, info_step, reward)
         _save_env_debug_artifacts(env, config, trial, info_step, reward)
         trace = pa.get("tactile_code_memory_trace", [])

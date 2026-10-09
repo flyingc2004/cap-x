@@ -17,6 +17,12 @@ import numpy as np
 from capx.envs.base import BaseEnv
 from capx.integrations.base_api import ApiBase
 from capx.integrations.univtac.native_tactile import summarize_tactile_stage_response
+from capx.integrations.opentac.public_force_calibration import (
+    ESTIMATOR_MODE as PUBLIC_DEPTH_MARKER_REGRESSION,
+    extract_public_tactile_force_features,
+    predict_public_tactile_force,
+    validate_public_force_calibration,
+)
 
 
 _STAGE_MEMORY_SCHEMA = "tactile_stage_memory.v1"
@@ -28,10 +34,12 @@ _CONTROL_SCHEMA = "opentac_tension_control_contract.v1"
 class OpenTacApi(ApiBase):
     """Public tactile sensing and frozen response memory for ViTaForge.
 
-    ``estimated_tension_N`` is computed only from public GelSight marker-RGB
-    observations and the configured calibration sidecar.  The API never reads
-    the task's true tension, physical scorer, reward, success, actor state, or
-    private metadata.
+    ``estimated_tension_N`` is computed only from configured public GelSight
+    observations and a frozen calibration sidecar. Public API methods never
+    read or expose the task's true tension, physical scorer, reward, success,
+    actor state, or private metadata. When explicitly configured, a separate
+    post-step evaluator writes estimate-vs-physics pairs to a private artifact;
+    that audit path is not an API function and never affects control.
     """
 
     def __init__(self, env: BaseEnv) -> None:
@@ -46,6 +54,9 @@ class OpenTacApi(ApiBase):
         self._tracker: Any | None = None
         self._reference_images: dict[str, np.ndarray] | None = None
         self._calibration: dict[str, Any] | None = None
+        self._estimator_started = False
+        self._estimator_mode_name: str | None = None
+        self._calibration_id: str | None = None
         self._observer_name = f"opentac_tension_estimator_{id(self)}"
         self._observer_registered = False
         self._latest_estimate: dict[str, Any] | None = None
@@ -58,6 +69,8 @@ class OpenTacApi(ApiBase):
             "invalid_sample_count": 0,
             "last_failure": None,
         }
+        self._estimator_audit_index = 0
+        self._private_force_audit_index = 0
 
     def functions(self) -> dict[str, Any]:
         full = {
@@ -82,6 +95,9 @@ class OpenTacApi(ApiBase):
         self._tracker = None
         self._reference_images = None
         self._calibration = None
+        self._estimator_started = False
+        self._estimator_mode_name = None
+        self._calibration_id = None
         self._latest_estimate = None
         self._last_observed_step = None
         self._stage_memory_cache = None
@@ -90,6 +106,8 @@ class OpenTacApi(ApiBase):
             "invalid_sample_count": 0,
             "last_failure": None,
         }
+        self._estimator_audit_index = 0
+        self._private_force_audit_index = 0
         self._publish_diagnostics()
 
     def get_tactile_tension_control_contract(self) -> dict[str, Any]:
@@ -111,6 +129,9 @@ class OpenTacApi(ApiBase):
         stage_tolerance = float(config.get("stage_tolerance_N", 0.5))
         observation_wait_steps = int(config.get("observation_wait_steps", 2))
         observation_dt_s = float(config.get("observation_dt_s", 1.0 / 60.0))
+        filter_time_constant_s = float(config.get("force_filter_time_constant_s", 0.15))
+        controller_deadband_N = float(config.get("controller_deadband_N", 0.02))
+        sampling_cadence_seconds = observation_wait_steps * observation_dt_s
         contract = {
             "schema_version": _CONTROL_SCHEMA,
             "control_frame": "world",
@@ -121,9 +142,14 @@ class OpenTacApi(ApiBase):
             # Stable agent-facing aliases. Earlier prompts described a
             # sampling cadence but exposed only its component factors.
             "sampling_cadence_steps": observation_wait_steps,
-            "sampling_cadence_seconds": observation_wait_steps * observation_dt_s,
+            "sampling_cadence_seconds": sampling_cadence_seconds,
             "stage_hold_seconds": float(config.get("stage_hold_seconds", 3.0)),
             "estimator_settle_steps": int(config.get("estimator_settle_steps", 30)),
+            "force_filter_time_constant_s": filter_time_constant_s,
+            "force_filter_alpha": float(
+                1.0 - np.exp(-sampling_cadence_seconds / filter_time_constant_s)
+            ),
+            "controller_deadband_N": controller_deadband_N,
             "proportional_delta_gain_m_per_N": float(
                 config.get("proportional_delta_gain_m_per_N", 1.0 / 120000.0)
             ),
@@ -142,6 +168,8 @@ class OpenTacApi(ApiBase):
             or contract["estimator_settle_steps"] < 1
             or contract["proportional_delta_gain_m_per_N"] <= 0.0
             or contract["observation_dt_s"] <= 0.0
+            or contract["force_filter_time_constant_s"] <= 0.0
+            or contract["controller_deadband_N"] < 0.0
             or stage_tolerance <= 0.0
             or contract["estimator_update_stride"] < 1
             or contract["max_estimate_age_steps"] < 0
@@ -152,11 +180,11 @@ class OpenTacApi(ApiBase):
         return _jsonable(contract)
 
     def begin_tactile_tension_estimator(self) -> dict[str, Any]:
-        """Capture a marker-RGB baseline after the agent has secured the strap."""
-        # Repeated calls preserve the marker baseline.  The API has no notion
+        """Start public tactile force estimation after the agent secures the strap."""
+        # Repeated calls preserve the estimator state. The API has no notion
         # of control-stage progress; whether to resume, regrasp, or stop is
         # owned entirely by generated agent code.
-        if self._tracker is not None:
+        if self._estimator_started:
             return _jsonable(
                 {
                     "schema_version": _ESTIMATE_SCHEMA,
@@ -164,35 +192,52 @@ class OpenTacApi(ApiBase):
                     "step": self._step_count(),
                 }
             )
-        images = self._read_marker_images()
         calibration = self._load_tension_calibration()
-        utilities = self._force_task_utilities()
-        try:
-            tracker = utilities.MarkerFlowTracker(images)
-        except Exception as exc:
-            raise RuntimeError(f"OpenTac could not initialize marker tracking: {exc}") from exc
-        self._reference_images = images
+        mode = self._estimator_mode()
+        sensor_keys: list[str]
+        if mode == PUBLIC_DEPTH_MARKER_REGRESSION:
+            observations = self._read_public_tactile_observations()
+            try:
+                extract_public_tactile_force_features(
+                    (observations["left_tactile"]["depth"], observations["right_tactile"]["depth"]),
+                    (observations["left_tactile"]["marker"], observations["right_tactile"]["marker"]),
+                    far_plane_mm=float(calibration["far_plane_mm"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(f"OpenTac public depth/marker estimator is not ready: {exc}") from exc
+            sensor_keys = sorted(observations)
+        else:
+            images = self._read_marker_images()
+            utilities = self._force_task_utilities()
+            try:
+                self._tracker = utilities.MarkerFlowTracker(images)
+            except Exception as exc:
+                raise RuntimeError(f"OpenTac could not initialize marker tracking: {exc}") from exc
+            self._reference_images = images
+            sensor_keys = sorted(images)
         self._calibration = calibration
-        self._tracker = tracker
-        # A baseline establishes marker identities; it is not itself a flow
-        # sample. Updating a temporal tracker against the identical baseline
-        # image would consume its first coarse-flow update and make the first
-        # physical motion use only the fragile local correspondence search.
+        self._estimator_started = True
+        self._estimator_mode_name = mode
+        self._calibration_id = str(calibration.get("calibration_id", mode))
+        # A marker-RGB baseline establishes marker identities; it is not a
+        # flow sample. The public depth/marker regression has no temporal
+        # baseline and instead validates a complete bilateral observation.
         self._latest_estimate = self._baseline_pending_record()
         self._last_observed_step = self._step_count()
         self._register_observers()
         record = {
             "schema_version": _ESTIMATE_SCHEMA,
             "started": True,
-            "sensor_keys": sorted(images),
+            "sensor_keys": sensor_keys,
             "step": self._step_count(),
         }
         self._trace("tension_estimator_begin", record)
+        self._append_estimator_audit("baseline", record)
         self._publish_diagnostics()
         return _jsonable(record)
 
     def get_tactile_tension_estimate(self) -> dict[str, Any]:
-        """Estimate strap tension from public marker-RGB flow and calibration.
+        """Estimate strap tension from public tactile observations.
 
         Call :meth:`begin_tactile_tension_estimator` once after a bilateral
         grasp.  A returned estimate is an observation-model output, not the
@@ -200,7 +245,7 @@ class OpenTacApi(ApiBase):
         usable, ``available`` is false and ``estimated_tension_N`` is null;
         the API does not count failures or prescribe a recovery policy.
         """
-        if self._tracker is None or self._calibration is None or self._reference_images is None:
+        if not self._estimator_started or self._calibration is None:
             raise RuntimeError("call begin_tactile_tension_estimator() after grasping first")
         record = dict(self._latest_estimate or self._unavailable_record())
         age_steps = self._estimate_age_steps(record)
@@ -282,10 +327,10 @@ class OpenTacApi(ApiBase):
 
     def runtime_memory_context(self, max_chars: int = 4000) -> str:
         """Return only the latest public numeric estimate for recovery context."""
-        latest = self.get_tactile_tension_estimate() if self._tracker is not None else None
+        latest = self.get_tactile_tension_estimate() if self._estimator_started else None
         context = {
             "schema_version": _ESTIMATE_SCHEMA,
-            "estimator_active": self._tracker is not None,
+            "estimator_active": self._estimator_started,
             "latest_estimate": latest,
         }
         text = json.dumps(_jsonable(context), ensure_ascii=False, separators=(",", ":"))
@@ -306,7 +351,7 @@ class OpenTacApi(ApiBase):
         self._observer_registered = False
 
     def _on_post_task_step(self) -> None:
-        if self._tracker is None:
+        if not self._estimator_started:
             return
         self._sample_estimator()
         # The 10D response panel is a direct tactile diagnostic. It must keep
@@ -314,7 +359,7 @@ class OpenTacApi(ApiBase):
         self._publish_live_stage_response()
 
     def _sample_estimator(self, *, force: bool = False) -> None:
-        if self._tracker is None or self._calibration is None or self._reference_images is None:
+        if not self._estimator_started or self._calibration is None:
             return
         step = self._step_count()
         if step is not None and self._last_observed_step == step and not force:
@@ -326,16 +371,37 @@ class OpenTacApi(ApiBase):
         if step is not None:
             self._last_observed_step = step
         try:
-            images = self._read_marker_images()
-            utilities = self._force_task_utilities()
-            features, tracking = utilities.tracked_flow_rgb_features(
-                self._reference_images,
-                images,
-                self._tracker,
-            )
-            estimate = float(utilities.predict_calibrated(self._calibration, features))
+            mode = self._estimator_mode_name or self._estimator_mode()
+            if mode == PUBLIC_DEPTH_MARKER_REGRESSION:
+                observations = self._read_public_tactile_observations()
+                features = extract_public_tactile_force_features(
+                    (observations["left_tactile"]["depth"], observations["right_tactile"]["depth"]),
+                    (observations["left_tactile"]["marker"], observations["right_tactile"]["marker"]),
+                    far_plane_mm=float(self._calibration["far_plane_mm"]),
+                )
+                estimate = predict_public_tactile_force(self._calibration, features)
+                tracking = {
+                    "feature_dimension": int(features.size),
+                    "input": "public_depth_marker",
+                }
+            else:
+                if self._tracker is None or self._reference_images is None:
+                    raise RuntimeError("marker-RGB estimator has no initialized tracker")
+                images = self._read_marker_images()
+                utilities = self._force_task_utilities()
+                features, tracking = utilities.tracked_flow_rgb_features(
+                    self._reference_images,
+                    images,
+                    self._tracker,
+                )
+                estimate = float(utilities.predict_calibrated(self._calibration, features))
         except Exception as exc:
-            self._record_invalid_estimate("tracking_unavailable", str(exc), step)
+            status = (
+                "public_tactile_unavailable"
+                if (self._estimator_mode_name or self._estimator_mode()) == PUBLIC_DEPTH_MARKER_REGRESSION
+                else "tracking_unavailable"
+            )
+            self._record_invalid_estimate(status, str(exc), step)
             return
 
         if not np.isfinite(estimate):
@@ -347,16 +413,25 @@ class OpenTacApi(ApiBase):
             self._tracker_debug["valid_sample_count"]
         ) + 1
         self._tracker_debug["last_failure"] = None
+        mode = self._estimator_mode_name or self._estimator_mode()
         record = {
             "schema_version": _ESTIMATE_SCHEMA,
             "available": True,
             "estimated_tension_N": float(estimate),
-            "tracking": _public_tracking_summary(tracking),
             "estimate_id": f"estimate_{self._estimate_count:03d}",
             "sample_step": step,
             "step": step,
         }
+        if mode == PUBLIC_DEPTH_MARKER_REGRESSION:
+            record["measurement"] = {
+                "mode": mode,
+                "feature_dimension": int(np.asarray(features).size),
+            }
+        else:
+            record["tracking"] = _public_tracking_summary(tracking)
         self._latest_estimate = record
+        self._append_estimator_audit("estimate", record, features=features)
+        self._append_private_force_audit(record)
         self._publish_diagnostics()
 
     def _publish_live_stage_response(self) -> None:
@@ -416,7 +491,137 @@ class OpenTacApi(ApiBase):
             "sample_step": step,
             "step": step,
         }
+        self._append_estimator_audit("unavailable", self._latest_estimate)
+        self._append_private_force_audit(self._latest_estimate)
         self._publish_diagnostics()
+
+    def _append_estimator_audit(
+        self,
+        event: str,
+        estimate: dict[str, Any],
+        *,
+        features: np.ndarray | None = None,
+    ) -> None:
+        """Persist bounded public estimator evidence outside the LLM channel."""
+        append = getattr(self._env, "append_opentac_tension_estimator_trace", None)
+        if not callable(append):
+            return
+        if event == "baseline":
+            audit_index = 0
+        else:
+            self._estimator_audit_index += 1
+            audit_index = self._estimator_audit_index
+            stride = max(1, int(self._runtime_config().get("estimator_audit_stride", 10)))
+            if audit_index % stride:
+                return
+        robot_state_fn = getattr(self._env, "get_robot_state", None)
+        robot_state = robot_state_fn() if callable(robot_state_fn) else {}
+        state = robot_state if isinstance(robot_state, dict) else {}
+        payload: dict[str, Any] = {
+            "schema_version": "opentac_tension_estimator_audit.v1",
+            "event": str(event),
+            "audit_index": int(audit_index),
+            "step": self._step_count(),
+            "action_count": int(getattr(self._env, "get_action_count", lambda: 0)()),
+            "estimate": _jsonable(estimate),
+            "estimator": {
+                "mode": self._estimator_mode_name or self._estimator_mode(),
+                "calibration_id": self._calibration_id,
+            },
+            "robot": {
+                "ee_pos": state.get("ee_pos"),
+                "gripper_qpos": state.get("gripper_qpos"),
+            },
+        }
+        if features is not None:
+            values = np.asarray(features, dtype=float).reshape(-1)
+            if (self._estimator_mode_name or self._estimator_mode()) == PUBLIC_DEPTH_MARKER_REGRESSION:
+                payload["public_tactile_feature_dimension"] = int(values.size)
+                payload["public_tactile_feature_l2"] = float(np.linalg.norm(values))
+            else:
+                payload["marker_flow_features"] = values.tolist()
+                payload["marker_flow_feature_l2"] = float(np.linalg.norm(values))
+        append(payload)
+
+    def _append_private_force_audit(self, estimate: dict[str, Any]) -> None:
+        """Pair a public estimate with private physics only after a task step.
+
+        This evaluation hook is intentionally absent from :meth:`functions`.
+        Its rows go only to a post-execution artifact, never to generated code,
+        the LLM context, stage progression, console events, or the video panel.
+        """
+        config = self._runtime_config().get("private_force_audit", {})
+        if not isinstance(config, dict) or not bool(config.get("enabled", False)):
+            return
+        self._private_force_audit_index += 1
+        stride = max(1, int(config.get("sample_stride", 1)))
+        if self._private_force_audit_index % stride:
+            return
+
+        true_tension: float | None = None
+        true_tension_source: str | None = None
+        audit_error: str | None = None
+        reader = getattr(self._env, "read_private_tension_for_posthoc_audit", None)
+        if callable(reader):
+            try:
+                private = reader()
+                if not isinstance(private, dict):
+                    raise RuntimeError("private tension reader returned a non-mapping")
+                value = private.get("true_tension_N")
+                if value is None or not np.isfinite(float(value)):
+                    raise RuntimeError("private tension reader returned a non-finite value")
+                true_tension = float(value)
+                source = private.get("source")
+                true_tension_source = str(source) if source is not None else None
+            except Exception as exc:
+                # Audit availability must not change a live trial outcome.
+                audit_error = str(exc)
+        else:
+            audit_error = "environment has no private tension audit reader"
+
+        estimate_available = estimate.get("available") is True
+        estimated_tension: float | None = None
+        if estimate_available:
+            value = estimate.get("estimated_tension_N")
+            if value is not None and np.isfinite(float(value)):
+                estimated_tension = float(value)
+            else:
+                estimate_available = False
+
+        error: float | None = None
+        if estimated_tension is not None and true_tension is not None:
+            error = estimated_tension - true_tension
+        contract = self.get_tactile_tension_control_contract()
+        payload: dict[str, Any] = {
+            "schema_version": "opentac_tension_calibration_audit.v1",
+            "source": "private_physics_posthoc_only",
+            "audit_index": self._private_force_audit_index,
+            "step": self._step_count(),
+            "action_count": int(getattr(self._env, "get_action_count", lambda: 0)()),
+            "estimator": {
+                "mode": self._estimator_mode_name or self._estimator_mode(),
+                "calibration_id": self._calibration_id,
+            },
+            "estimate_available": estimate_available,
+            "estimated_tension_N": estimated_tension,
+            "true_tension_N": true_tension,
+            "true_tension_source": true_tension_source,
+            "error_N": error,
+            "absolute_error_N": None if error is None else abs(error),
+            "evaluation_bands_N": contract["stage_bands_N"],
+            "status": (
+                "paired"
+                if error is not None
+                else "estimate_unavailable"
+                if true_tension is not None
+                else "private_tension_unavailable"
+            ),
+        }
+        if audit_error is not None:
+            payload["audit_error"] = audit_error
+        append = getattr(self._env, "append_opentac_tension_calibration_audit", None)
+        if callable(append):
+            append(payload)
 
     def _estimate_age_steps(self, estimate: dict[str, Any]) -> int | None:
         current_step = self._step_count()
@@ -452,7 +657,9 @@ class OpenTacApi(ApiBase):
         setter(
             {
                 "schema_version": _ESTIMATE_SCHEMA,
-                "estimator_active": self._tracker is not None,
+                "estimator_active": self._estimator_started,
+                "estimator_mode": self._estimator_mode_name or self._estimator_mode(),
+                "calibration_id": self._calibration_id,
                 "latest_estimate": latest,
                 # Saved only in univtac_debug.json. This deliberately does
                 # not appear in get_tactile_tension_estimate() or the bounded
@@ -465,6 +672,30 @@ class OpenTacApi(ApiBase):
         configs = getattr(self._env, "api_configs", {})
         config = configs.get("opentac_api", {}) if isinstance(configs, dict) else {}
         return config if isinstance(config, dict) else {}
+
+    def _estimator_mode(self) -> str:
+        value = str(self._runtime_config().get("tension_estimator_mode", "marker_rgb_flow_v1"))
+        if value not in {"marker_rgb_flow_v1", PUBLIC_DEPTH_MARKER_REGRESSION}:
+            raise RuntimeError(f"unsupported OpenTac tension estimator mode: {value}")
+        return value
+
+    def _read_public_tactile_observations(self) -> dict[str, dict[str, Any]]:
+        """Read the public depth/marker pair used by the frozen 26D model."""
+        _refresh_tactile(self._env, data_types=["depth", "marker"])
+        raw_fn = getattr(self._env, "current_raw_observation", None)
+        raw = raw_fn() if callable(raw_fn) else {}
+        tactile = raw.get("tactile", {}) if isinstance(raw, dict) else {}
+        if not isinstance(tactile, dict):
+            raise RuntimeError("OpenTac requires a tactile observation mapping")
+        observations: dict[str, dict[str, Any]] = {}
+        for hand in ("left_tactile", "right_tactile"):
+            record = tactile.get(hand)
+            if not isinstance(record, dict):
+                raise RuntimeError(f"OpenTac requires {hand} observations")
+            if record.get("depth") is None or record.get("marker") is None:
+                raise RuntimeError(f"OpenTac requires public depth and marker from {hand}")
+            observations[hand] = {"depth": record["depth"], "marker": record["marker"]}
+        return observations
 
     def _read_marker_images(self) -> dict[str, np.ndarray]:
         # The tracker consumes marker RGB; the co-sampled public depth and
@@ -491,6 +722,11 @@ class OpenTacApi(ApiBase):
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"could not load OpenTac calibration from {path}: {exc}") from exc
+        if self._estimator_mode() == PUBLIC_DEPTH_MARKER_REGRESSION:
+            try:
+                return validate_public_force_calibration(payload)
+            except ValueError as exc:
+                raise RuntimeError(f"invalid OpenTac public tactile force calibration: {exc}") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("weights"), list):
             raise RuntimeError("OpenTac tension calibration has no public linear weights")
         return payload

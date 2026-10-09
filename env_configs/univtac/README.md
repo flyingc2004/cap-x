@@ -31,14 +31,33 @@ uses the public EE-z plateau/transition alignment from the expert replay; the
 retained v1 sidecar is an audit-only adjacent-window snapshot and is not used
 by the active control configuration.
 
-The sidecar contains only calibration-derived public depth/marker response
-prototypes and a pooled calibration IQR for comparable cross-stage distances.
-At runtime, the ViTaForge-specific `OpenTacApi` exposes the frozen memory, a
-public `tactile_stage_response.v1` capture, and a marker-RGB calibrated tension
-estimate. Generated code owns local Z feedback, response distance, and stage
-transitions. `OpenTacApi` never returns true tension, actor state, reward,
-success, or an action recommendation. `UniVTACTactileApi` remains unchanged
-for UniVTAC tasks.
+The stage-memory sidecar contains only calibration-derived public depth/marker
+response prototypes and a pooled calibration IQR for diagnostic display. The
+active control YAML instead uses
+`tension_calibration/tension_strap_public_tactile_force_69seed.v1.json`: a
+frozen 26D public depth/marker regression trained offline using 69 expert
+episodes. Runtime inference reads only current tactile depth and marker
+coordinates; it does not load force-label sidecars or task-private force.
+Generated code owns local Z feedback and numerical 12N/18N hold timing. The
+10D stage response remains a saved diagnostic and is not a control gate.
+`OpenTacApi` never returns true tension, actor state, reward, success, or an
+action recommendation. `UniVTACTactileApi` remains unchanged for UniVTAC
+tasks.
+
+Both active tension-control YAMLs enable a private **post-hoc calibration
+audit**. It is deliberately outside the LLM/API surface: each estimator sample
+is paired with the force-task physics label only after the simulator step has
+finished. A completed CaP-X trial therefore contains:
+
+- `opentac_tension_calibration_audit.jsonl`: one estimate/true-force pair per
+  sampled step, including `estimated_tension_N`, `true_tension_N`, signed and
+  absolute error, and availability status;
+- `opentac_tension_calibration_audit_summary.json`: paired coverage plus
+  overall and true-force-near-12N/18N MAE, RMSE, bias, and P95 absolute error.
+
+These files are for evaluator analysis only. True tension is not included in
+LLM prompts, runtime memory, public API return values, video overlays, or
+control decisions.
 
 The selected `UNIVTAC_ROOT` must point to the matching ViTaForge checkout and
 each force-task seed must run in its own process. The control entry is an

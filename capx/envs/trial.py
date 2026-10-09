@@ -62,6 +62,28 @@ if TYPE_CHECKING:
 MULTITURN_LIMIT = 10
 
 
+def _restart_action_deadline_after_reset(
+    env: CodeExecutionEnvBase, config: dict[str, Any]
+) -> int | None:
+    """Re-arm both trial clocks after an environment reset.
+
+    ``UniVTACLowLevelEnv.reset()`` deliberately clears per-episode state,
+    including its soft deadline.  The SIGALRM clock is restarted here already,
+    but the adapter clock must be restored as well: generated ``wait_steps``
+    loops do not necessarily invoke a planner action that would otherwise
+    check it.
+    """
+    remaining = signal.alarm(0)
+    if remaining <= 0:
+        return None
+    timeout_seconds = max(1, int(config.get("trial_timeout_seconds", remaining)))
+    signal.alarm(timeout_seconds)
+    set_deadline = getattr(env, "set_trial_deadline", None)
+    if callable(set_deadline):
+        set_deadline(max(1, timeout_seconds - 2))
+    return timeout_seconds
+
+
 def _visual_feedback_enabled(config: dict[str, Any], args: "LaunchArgs") -> bool:
     """Return whether this run is permitted to send direct image input."""
     return bool(config.get("use_visual_feedback", False)) and (
@@ -1494,12 +1516,9 @@ def _run_single_trial(
         )
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
     print(f"[capx-trial] trial={trial} reset end", flush=True)
-    # Reset the SIGALRM timer AFTER env.reset() so the timeout only covers
-    # actual task execution, not scene loading / cuRobo JIT compilation.
-    remaining = signal.alarm(0)  # cancel current alarm
-    if remaining > 0:
-        timeout_seconds = int(config.get("trial_timeout_seconds", remaining))
-        signal.alarm(max(1, timeout_seconds))
+    # Reset clears the low-level deadline along with task state. Re-arm both
+    # the process alarm and the adapter-side deadline after scene loading.
+    _restart_action_deadline_after_reset(env, config)
     obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
     _patch_libero_goal(env, obs)
 

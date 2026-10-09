@@ -205,49 +205,62 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
         "get_tactile_tension_control_contract",
         "begin_tactile_tension_estimator",
         "get_tactile_tension_estimate",
-        "get_tactile_stage_memory",
         "capture_tactile_stage_response",
     ]
+    assert tactile["tension_estimator_mode"] == "public_depth_marker_regression_v1"
+    assert tactile["tension_calibration_path"].endswith(
+        "tension_calibration/tension_strap_public_tactile_force_69seed.v1.json"
+    )
     prompt = config["env"]["cfg"]["prompt"]
     assert "true tension" in prompt
-    assert "pooled-calibration IQR" in prompt
+    assert "10D response is recorded" in prompt
     assert "12 N" in prompt
     assert "18 N" in prompt
     assert "[11.5, 12.5]" in prompt
     assert "Tension is a tolerance-band requirement" in prompt
     assert "Time is a strict continuous requirement" in prompt
     assert "never join separated in-band intervals" in prompt
-    assert 'memory["stages"]' in prompt
-    assert 'stage["memory_id"]' in prompt
-    assert 'stage["response_blocks"]' in prompt
+    assert 'memory["stages"]' not in prompt
+    assert 'stage["memory_id"]' not in prompt
+    assert 'stage["response_blocks"]' not in prompt
     assert "Every submitted or regenerated code block must be independently executable" in prompt
     assert "already injected as top-level Python functions" in prompt
     assert "Do not import API modules" in prompt
     assert "physical scorer" in OpenTacApi.__doc__
     assert "public target bands" in prompt
+    assert "A move_delta already advances one native control cadence" in prompt
+    assert "Do not create a local sample, retry, action, or iteration cap" in prompt
     assert "stage_bands_N" in prompt
     assert "do not derive another band" in prompt
     assert "adapter does not track stage progress" in prompt.lower()
     assert tactile["estimator_update_stride"] == 1
     assert tactile["estimator_settle_steps"] == 30
+    assert tactile["force_filter_time_constant_s"] == pytest.approx(0.15)
+    assert tactile["controller_deadband_N"] == pytest.approx(0.02)
     assert 'contract["sampling_cadence_steps"]' in prompt
     assert 'contract["sampling_cadence_seconds"]' in prompt
     assert 'grasp["bilateral_contact"]' in prompt
     assert "is a boolean, never a dictionary" in prompt
-    assert tactile["proportional_delta_gain_m_per_N"] == pytest.approx(1.0 / 12000.0)
-    assert tactile["max_delta_z_m"] == pytest.approx(0.001)
-    assert low_level["api_configs"]["franka_control_api"]["local_delta_max_m"] == pytest.approx(0.001)
-    assert low_level["api_configs"]["franka_control_api"]["force_task_target_lead_m"] == pytest.approx(0.002)
+    assert tactile["proportional_delta_gain_m_per_N"] == pytest.approx(1.0 / 120000.0)
+    assert tactile["max_delta_z_m"] == pytest.approx(2.0e-3 / 60.0)
+    assert tactile["observation_wait_steps"] * tactile["observation_dt_s"] == pytest.approx(1.0 / 60.0)
+    assert low_level["api_configs"]["franka_control_api"]["local_delta_max_m"] == pytest.approx(2.0e-3 / 60.0)
+    assert low_level["api_configs"]["franka_control_api"]["force_task_target_lead_m"] == pytest.approx(2.0e-3 / 60.0)
     assert tactile["max_estimate_age_steps"] == 3
     assert config["tactile_memory"]["persistent"]["enabled"] is False
     assert low_level["video_renderer"] == "task_native"
+    assert low_level["video_stream_fps"] == pytest.approx(15.0)
     assert low_level["tension_response_panel"] == {"enabled": True, "history_points": 360}
     assert low_level["task_config_overrides"] == {
+        "official_task_protocol": True,
         "task_cfg_overrides": {"save_pre_move": False},
         "record_video_during_reset": False,
         "record_pre_move_frames": False,
         "record_pre_move_tactile_timeline": False,
-        "video_frame_stride": 2,
+        "runtime_task_mode": "eval_test",
+        "render_frequency": 2,
+        "video_frequency": 0,
+        "video_frame_stride": 8,
         "force_task_adapter_pre_move": True,
     }
     assert config["max_regenerations"] == 1
@@ -256,14 +269,19 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert config["multiturn_executed_code_max_chars"] == 3000
     grasp = low_level["api_configs"]["franka_control_api"]["adaptive_gripper"]
     assert grasp["target_depth_delta_mm"] == pytest.approx(6.4)
-    assert grasp["post_squeeze_qpos"] == pytest.approx(0.00015)
+    assert low_level["api_configs"]["franka_control_api"]["max_gripper_servo_steps"] == 400
+    assert grasp["coarse_qpos_step"] == pytest.approx(1.0e-4)
+    assert grasp["fine_qpos_step"] == pytest.approx(1.0e-4)
+    assert grasp["settle_steps_per_command"] == 2
+    assert grasp["post_squeeze_qpos"] == pytest.approx(0.0)
     assert low_level["runtime_preflight"] == {
         "enabled": True,
-        "tacex_root": "${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/ViTaForge_capx_tension/third_party/TacEx}",
+        "tacex_root": "${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/ViTaForge/third_party/TacEx}",
         "require_contact_gradient": True,
         "require_attached_gelpad_asset": True,
         "require_attachment_points": True,
     }
+    assert low_level["task_config_overrides"]["official_task_protocol"] is True
 
 
 def test_univtac_tactile_api_does_not_expose_force_task_stage_memory() -> None:

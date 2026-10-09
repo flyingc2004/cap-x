@@ -58,6 +58,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         ),
         live_preview_stride: int = 5,
         live_preview_jpeg_quality: int = 80,
+        video_stream_fps: float = 30.0,
         video_renderer: str = "capx_composed",
         tension_response_panel: dict[str, Any] | None = None,
         runtime_preflight: dict[str, Any] | None = None,
@@ -99,6 +100,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         self.live_preview_jpeg_quality = int(
             np.clip(int(live_preview_jpeg_quality), 1, 95)
         )
+        self.video_stream_fps = float(video_stream_fps)
+        if not math.isfinite(self.video_stream_fps) or self.video_stream_fps <= 0.0:
+            raise ValueError("video_stream_fps must be a finite positive number")
         self.video_renderer = str(video_renderer).strip().lower()
         if self.video_renderer not in {"capx_composed", "task_native"}:
             raise ValueError(
@@ -165,6 +169,11 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._start_time = time.time()
         self._debug_records: list[dict[str, Any]] = []
         self._tactile_gripper_trace: list[dict[str, Any]] = []
+        self._opentac_tension_estimator_trace: list[dict[str, Any]] = []
+        # This is an evaluator-only sidecar. It is intentionally separate
+        # from the public estimator trace so a true force value can never be
+        # mistaken for an LLM-visible observation.
+        self._opentac_tension_calibration_audit: list[dict[str, Any]] = []
         self._primitive_trace: list[dict[str, Any]] = []
         self._tactile_working_memory_trace: list[dict[str, Any]] = []
         self._tactile_trial_memory_snapshot: dict[str, Any] = {}
@@ -237,6 +246,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._start_time = time.time()
         self._debug_records.clear()
         self._tactile_gripper_trace.clear()
+        self._opentac_tension_estimator_trace.clear()
+        self._opentac_tension_calibration_audit.clear()
         self._primitive_trace.clear()
         self._tactile_working_memory_trace.clear()
         self._tactile_trial_memory_snapshot.clear()
@@ -710,6 +721,18 @@ class UniVTACLowLevelEnv(BaseEnv):
 
     def finalize_high_level_action(self) -> dict[str, Any]:
         """Apply native success/early-stop rules after one CaP physical action."""
+        self._apply_official_task_protocol()
+        self.refresh_live_preview()
+        return self.get_protocol_status()
+
+    def _apply_official_task_protocol(self) -> None:
+        """Synchronize native terminal rules without an extra render.
+
+        Force-task ``wait_steps`` advances physics through ``task.delay``.
+        It must execute this same check after every delay; otherwise a
+        generated hold loop bypasses native timeout/failure until the outer
+        wall-clock watchdog intervenes.
+        """
         if self._official_task_protocol:
             if self.get_action_count() >= self.max_steps:
                 self._stop_protocol("action_budget")
@@ -722,8 +745,6 @@ class UniVTACLowLevelEnv(BaseEnv):
                         self._stop_protocol("early_stop")
                 except Exception as exc:
                     self._stop_protocol(f"protocol_check_error:{type(exc).__name__}")
-        self.refresh_live_preview()
-        return self.get_protocol_status()
 
     def refresh_live_preview(self) -> None:
         """Refresh the local preview after a high-level action attempt.
@@ -1352,6 +1373,62 @@ class UniVTACLowLevelEnv(BaseEnv):
                 raise ValueError("tactile gripper trace may only contain close/open operations")
             self._tactile_gripper_trace.append(_jsonable(record))
 
+    def append_opentac_tension_estimator_trace(self, record: dict[str, Any]) -> None:
+        """Store public marker-flow estimator samples for offline calibration audit.
+
+        This trace is deliberately artifact-only. It is not returned by an LLM
+        API, included in runtime memory, or used to advance a task stage.
+        """
+        if not hasattr(self, "_opentac_tension_estimator_trace"):
+            self._opentac_tension_estimator_trace = []
+        self._opentac_tension_estimator_trace.append(_jsonable(dict(record)))
+
+    def read_private_tension_for_posthoc_audit(self) -> dict[str, Any]:
+        """Read the force-task physics label for artifact-only evaluation.
+
+        This is deliberately *not* an API registration and must never be used
+        by CaP-X control, prompts, runtime memory, or rendering.  It mirrors
+        the task's physical resultant definition without calling ``_measure``
+        (which also evaluates task-side contact diagnostics).
+        """
+        task = getattr(self, "_task", None)
+        required = ("strap", "resultant", "upper_mask")
+        missing = [name for name in required if not hasattr(task, name)]
+        if missing:
+            raise RuntimeError(
+                "private tension audit is unavailable; task lacks " + ", ".join(missing)
+            )
+        step = int(self.get_step_count())
+        # ``tension_strap._step`` already evaluates this exact physical value
+        # before post-step observers run. Reuse it when aligned so evaluation
+        # does not add a second expensive elastic-resultant solve per step.
+        cached = getattr(task, "measured", None)
+        cached_step = getattr(task, "_measure_step", None)
+        if isinstance(cached, dict) and cached_step == step:
+            cached_tension = cached.get("tension_N")
+            if cached_tension is not None and np.isfinite(float(cached_tension)):
+                return {
+                    "true_tension_N": max(0.0, float(cached_tension)),
+                    "step": step,
+                    "source": "task_cached_physics_measurement",
+                }
+        points = np.asarray(task.strap.vertex_positions, dtype=np.float64).copy()
+        measurement = task.resultant.measure(points, task.upper_mask)
+        elastic_force = np.asarray(measurement["elastic_force_N"], dtype=np.float64).reshape(-1)
+        if elastic_force.size < 3 or not np.isfinite(elastic_force[2]):
+            raise RuntimeError("private tension audit produced an invalid elastic resultant")
+        return {
+            "true_tension_N": max(0.0, -float(elastic_force[2])),
+            "step": step,
+            "source": "direct_elastic_resultant",
+        }
+
+    def append_opentac_tension_calibration_audit(self, record: dict[str, Any]) -> None:
+        """Store private estimate-vs-physics evidence for post-hoc scoring only."""
+        if not hasattr(self, "_opentac_tension_calibration_audit"):
+            self._opentac_tension_calibration_audit = []
+        self._opentac_tension_calibration_audit.append(_jsonable(dict(record)))
+
     def reset_primitive_trace(self) -> None:
         """Clear public tactile primitive trace for a fresh trial."""
         if not hasattr(self, "_primitive_trace"):
@@ -1568,13 +1645,31 @@ class UniVTACLowLevelEnv(BaseEnv):
     def wait_steps(self, n: int = 1) -> dict[str, Any]:
         steps = max(0, int(n))
         for _ in range(steps):
+            if self._official_task_protocol and self._protocol_stopped:
+                reason = self._protocol_stop_reason or "native_terminal"
+                if reason != "native_success":
+                    raise RuntimeError(f"native task protocol stopped: {reason}")
+                break
+            # A hold loop can legitimately contain only waits. It must still
+            # honor the same adapter deadline as planner-backed motion calls.
+            self._raise_if_hard_stopped("wait_steps")
             self._task.delay(1, is_save=True, force=True)
             self._update_after_action()
+            self._apply_official_task_protocol()
+            if self._official_task_protocol and self._protocol_stopped:
+                reason = self._protocol_stop_reason or "native_terminal"
+                if reason != "native_success":
+                    raise RuntimeError(f"native task protocol stopped: {reason}")
+                break
         result = {
-            "ok": True,
+            "ok": not self._protocol_stopped,
             "step": self.get_step_count(),
             "action_count": self.get_action_count(),
-            "message": f"waited {steps} simulation step(s)",
+            "message": (
+                f"waited {steps} simulation step(s)"
+                if not self._protocol_stopped
+                else f"native task protocol stopped: {self._protocol_stop_reason}"
+            ),
         }
         self._last_action_result = result
         return result
@@ -1971,6 +2066,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         """Write private UniVTAC diagnostics for audit, never for LLM prompts."""
         debug_records = getattr(self, "_debug_records", [])
         gripper_trace = getattr(self, "_tactile_gripper_trace", [])
+        estimator_trace = getattr(self, "_opentac_tension_estimator_trace", [])
+        force_audit = getattr(self, "_opentac_tension_calibration_audit", [])
         primitive_trace = getattr(self, "_primitive_trace", [])
         working_memory_trace = getattr(self, "_tactile_working_memory_trace", [])
         trial_memory_snapshot = getattr(self, "_tactile_trial_memory_snapshot", {})
@@ -1980,6 +2077,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         if (
             not debug_records
             and not gripper_trace
+            and not estimator_trace
+            and not force_audit
             and not primitive_trace
             and not working_memory_trace
             and not trial_memory_snapshot
@@ -2018,6 +2117,35 @@ class UniVTACLowLevelEnv(BaseEnv):
             with open(trace_path, "w", encoding="utf-8") as f:
                 json.dump(gripper_trace, f, indent=2, sort_keys=True)
             print(f"[capx-univtac] saved tactile gripper trace to {trace_path}", flush=True)
+        estimator_trace_path = None
+        if estimator_trace:
+            estimator_trace_path = output_path / "opentac_tension_estimator_trace.json"
+            with open(estimator_trace_path, "w", encoding="utf-8") as f:
+                json.dump(estimator_trace, f, indent=2, sort_keys=True)
+            print(
+                "[capx-univtac] saved OpenTac tension estimator trace "
+                f"to {estimator_trace_path}",
+                flush=True,
+            )
+        force_audit_path = None
+        if force_audit:
+            force_audit_path = output_path / "opentac_tension_calibration_audit.jsonl"
+            with open(force_audit_path, "w", encoding="utf-8") as f:
+                for row in force_audit:
+                    f.write(json.dumps(_jsonable(row), sort_keys=True) + "\n")
+            force_summary_path = output_path / "opentac_tension_calibration_audit_summary.json"
+            with open(force_summary_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    _summarize_opentac_tension_calibration_audit(force_audit),
+                    f,
+                    indent=2,
+                    sort_keys=True,
+                )
+            print(
+                "[capx-univtac] saved private OpenTac tension calibration audit "
+                f"to {force_audit_path}",
+                flush=True,
+            )
         primitive_path = None
         if primitive_trace:
             primitive_path = output_path / "primitive_trace.json"
@@ -2061,6 +2189,10 @@ class UniVTACLowLevelEnv(BaseEnv):
             return str(debug_path)
         if gripper_trace:
             return str(trace_path)
+        if estimator_trace_path is not None:
+            return str(estimator_trace_path)
+        if force_audit_path is not None:
+            return str(force_audit_path)
         if primitive_path is not None:
             return str(primitive_path)
         if working_memory_path is not None:
@@ -2307,7 +2439,12 @@ class UniVTACLowLevelEnv(BaseEnv):
                 task_config_file,
                 seed=self.force_task_seed,
             )
-        self._task = task_module.Task(env_cfg, mode="eval")
+        task_runtime_mode = str(self._task_config.get("runtime_task_mode", "eval")).strip()
+        if task_runtime_mode not in {"collect", "eval", "eval_test"}:
+            raise ValueError(
+                "runtime_task_mode must be one of 'collect', 'eval', or 'eval_test'"
+            )
+        self._task = task_module.Task(env_cfg, mode=task_runtime_mode)
         self.record_video_during_reset = bool(
             self._task_config.get(
                 "record_video_during_reset",
@@ -3034,13 +3171,18 @@ class UniVTACLowLevelEnv(BaseEnv):
             self._video_stream_turn_writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
         self._video_stream_frame_count += 1
 
-    @staticmethod
-    def _ensure_video_stream_writer(writer: Any | None, path: Path, frame: np.ndarray) -> Any:
+    def _ensure_video_stream_writer(
+        self, writer: Any | None, path: Path, frame: np.ndarray
+    ) -> Any:
         if writer is not None:
             return writer
         height, width = frame.shape[:2]
+        stream_fps = float(getattr(self, "video_stream_fps", 30.0))
         created = cv2.VideoWriter(
-            str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (int(width), int(height))
+            str(path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            stream_fps,
+            (int(width), int(height)),
         )
         if not created.isOpened():
             raise RuntimeError(f"could not open streamed video writer: {path}")
@@ -3874,6 +4016,83 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+def _summarize_opentac_tension_calibration_audit(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize private post-hoc estimate-vs-physics audit rows.
+
+    This function is deliberately invoked only while saving trial artifacts.
+    Its output is never used by OpenTac control or made available to generated
+    code, so the task's physical tension cannot leak back into a live trial.
+    """
+    paired: list[tuple[float, float]] = []
+    true_available = 0
+    estimate_available = 0
+    stage_bands: list[list[float]] = []
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+        if row.get("true_tension_N") is not None:
+            true_available += 1
+        if row.get("estimate_available") is True:
+            estimate_available += 1
+        if not stage_bands:
+            candidate_bands = row.get("evaluation_bands_N")
+            if isinstance(candidate_bands, list):
+                stage_bands = candidate_bands
+        try:
+            estimate = float(row["estimated_tension_N"])
+            truth = float(row["true_tension_N"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(estimate) and math.isfinite(truth):
+            paired.append((estimate, truth))
+
+    def error_metrics(samples: list[tuple[float, float]]) -> dict[str, Any]:
+        if not samples:
+            return {
+                "count": 0,
+                "mae_N": None,
+                "rmse_N": None,
+                "bias_N": None,
+                "p95_absolute_error_N": None,
+            }
+        errors = np.asarray([estimate - truth for estimate, truth in samples], dtype=float)
+        return {
+            "count": int(errors.size),
+            "mae_N": float(np.mean(np.abs(errors))),
+            "rmse_N": float(np.sqrt(np.mean(errors * errors))),
+            "bias_N": float(np.mean(errors)),
+            "p95_absolute_error_N": float(np.percentile(np.abs(errors), 95.0)),
+        }
+
+    by_target: dict[str, dict[str, Any]] = {}
+    for band in stage_bands:
+        try:
+            low, high = float(band[0]), float(band[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(low) and math.isfinite(high) and low <= high):
+            continue
+        center = (low + high) / 2.0
+        samples = [(estimate, truth) for estimate, truth in paired if low <= truth <= high]
+        by_target[f"near_{center:g}N"] = {
+            "true_tension_band_N": [low, high],
+            **error_metrics(samples),
+        }
+
+    total = len(records)
+    return {
+        "schema_version": "opentac_tension_calibration_audit_summary.v1",
+        "source": "private_physics_posthoc_only",
+        "sample_count": int(total),
+        "paired_sample_count": int(len(paired)),
+        "true_tension_available_count": int(true_available),
+        "estimate_available_count": int(estimate_available),
+        "paired_coverage": float(len(paired) / total) if total else 0.0,
+        "overall": error_metrics(paired),
+        "by_true_tension_band": by_target,
+    }
 
 
 _TENSION_RESPONSE_FIELDS: tuple[tuple[str, str, str, tuple[str, ...], str], ...] = (

@@ -6,7 +6,7 @@ env:
     stream_user_code_output: false
     low_level:
       _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
-      univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/sdc/ljz/ViTaForge_capx_tension}
+      univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/sdc/ljz/ViTaForge}
       task_name: tension_strap
       task_config: tension_strap
       force_task: true
@@ -17,27 +17,35 @@ env:
       live_preview_path: ${oc.env:CAPX_LIVE_PREVIEW_PATH,/tmp/capx_tension_strap_preview.jpg}
       live_preview_stride: 5
       live_preview_jpeg_quality: 85
+      # 120 Hz physics / 8 = 15 fps.  The video therefore preserves simulation
+      # time while avoiding a full 1600x1200 dashboard encode on every render.
+      video_stream_fps: 15.0
       video_renderer: task_native
       tension_response_panel:
         enabled: true
         history_points: 360
-      # Adapter pre-move is benchmark initialization, not agent behavior. Rendering
-      # the 1600x1200 dashboard and extracting a tactile timeline at every
-      # pre-move physics step consumed most of the outer process watchdog.
-      # Start recording at the post-reset agent state instead.  The task runs
-      # at 60 Hz, so stride 2 preserves real-time playback at the writer's
-      # 30 FPS while cutting dashboard rendering and encoding in half.
+      # Adapter pre-move is benchmark initialization, not agent behavior. Keep
+      # the 60 Hz render cadence needed for tactile observations, but let
+      # CaP-X own the sole encoded video stream at 15 fps.
       task_config_overrides:
+        # Propagate the task's own success, grasp-loss, overload, travel-limit,
+        # and 60-second physical timeout into the CaP-X control loop.
+        official_task_protocol: true
         task_cfg_overrides:
           save_pre_move: false
         record_video_during_reset: false
         record_pre_move_frames: false
         record_pre_move_tactile_timeline: false
-        video_frame_stride: 2
+        # eval_test avoids BaseTask's unconditional eval render and its native
+        # VideoHandler. render_frequency=2 is the public 60 Hz sensor cadence.
+        runtime_task_mode: eval_test
+        render_frequency: 2
+        video_frequency: 0
+        video_frame_stride: 8
         force_task_adapter_pre_move: true
       runtime_preflight:
         enabled: true
-        tacex_root: ${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/ViTaForge_capx_tension/third_party/TacEx}
+        tacex_root: ${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/ViTaForge/third_party/TacEx}
         require_contact_gradient: true
         require_attached_gelpad_asset: true
         require_attachment_points: true
@@ -47,33 +55,61 @@ env:
           llm_visible_functions: [move_delta, open_gripper, close_gripper, get_robot_state, wait_steps]
           tactile_adaptive_gripper_enabled: true
           use_native_pose_planner: false
-          local_delta_max_m: 0.001
-          local_delta_segment_m: 0.001
-          force_task_target_lead_m: 0.002
+          # Match the expert's capped 2 mm/s pull at its 60 Hz public cadence.
+          # GPU load changes wall-clock time, not physical control velocity.
+          local_delta_max_m: 0.00003333333333333333
+          local_delta_segment_m: 0.00003333333333333333
+          force_task_target_lead_m: 0.00003333333333333333
           min_safe_z: 0.10
-          max_gripper_servo_steps: 160
+          # The official public grasp has a 400-command budget, with two
+          # physics ticks per command.  This is a budget, never a qpos goal.
+          max_gripper_servo_steps: 400
           adaptive_gripper:
             # The public expert accepts the grasp at 27.6 mm raw depth with a
             # 34 mm calibrated far plane, i.e. at least 6.4 mm indentation.
+            # Its depth-driven step is in [5e-6, 1e-4] m and each command runs
+            # for two physics ticks.  The generic adapter has no remaining-
+            # depth taper, so use the expert's 1e-4 m upper-rate bound for
+            # both generic phases and let bilateral depth terminate closing.
+            coarse_qpos_step: 0.0001
+            fine_qpos_step: 0.0001
+            settle_steps_per_command: 2
+            contact_debounce_frames: 1
+            stable_debounce_frames: 1
+            contact_force_threshold: 0.0
+            contact_balance_threshold: 1.0
+            slip_threshold: 1.0
+            one_sided_force_limit: 1.1
             target_depth_delta_mm: 6.4
-            min_stable_contact_area: 0.006
-            post_squeeze_qpos: 0.00015
-            post_squeeze_steps: 4
-            hold_steps: 8
+            min_stable_contact_area: 0.0
+            post_squeeze_qpos: 0.0
+            post_squeeze_steps: 0
+            hold_steps: 0
         opentac_api:
-          llm_visible_functions: [get_tactile_tension_control_contract, begin_tactile_tension_estimator, get_tactile_tension_estimate, get_tactile_stage_memory, capture_tactile_stage_response]
-          tension_calibration_path: task_config/force_task_rgb/tension_strap_dual_stage.json
+          llm_visible_functions: [get_tactile_tension_control_contract, begin_tactile_tension_estimator, get_tactile_tension_estimate, capture_tactile_stage_response]
+          tension_estimator_mode: public_depth_marker_regression_v1
+          tension_calibration_path: env_configs/univtac/tension_calibration/tension_strap_public_tactile_force_69seed.v1.json
           tactile_stage_memory_path: env_configs/univtac/tactile_response_memory/tension_strap_12n_18n.v2.json
-          max_delta_z_m: 0.001
+          # Expert-equivalent P controller: clamp(error / 2000 m/s, +/-2 mm/s)
+          # and apply it for two 120 Hz physics ticks per public action.
+          max_delta_z_m: 0.00003333333333333333
           observation_wait_steps: 2
-          observation_dt_s: 0.016666666666666666
+          observation_dt_s: 0.008333333333333333
           stage_hold_seconds: 3.0
           estimator_settle_steps: 30
-          proportional_delta_gain_m_per_N: 0.00008333333333333333
+          force_filter_time_constant_s: 0.15
+          controller_deadband_N: 0.02
+          proportional_delta_gain_m_per_N: 0.000008333333333333333
           stage_targets_N: [12.0, 18.0]
           stage_tolerance_N: 0.5
           estimator_update_stride: 1
           max_estimate_age_steps: 3
+          # Evaluator-only: pairs public estimates with private physics in a
+          # post-run artifact. It never enters an API response, prompt, video,
+          # or control decision.
+          private_force_audit:
+            enabled: true
+            sample_stride: 1
       expose_actor_pose: false
       privileged: false
       enable_render: true
@@ -84,21 +120,19 @@ env:
 
       Task objective: keep the same grasp throughout two ordered tension stages. First control the public estimated_tension_N into the 12 N target band [11.5, 12.5], then without opening or regrasping control it into the 18 N target band [17.5, 18.5]. Tension is a tolerance-band requirement: do not chase an exact 12.000 or 18.000 value once the public estimate is inside its band. Time is a strict continuous requirement: each stage must remain inside its band for one uninterrupted full 3.0-second window. Do not begin the 18 N stage until the full 12 N hold has completed. Do not end after only the first stage. Do not read or infer simulator true tension, actor state, reward, success, task metadata, private task fields, or direct environment objects.
 
-      The CaP-X adapter has already brought the open gripper to the public non-contact strap approach. First call close_gripper(adaptive=True). Its result has these top-level boolean fields: grasp["stable"], grasp["contact"], grasp["left_contact"], grasp["right_contact"], and grasp["bilateral_contact"]. Use bool(grasp["bilateral_contact"]) as bilateral grasp evidence. grasp["contact"] is a boolean, never a dictionary: do not call .get(...) on it and do not invent contact_state. stable=false alone is not a reason to abort when bilateral_contact is true. Wait contract["estimator_settle_steps"] without moving, then call begin_tactile_tension_estimator() once. Do not open or regrasp between the ordered 12 N and 18 N stages unless your own code decides that the physical grasp is lost.
+      The CaP-X adapter has already brought the open gripper to the public non-contact strap approach. First call close_gripper(adaptive=True, target_force=0.0, max_steps=400). This reproduces the expert's public close budget and bilateral-depth stopping protocol; it is not a fixed qpos, width, depth, or physical-force target. Its result has these top-level boolean fields: grasp["stable"], grasp["contact"], grasp["left_contact"], grasp["right_contact"], and grasp["bilateral_contact"]. Continue only when both bool(grasp["stable"]) and bool(grasp["bilateral_contact"]) are true. Otherwise print CAPX_FAILURE and raise RuntimeError; do not start the estimator from a partial grasp and do not invent a regrasp policy. grasp["contact"] is a boolean, never a dictionary: do not call .get(...) on it and do not invent contact_state. Wait contract["estimator_settle_steps"] without moving, then call begin_tactile_tension_estimator() once. Do not open or regrasp between the ordered 12 N and 18 N stages.
 
-      Call get_tactile_tension_control_contract() and get_tactile_stage_memory() before control. The contract gives public target bands, sampling cadence, hold duration, motion safety range, and proportional gain. The adapter does not track stage progress, action counts, failure counts, or recovery decisions. Maintain your own local stage index, in-band elapsed time, and any retry/recovery state in the generated code. Control the two public stages in the fixed order: first 12 N, then 18 N. Read the exact band from contract["stage_bands_N"][stage_index]; do not derive another band. Positive move_delta(dz) pulls upward and increases tension; negative dz relaxes the strap. The 18 N stage requires an additional upward motion after the 12 N hold; no API performs this automatically.
+      Call get_tactile_tension_control_contract() before control. The contract gives public target bands, sampling cadence, hold duration, motion safety range, and proportional gain. The adapter does not track stage progress, action counts, failure counts, or recovery decisions. Maintain your own local stage index, in-band elapsed time, and any retry/recovery state in the generated code. Control the two public stages in the fixed order: first 12 N, then 18 N. Read the exact band from contract["stage_bands_N"][stage_index]; do not derive another band. Positive move_delta(dz) pulls upward and increases tension; negative dz relaxes the strap. The 18 N stage requires an additional upward motion after the 12 N hold; no API performs this automatically.
 
-      get_tactile_tension_estimate() is only a public numerical observation. When estimate["available"] is true, use estimate["estimated_tension_N"]. When available is false, the estimate is temporarily unavailable: do not treat it as task failure and do not move from an unobserved estimate. Wait and sample again, or use a locally chosen recovery such as settling or re-establishing a grasp. The adapter never provides a consecutive-failure count, a failure reason, a completed-stage flag, or a prescribed recovery. Keep any local wait/retry loop finite and make the eventual stop/recovery choice yourself.
+      get_tactile_tension_estimate() is only a public numerical observation. When estimate["available"] is true, use estimate["estimated_tension_N"]. When available is false, the estimate is temporarily unavailable: do not treat it as task failure and do not move from an unobserved estimate. Wait and sample again. The adapter never provides a consecutive-failure count, a failure reason, a completed-stage flag, or a prescribed recovery. Do not add an arbitrary local wait, retry, sample, action, or iteration limit; native physical terminal conditions and the trial timeout bound the run.
 
-      For each stage, sample at the public cadence. The exact cadence fields are contract["sampling_cadence_steps"] and contract["sampling_cadence_seconds"]. Call wait_steps(contract["sampling_cadence_steps"]) between samples and add contract["sampling_cadence_seconds"] only after an available estimate is inside the exact band. observation_wait_steps and observation_dt_s are diagnostic factors for the same cadence; do not invent any other cadence key. Reset that stage's local elapsed time to zero on every unavailable or out-of-band sample; never join separated in-band intervals. When outside the band, calculate a proportional dz = clip((target - estimated_tension_N) * contract["proportional_delta_gain_m_per_N"], -contract["max_delta_z_m"], contract["max_delta_z_m"]), move once, then wait and sample again. When inside the band, do not move; wait and continue sampling until your own accumulated elapsed time reaches contract["stage_hold_seconds"].
+      For each stage, sample at the public cadence. The exact cadence fields are contract["sampling_cadence_steps"] and contract["sampling_cadence_seconds"]. Add contract["sampling_cadence_seconds"] only after an available estimate is inside the exact band. observation_wait_steps and observation_dt_s are diagnostic factors for the same cadence; do not invent any other cadence key. Maintain filtered_tension locally: initialize it from the first available estimated_tension_N, then on each later available sample update it as filtered += contract["force_filter_alpha"] * (raw - filtered). Use filtered_tension, not one raw sample, for both band membership and proportional control. Reset that stage's local elapsed time to zero on every unavailable or filtered out-of-band sample; never join separated in-band intervals. When outside the band, calculate error = target - filtered_tension. If abs(error) is at or below contract["controller_deadband_N"], do not move; otherwise calculate dz = clip(error * contract["proportional_delta_gain_m_per_N"], -contract["max_delta_z_m"], contract["max_delta_z_m"]), then call move_delta(dz=dz). A move_delta already advances one native control cadence: immediately read a fresh estimate on the next loop and do not add wait_steps immediately after it. Use wait_steps(contract["sampling_cadence_steps"]) only while holding inside the band or while an estimate is unavailable. Do not create a local sample, retry, action, or iteration cap; the native physical terminal conditions and trial timeout are the only bounds. When inside the band, do not move; wait and continue sampling until your own accumulated elapsed time reaches contract["stage_hold_seconds"].
 
-      Immediately after each locally completed 3-second hold, call capture_tactile_stage_response() and require response["quality"]["valid"] is true. Do not guess the frozen-memory schema. It is exactly memory["stages"], a list with two records whose identifiers are stage["memory_id"] == "tension_strap_hold_12n.v1" and "tension_strap_hold_18n.v1". Each stage record has stage["response_blocks"], not "blocks". There is no stage "name" or "id" field to search for. Select each stage by its exact memory_id.
+      Immediately after each locally completed 3-second hold, call capture_tactile_stage_response() once and print its capture ID and quality for diagnostics. The 10D response is recorded in the video and artifact only. Do not calculate frozen-memory distances, and do not treat response quality, response memory, or images as a completion gate. The numerical estimate and your uninterrupted in-band timer are the only agent-side stage-progress criteria. The task itself independently applies the expert's physical acceptance and termination rules: two ordered 3-second physical holds, plus its own grasp-loss, overload, travel-limit, and 60-second timeout checks. Do not invent a separate action budget, early-success condition, or terminal heuristic. After the second local hold, stop commanding and end normally; task completion is reported independently by the environment.
 
-      Build the 10 public response values in these three fixed blocks: normal_static = [response["hold"]["left"]["depth_mm"], response["hold"]["right"]["depth_mm"]]; normal_dynamic = [response["end_minus_start"]["left"]["depth_mm"], response["end_minus_start"]["right"]["depth_mm"]]; surface_spatial_static = [left/right marker_row_gradient_px, left/right marker_col_gradient_px, log(left marker_anisotropy_ratio), log(right marker_anisotropy_ratio)] from response["hold"]. For block index i, compare these values with stage["response_blocks"][i]["scaler"]["median"] and the same-index shared pooled-calibration IQR at memory["retrieval_scaler"]["response_blocks"][i]["iqr"]. The block distance is RMS((value - median) / IQR); the fused stage distance is the arithmetic mean of its three block distances. The response must be closer to tension_strap_hold_12n.v1 after the 12 N hold, and closer to tension_strap_hold_18n.v1 after the 18 N hold. Print CAPX_STAGE with the stage, both fused distances, and margin. The frozen response memory verifies the completed stage; it does not control motion for you.
+      Every submitted or regenerated code block must be independently executable. At the top of any block that needs it, retrieve contract again; never rely on variables created by an earlier code block. The adapter has no persisted stage checkpoint, so a recovery block must not claim a previous stage completed unless its own code has established that fact. On a deliberate failure, print CAPX_FAILURE and raise RuntimeError without catching or swallowing it. Do not wrap the main program in `except SystemExit: pass` or a broad exception handler that turns a failure into apparent success.
 
-      Every submitted or regenerated code block must be independently executable. At the top of any block that uses them, retrieve contract and memory again; never rely on variables created by an earlier code block. The adapter has no persisted stage checkpoint, so a recovery block must not claim a previous stage completed unless its own code has established that fact. On a deliberate failure, print CAPX_FAILURE and raise RuntimeError without catching or swallowing it. Do not wrap the main program in `except SystemExit: pass` or a broad exception handler that turns a failure into apparent success.
-
-      Advance only after both the local physical hold and its matching 10D response are valid. At 18 N, remain at the final pose until its hold and response are complete, then end normally. Return concise executable Python only.
+      Advance after the local numerical hold completes, then capture the diagnostic response. At 18 N, remain at the final pose until its numerical hold is complete, capture the diagnostic response, then end normally. Return concise executable Python only.
     multi_turn_prompt: |
       Executed code:
       {executed_code}
@@ -109,7 +143,7 @@ env:
       Console stderr:
       {console_stderr}
 
-      This is failure-only recovery. The appended OpenTac context is only the latest public numerical estimate; it has no stage checkpoint or recovery verdict. Do not infer completed holds from it. The documented functions are already injected as top-level names: do not import or instantiate API classes. The regenerated block must be independently executable: retrieve contract and memory again instead of assuming prior local variables exist. Use only contract["sampling_cadence_steps"] and contract["sampling_cadence_seconds"] for cadence. close_gripper(adaptive=True) returns top-level boolean bilateral_contact, left_contact, right_contact, stable, and contact; contact is not a mapping and there is no contact_state. Select frozen stages only through memory["stages"][*]["memory_id"] and use response_blocks, never guessed name/id/blocks fields. Do not use private force signals or change the 12 N then 18 N target sequence.
+      This is failure-only recovery. The appended OpenTac context is only the latest public numerical estimate; it has no stage checkpoint or recovery verdict. Do not infer completed holds from it. The documented functions are already injected as top-level names: do not import or instantiate API classes. The regenerated block must be independently executable: retrieve contract again instead of assuming prior local variables exist. Use only contract["sampling_cadence_steps"] and contract["sampling_cadence_seconds"] for cadence. If closing is needed, use close_gripper(adaptive=True, target_force=0.0, max_steps=400); it returns top-level boolean bilateral_contact, left_contact, right_contact, stable, and contact; contact is not a mapping and there is no contact_state. Preserve the environment-owned physical termination rules: do not add action-count terminal conditions or claim task success yourself. Do not use private force signals or change the 12 N then 18 N target sequence.
 trials: 1
 num_workers: 1
 record_video: true

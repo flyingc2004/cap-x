@@ -541,6 +541,74 @@ def test_tactile_gripper_trace_exports_beside_trial_artifacts(tmp_path) -> None:
     assert [item["operation"] for item in json.loads(path.read_text())] == ["close", "open"]
 
 
+def test_opentac_estimator_trace_exports_without_gripper_trace(tmp_path) -> None:
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env.task_name = "tension_strap"
+    env.task_config_name = "tension_strap"
+    env._task = SimpleNamespace(metadata={})
+    env._debug_records = []
+    env._tactile_gripper_trace = []
+    env._opentac_tension_estimator_trace = [
+        {"event": "baseline", "estimate": {"available": False}},
+        {"event": "estimate", "estimate": {"estimated_tension_N": 12.0}},
+    ]
+    env._export_pre_move_tactile_timeline = lambda output_dir: None
+
+    exported = env.export_debug_artifacts(tmp_path)
+
+    path = tmp_path / "opentac_tension_estimator_trace.json"
+    assert exported == str(path)
+    assert json.loads(path.read_text())[1]["estimate"]["estimated_tension_N"] == 12.0
+
+
+def test_opentac_private_force_audit_exports_only_as_posthoc_artifacts(tmp_path) -> None:
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env.task_name = "tension_strap"
+    env.task_config_name = "tension_strap"
+    env._task = SimpleNamespace(metadata={})
+    env._debug_records = []
+    env._tactile_gripper_trace = []
+    env._opentac_tension_estimator_trace = []
+    env._opentac_tension_calibration_audit = [
+        {
+            "schema_version": "opentac_tension_calibration_audit.v1",
+            "estimate_available": True,
+            "estimated_tension_N": 12.2,
+            "true_tension_N": 12.0,
+            "error_N": 0.2,
+            "absolute_error_N": 0.2,
+            "evaluation_bands_N": [[11.5, 12.5], [17.5, 18.5]],
+        },
+        {
+            "schema_version": "opentac_tension_calibration_audit.v1",
+            "estimate_available": True,
+            "estimated_tension_N": 17.7,
+            "true_tension_N": 18.0,
+            "error_N": -0.3,
+            "absolute_error_N": 0.3,
+            "evaluation_bands_N": [[11.5, 12.5], [17.5, 18.5]],
+        },
+    ]
+    env._primitive_trace = []
+    env._tactile_working_memory_trace = []
+    env._tactile_trial_memory_snapshot = {}
+    env._public_probe_records = {}
+    env._perception_artifacts = []
+    env._runtime_preflight_diagnostics = {}
+    env._export_pre_move_tactile_timeline = lambda output_dir: None
+
+    exported = env.export_debug_artifacts(tmp_path)
+
+    rows = [json.loads(line) for line in (tmp_path / "opentac_tension_calibration_audit.jsonl").read_text().splitlines()]
+    summary = json.loads((tmp_path / "opentac_tension_calibration_audit_summary.json").read_text())
+    assert [row["true_tension_N"] for row in rows] == [12.0, 18.0]
+    assert summary["paired_sample_count"] == 2
+    assert summary["overall"]["mae_N"] == pytest.approx(0.25)
+    assert summary["by_true_tension_band"]["near_12N"]["count"] == 1
+    assert summary["by_true_tension_band"]["near_18N"]["count"] == 1
+    assert exported == str(tmp_path / "opentac_tension_calibration_audit.jsonl")
+
+
 def test_lift_can_prompt_and_controller_do_not_use_univtac_adaptive_helper() -> None:
     config_path = (
         Path(__file__).resolve().parents[1]
