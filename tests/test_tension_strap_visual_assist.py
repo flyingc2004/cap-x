@@ -168,6 +168,8 @@ def test_visual_yaml_keeps_numerical_stage_authority() -> None:
     assert "Do not use an image to estimate Newtons or decide that a stage is complete" in prompt
     assert "Do not invent arbitrary per-stage action-count limits" in prompt
     assert 'contract["stage_hold_seconds"]' in prompt
+    assert 'contract["stage_targets_N"][1]' in prompt
+    assert 'target - contract["controller_deadband_N"]' in prompt
     assert "do not use hold_duration_seconds" in prompt
     assert "max_code_block_actions" not in config
 

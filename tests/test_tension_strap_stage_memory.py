@@ -217,9 +217,9 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert "12 N" in prompt
     assert "18 N" in prompt
     assert "[11.5, 12.5]" in prompt
-    assert "Tension is a tolerance-band requirement" in prompt
+    assert "For 18 N, merely crossing the lower band edge is not arrival" in prompt
     assert "Time is a strict continuous requirement" in prompt
-    assert "never join separated in-band intervals" in prompt
+    assert "never join separated intervals" in prompt
     assert 'memory["stages"]' not in prompt
     assert 'stage["memory_id"]' not in prompt
     assert 'stage["response_blocks"]' not in prompt
@@ -231,6 +231,8 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert "A move_delta already advances one native control cadence" in prompt
     assert "Do not create a local sample, retry, action, or iteration cap" in prompt
     assert "stage_bands_N" in prompt
+    assert 'contract["stage_targets_N"][stage_index]' in prompt
+    assert 'target - contract["controller_deadband_N"]' in prompt
     assert "do not derive another band" in prompt
     assert "adapter does not track stage progress" in prompt.lower()
     assert tactile["estimator_update_stride"] == 1
