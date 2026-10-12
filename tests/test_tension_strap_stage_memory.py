@@ -198,6 +198,7 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     tactile = low_level["api_configs"]["opentac_api"]
 
     assert low_level["task_name"] == "tension_strap"
+    assert "OpenTacBench_capx" in low_level["univtac_root"]
     assert low_level["task_config"] == "tension_strap"
     assert low_level["force_task"] is True
     assert config["env"]["cfg"]["apis"] == ["FrankaControlApi", "OpenTacApi"]
@@ -229,16 +230,35 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert "physical scorer" in OpenTacApi.__doc__
     assert "public target bands" in prompt
     assert "A move_delta already advances one native control cadence" in prompt
+    assert "Check the returned dictionary from EVERY wait_steps(...) and move_delta(...)" in prompt
+    assert "native_success" not in prompt
+    assert "capx_stop = True" in prompt
+    assert "Never continue a hold or motion loop after an action returns ok=False" in prompt
     assert "Do not create a local sample, retry, action, or iteration cap" in prompt
     assert "stage_bands_N" in prompt
     assert 'contract["stage_targets_N"][stage_index]' in prompt
     assert 'target - contract["controller_deadband_N"]' in prompt
+    assert "Once hold_elapsed_s is positive, continue counting every fresh sample inside the full official band" in prompt
+    assert "a dip below the entry threshold alone must not reset the timer" in prompt
+    assert "do not require reaching that threshold again to preserve the timer" in prompt
+    assert "The pre-wait sample establishes entry" in prompt
+    assert "Start and continue its hold timer only while filtered_tension is at least" not in prompt
     assert "do not derive another band" in prompt
     assert "adapter does not track stage progress" in prompt.lower()
+    assert "AGENT_PROGRESS_PATH" in prompt
+    assert 'file EXISTS at the start of the first block with status="uninitialized"' in prompt
+    assert 'saved.get("status") == "uninitialized"' in prompt
+    assert 'contract["stage_hold_seconds"]' in prompt
+    assert 'Read and store this key before any physical action' in prompt
+    assert "Do not print capture fields" in prompt
+    assert "os.replace" in prompt
+    assert "completed_stages" in prompt
+    assert "sample_step equals last_sample_step" in prompt
+    assert "save BEFORE calling capture_tactile_stage_response()" in prompt
     assert tactile["estimator_update_stride"] == 1
     assert tactile["estimator_settle_steps"] == 30
     assert tactile["force_filter_time_constant_s"] == pytest.approx(0.15)
-    assert tactile["controller_deadband_N"] == pytest.approx(0.02)
+    assert tactile["controller_deadband_N"] == pytest.approx(0.20)
     assert 'contract["sampling_cadence_steps"]' in prompt
     assert 'contract["sampling_cadence_seconds"]' in prompt
     assert 'grasp["bilateral_contact"]' in prompt
@@ -250,6 +270,7 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert low_level["api_configs"]["franka_control_api"]["force_task_target_lead_m"] == pytest.approx(2.0e-3 / 60.0)
     assert tactile["max_estimate_age_steps"] == 3
     assert config["tactile_memory"]["persistent"]["enabled"] is False
+    assert config["agent_progress_file"] == {"enabled": True, "max_context_chars": 1000}
     assert low_level["video_renderer"] == "task_native"
     assert low_level["video_stream_fps"] == pytest.approx(15.0)
     assert low_level["tension_response_panel"] == {"enabled": True, "history_points": 360}
@@ -270,7 +291,15 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert config["multiturn_console_max_chars"] == 1000
     assert config["multiturn_executed_code_max_chars"] == 3000
     grasp = low_level["api_configs"]["franka_control_api"]["adaptive_gripper"]
-    assert grasp["target_depth_delta_mm"] == pytest.approx(6.4)
+    assert grasp["target_depth_delta_mm"] == pytest.approx(0.0)
+    assert grasp["raw_depth_target_mm"] == pytest.approx(27.6)
+    assert grasp["raw_depth_gain_qpos_per_mm"] == pytest.approx(0.0005)
+    assert grasp["raw_depth_min_step_qpos"] == pytest.approx(5e-6)
+    visual = yaml.safe_load(
+        (REPO_ROOT / "env_configs/univtac/tension_strap_stage_memory_control_visual.yaml").read_text()
+    )
+    visual_grasp = visual["env"]["cfg"]["low_level"]["api_configs"]["franka_control_api"]["adaptive_gripper"]
+    assert visual_grasp == grasp
     assert low_level["api_configs"]["franka_control_api"]["max_gripper_servo_steps"] == 400
     assert grasp["coarse_qpos_step"] == pytest.approx(1.0e-4)
     assert grasp["fine_qpos_step"] == pytest.approx(1.0e-4)
@@ -278,7 +307,7 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert grasp["post_squeeze_qpos"] == pytest.approx(0.0)
     assert low_level["runtime_preflight"] == {
         "enabled": True,
-        "tacex_root": "${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/ViTaForge/third_party/TacEx}",
+        "tacex_root": "${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/OpenTacBench_capx/third_party/TacEx}",
         "require_contact_gradient": True,
         "require_attached_gelpad_asset": True,
         "require_attachment_points": True,

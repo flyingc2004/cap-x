@@ -215,6 +215,130 @@ def test_adaptive_close_requires_depth_area_then_post_squeezes_and_holds() -> No
     assert phases[0] == "contact_debounce"
 
 
+def _raw_depth_summary(left_mm: float, right_mm: float, *, left_contact: bool = True, right_contact: bool = True) -> dict:
+    summary = _summary(
+        left=left_contact,
+        right=right_contact,
+        force=0.95,
+        depth=6.36,
+        area=0.5,
+    )
+    summary["left"]["depth_min_mm"] = left_mm
+    summary["right"]["depth_min_mm"] = right_mm
+    return summary
+
+
+def test_raw_depth_close_stops_at_expert_threshold_before_robust_depth_target() -> None:
+    max_qpos = 0.039
+    rig = _ControllerRig(
+        [
+            _raw_depth_summary(27.70, 27.13),
+            _raw_depth_summary(27.59, 27.13),
+        ],
+        width=0.01105 / max_qpos,
+    )
+    controller = TactileAdaptiveGripperController(
+        get_width=rig.get_width,
+        command_width=rig.command_width,
+        read_tactile_summary=rig.read_summary,
+        config=AdaptiveGripperConfig(
+            coarse_step=0.0001 / max_qpos,
+            fine_step=0.0001 / max_qpos,
+            max_qpos=max_qpos,
+            stable_debounce_frames=1,
+            target_depth_delta_mm=6.4,
+            raw_depth_target_mm=27.6,
+        ),
+    )
+
+    result = controller.close(target_force=0.0, max_steps=400)
+
+    assert result["stable"] is True
+    assert result["reason"] == "bilateral_depth_target"
+    assert result["bilateral_contact"] is True
+    assert result["depth_delta_mm"] == pytest.approx(6.36)
+    assert len(rig.commands) == 1
+    assert rig.width * max_qpos == pytest.approx(0.01100)
+    assert controller.trace[-1]["phase"] == "raw_depth_target"
+
+
+def test_raw_depth_close_accepts_the_expert_stop_frame_without_an_extra_command() -> None:
+    max_qpos = 0.039
+    rig = _ControllerRig(
+        [_raw_depth_summary(27.598869, 27.129509)],
+        width=0.01095 / max_qpos,
+    )
+    controller = TactileAdaptiveGripperController(
+        get_width=rig.get_width,
+        command_width=rig.command_width,
+        read_tactile_summary=rig.read_summary,
+        config=AdaptiveGripperConfig(
+            coarse_step=0.0001 / max_qpos,
+            fine_step=0.0001 / max_qpos,
+            max_qpos=max_qpos,
+            stable_debounce_frames=1,
+            target_depth_delta_mm=6.4,
+            raw_depth_target_mm=27.6,
+        ),
+    )
+
+    result = controller.close(target_force=0.0, max_steps=400)
+
+    assert result["stable"] is True
+    assert result["reason"] == "bilateral_depth_target"
+    assert rig.commands == []
+    assert rig.width * max_qpos == pytest.approx(0.01095)
+
+
+def test_raw_depth_close_tapers_and_rejects_incomplete_bilateral_contact() -> None:
+    max_qpos = 0.039
+    rig = _ControllerRig(
+        [
+            _raw_depth_summary(27.64, 27.20),
+            _raw_depth_summary(27.59, 27.20, right_contact=False),
+        ],
+        width=0.011 / max_qpos,
+    )
+    controller = TactileAdaptiveGripperController(
+        get_width=rig.get_width,
+        command_width=rig.command_width,
+        read_tactile_summary=rig.read_summary,
+        config=AdaptiveGripperConfig(
+            coarse_step=0.0001 / max_qpos,
+            fine_step=0.0001 / max_qpos,
+            max_qpos=max_qpos,
+            stable_debounce_frames=1,
+            raw_depth_target_mm=27.6,
+        ),
+    )
+
+    result = controller.close(target_force=0.0, max_steps=400)
+
+    assert rig.commands[0][0] * max_qpos == pytest.approx(0.01098)
+    assert result["stable"] is False
+    assert result["reason"] == "raw_depth_target_unstable"
+    assert len(rig.commands) == 1
+
+
+def test_raw_depth_close_fails_without_finite_bilateral_depth() -> None:
+    rig = _ControllerRig([_raw_depth_summary(float("nan"), 27.20)])
+    controller = TactileAdaptiveGripperController(
+        get_width=rig.get_width,
+        command_width=rig.command_width,
+        read_tactile_summary=rig.read_summary,
+        config=AdaptiveGripperConfig(
+            coarse_step=0.01,
+            fine_step=0.01,
+            raw_depth_target_mm=27.6,
+        ),
+    )
+
+    result = controller.close(max_steps=400)
+
+    assert result["reason"] == "invalid_raw_depth"
+    assert not rig.commands
+
+
 def test_adaptive_open_releases_fine_then_opens_coarse() -> None:
     contact = _summary(left=True, right=True, force=0.30)
     no_contact = _summary()
@@ -285,6 +409,37 @@ def test_univtac_api_converts_qpos_calibration_to_normalized_steps() -> None:
     assert config.post_squeeze_qpos == pytest.approx(0.0003)
     assert config.post_squeeze_steps == 8
     assert config.hold_steps == 10
+    assert config.raw_depth_target_mm is None
+
+
+def test_univtac_api_passes_opt_in_raw_depth_servo_config() -> None:
+    class Env:
+        task = object()
+        api_configs = {
+            "franka_control_api": {
+                "adaptive_gripper": {
+                    "coarse_qpos_step": 0.0001,
+                    "fine_qpos_step": 0.0001,
+                    "raw_depth_target_mm": 27.6,
+                    "raw_depth_gain_qpos_per_mm": 0.0005,
+                    "raw_depth_min_step_qpos": 0.000005,
+                }
+            }
+        }
+
+        def get_gripper_calibration(self):
+            return {"gripper_max_qpos": 0.039, "current_width": 0.8}
+
+        def command_gripper_width_step(self, width, *, settle_steps):
+            return {"ok": True}
+
+    api = UniVTACFrankaCompatApi(Env())
+    api._read_adaptive_tactile_summary = lambda: _summary()
+    config = api._adaptive_gripper_controller().config
+
+    assert config.raw_depth_target_mm == pytest.approx(27.6)
+    assert config.raw_depth_gain_qpos_per_mm == pytest.approx(0.0005)
+    assert config.raw_depth_min_step_qpos == pytest.approx(0.000005)
 
 
 def test_univtac_native_tactile_calibration_uses_robot_depth_range() -> None:

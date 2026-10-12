@@ -117,6 +117,9 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
     tactile_memory_config = _normalize_tactile_memory_config(
         configs_dict.get("tactile_memory")
     )
+    agent_progress_raw = configs_dict.get("agent_progress_file") or {}
+    if not isinstance(agent_progress_raw, dict):
+        raise TypeError("agent_progress_file must be a mapping")
     trial_memory_config = tactile_memory_config["trial"]
     if not tactile_memory_config["configured"]:
         trial_memory_config = {
@@ -267,6 +270,13 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "tactile_strategy_top_k": tactile_strategy_top_k,
         "tactile_code_memory": tactile_code_memory_config,
         "tactile_memory": tactile_memory_config,
+        "agent_progress_file": {
+            "enabled": bool(agent_progress_raw.get("enabled", False)),
+            "max_context_chars": max(
+                256,
+                min(2000, int(agent_progress_raw.get("max_context_chars", 1000))),
+            ),
+        },
         "include_trial_memory_in_multiturn": trial_memory_config[
             "enabled"
         ] and trial_memory_config["include_in_multiturn"],
@@ -276,6 +286,9 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
                 "CAPX_TRIAL_TIMEOUT_SECONDS",
                 configs_dict.get("trial_timeout_seconds", 1000),
             )
+        ),
+        "code_block_wall_timeout_seconds": float(
+            configs_dict.get("code_block_wall_timeout_seconds", 0) or 0
         ),
         "max_trial_retries": int(
             os.getenv(

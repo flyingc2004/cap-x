@@ -346,3 +346,25 @@ def test_force_task_move_splits_one_public_delta_into_marker_trackable_segments(
     assert result["segment_count"] == 2
     assert result["segments_completed"] == 2
     assert np.isclose(result["executed_delta_z_m"], 0.002)
+
+
+def test_force_task_move_preserves_native_terminal_reason() -> None:
+    class _StoppedEnv:
+        def move_force_task_vertical_delta(self, *, dz: float) -> dict[str, Any]:
+            return {"ok": False, "reason": "native_success", "message": "protocol stopped"}
+
+    api = UniVTACFrankaCompatApi.__new__(UniVTACFrankaCompatApi)
+    api._env = _StoppedEnv()
+    api.local_delta_max_m = 0.002
+    api.local_delta_segment_m = 0.001
+    api.min_safe_z = 0.1
+    api._current_tool_pose = lambda: (
+        np.asarray([0.5, 0.0, 0.2], dtype=float),
+        np.asarray([1.0, 0.0, 0.0, 0.0], dtype=float),
+    )
+
+    result = api._opentac_tension_move_delta(0.002)
+
+    assert result["ok"] is False
+    assert result["reason"] == "native_success"
+    assert result["segments_completed"] == 0

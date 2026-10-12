@@ -196,6 +196,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._public_pose_cache: dict[str, dict[str, Any]] = {}
         self._active_public_grasp_object_name: str | None = None
         self._official_task_protocol = False
+        self.policy_controls_termination = False
+        self._policy_end_submitted = False
+        self._policy_end_verdict = False
         self._protocol_stopped = False
         self._protocol_stop_reason: str | None = None
         self._trial_deadline_time: float | None = None
@@ -272,6 +275,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._force_task_command_ee_quat = None
         self._protocol_stopped = False
         self._protocol_stop_reason = None
+        self._policy_end_submitted = False
+        self._policy_end_verdict = False
         self.clear_trial_deadline()
         self.clear_code_block_action_budget()
         self._reset_serial += 1
@@ -343,12 +348,25 @@ class UniVTACLowLevelEnv(BaseEnv):
         return 1.0 if self.task_completed() else 0.0
 
     def task_completed(self) -> bool:
+        if getattr(self, "policy_controls_termination", False):
+            return self._policy_end_submitted and self._policy_end_verdict
         completed = bool(self._task.check_success())
         if completed and bool(getattr(self, "_force_task_mode", False)):
             finalize = getattr(self._task, "_finish_strap_episode", None)
             if callable(finalize):
                 finalize()
         return completed
+
+    def submit_policy_end(self) -> bool:
+        """Commit an agent-owned END without exposing the private verdict to code."""
+        if not self.policy_controls_termination:
+            raise RuntimeError("task does not accept policy END")
+        if self._policy_end_submitted:
+            raise RuntimeError("policy END was already submitted")
+        self._policy_end_submitted = True
+        self._policy_end_verdict = bool(self._task.finish_episode())
+        self._stop_protocol("policy_end")
+        return self._policy_end_verdict
 
     def _active_object_height(self, object_name: str) -> float | None:
         actor = getattr(self._task, str(object_name), None)
@@ -738,7 +756,7 @@ class UniVTACLowLevelEnv(BaseEnv):
                 self._stop_protocol("action_budget")
             elif not self._protocol_stopped:
                 try:
-                    if bool(self._task.check_success()):
+                    if not getattr(self, "policy_controls_termination", False) and bool(self._task.check_success()):
                         self._task.eval_success = True
                         self._stop_protocol("native_success")
                     elif bool(self._task.check_early_stop()):
@@ -887,6 +905,7 @@ class UniVTACLowLevelEnv(BaseEnv):
     def _protocol_blocked_result(self) -> dict[str, Any]:
         result = {
             "ok": False,
+            "reason": self._protocol_stop_reason or "native_terminal",
             "step": self.get_step_count(),
             "action_count": self.get_action_count(),
             "message": f"official protocol stopped: {self._protocol_stop_reason}",
@@ -1669,6 +1688,7 @@ class UniVTACLowLevelEnv(BaseEnv):
                 break
         result = {
             "ok": not self._protocol_stopped,
+            "reason": self._protocol_stop_reason if self._protocol_stopped else None,
             "step": self.get_step_count(),
             "action_count": self.get_action_count(),
             "message": (
@@ -2451,6 +2471,9 @@ class UniVTACLowLevelEnv(BaseEnv):
                 "runtime_task_mode must be one of 'collect', 'eval', or 'eval_test'"
             )
         self._task = task_module.Task(env_cfg, mode=task_runtime_mode)
+        self.policy_controls_termination = bool(
+            getattr(env_cfg, "policy_controls_termination", False)
+        )
         self.record_video_during_reset = bool(
             self._task_config.get(
                 "record_video_during_reset",

@@ -166,11 +166,24 @@ def test_visual_yaml_keeps_numerical_stage_authority() -> None:
     assert low_level["task_config_overrides"]["video_frame_stride"] == 8
     assert config["visual_checkpoint_markers"] == ["grasp_ready", "hold_12n_complete"]
     assert "Do not use an image to estimate Newtons or decide that a stage is complete" in prompt
-    assert "Do not invent arbitrary per-stage action-count limits" in prompt
+    assert "Do not invent per-stage action-count limits" in prompt
+    assert "Check the returned dictionary from EVERY wait_steps(...) and move_delta(...)" in prompt
+    assert "native_success" not in prompt
+    assert "capx_stop = True" in prompt
     assert 'contract["stage_hold_seconds"]' in prompt
+    assert 'file EXISTS at the start of the initial block with status="uninitialized"' in prompt
+    assert 'saved.get("status") == "uninitialized"' in prompt
+    assert "Do not print capture metadata" in prompt
     assert 'contract["stage_targets_N"][1]' in prompt
     assert 'target - contract["controller_deadband_N"]' in prompt
-    assert "do not use hold_duration_seconds" in prompt
+    assert "continue counting every fresh available sample inside the full official band" in prompt
+    assert "not on a dip below the entry threshold" in prompt
+    assert "do not reapply the entry threshold after a positive saved hold_elapsed_s" in prompt
+    assert "The pre-wait sample establishes entry" in prompt
+    assert "do not invent another key" in prompt
+    assert "AGENT_PROGRESS_PATH" in prompt
+    assert "completed_stages" in prompt
+    assert "same sample_step as last_sample_step" in prompt
     assert "max_code_block_actions" not in config
 
 

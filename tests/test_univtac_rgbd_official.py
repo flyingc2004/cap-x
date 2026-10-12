@@ -565,6 +565,22 @@ def test_wait_steps_applies_official_protocol_checks() -> None:
     assert env._protocol_stop_reason == "early_stop"
 
 
+def test_terminal_action_results_include_reason() -> None:
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._official_task_protocol = True
+    env._protocol_stopped = True
+    env._protocol_stop_reason = "native_success"
+    env._task = types.SimpleNamespace(take_action_cnt=3, step_count=9)
+
+    blocked = env._protocol_blocked_result()
+    waited = env.wait_steps(1)
+
+    assert blocked["ok"] is False
+    assert blocked["reason"] == "native_success"
+    assert waited["ok"] is False
+    assert waited["reason"] == "native_success"
+
+
 def test_wait_steps_enforces_adapter_trial_deadline() -> None:
     env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
     env._official_task_protocol = True

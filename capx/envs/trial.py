@@ -20,15 +20,25 @@ import json
 import os
 import re
 import signal
+import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image, ImageDraw
 
+from capx.envs.agent_progress import (
+    initialize_progress,
+    progress_context,
+    progress_path,
+    read_progress,
+    save_progress_artifact,
+)
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.envs.tasks.exceptions import CodeBlockTimeout
 
 from capx.llm.client import (
     VLM_MODELS,
@@ -442,6 +452,125 @@ def _clear_code_block_action_budget(env: CodeExecutionEnvBase) -> None:
     clearer = getattr(env, "clear_code_block_action_budget", None)
     if callable(clearer):
         clearer()
+
+
+@contextmanager
+def _code_block_wall_watchdog(
+    config: dict[str, Any], code: str, block_index: int, *, can_regenerate: bool
+):
+    """Interrupt one long block without extending the trial's SIGALRM clock."""
+    limit = float(config.get("code_block_wall_timeout_seconds", 0) or 0)
+    if limit <= 0 or not can_regenerate:
+        yield
+        return
+
+    remaining, interval = signal.getitimer(signal.ITIMER_REAL)
+    llm_reserve = (
+        float(os.getenv("CAPX_LLM_TIMEOUT_SECONDS", "200"))
+        + float(os.getenv("CAPX_LLM_HARD_TIMEOUT_GRACE_SECONDS", "15"))
+        + 60.0
+    )
+    if remaining <= llm_reserve + 1.0:
+        yield
+        return
+
+    block_limit = min(limit, remaining - llm_reserve)
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_trace = sys.gettrace()
+    started = time.monotonic()
+
+    def on_timeout(_signum: int, frame) -> None:
+        generated_line = None
+        while frame is not None:
+            if frame.f_code.co_filename == "<string>":
+                generated_line = frame.f_lineno
+                break
+            frame = frame.f_back
+        source_lines = code.splitlines()
+        source_line = (
+            source_lines[generated_line - 1].strip()[:160]
+            if generated_line is not None and generated_line <= len(source_lines)
+            else ""
+        )
+        raise CodeBlockTimeout(
+            f"code block {block_index} exceeded {block_limit:.1f}s",
+            details={
+                "block_index": block_index,
+                "elapsed_wall_seconds": round(time.monotonic() - started, 2),
+                "line_number": generated_line,
+                "source_line": source_line,
+            },
+        )
+
+    def trace_generated_code(frame, event: str, _arg):
+        if frame.f_code.co_filename != "<string>":
+            return None
+        if event == "line" and time.monotonic() - started >= block_limit:
+            on_timeout(signal.SIGALRM, frame)
+        return trace_generated_code
+
+    signal.signal(signal.SIGALRM, on_timeout)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, block_limit)
+        sys.settrace(trace_generated_code)
+        yield
+    finally:
+        sys.settrace(previous_trace)
+        elapsed = time.monotonic() - started
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        signal.setitimer(
+            signal.ITIMER_REAL, max(0.001, remaining - elapsed), interval
+        )
+
+
+def _low_level_count(env: CodeExecutionEnvBase, method_name: str) -> int | None:
+    getter = getattr(getattr(env, "low_level_env", None), method_name, None)
+    return int(getter()) if callable(getter) else None
+
+
+def _code_block_timeout_info(
+    env: CodeExecutionEnvBase,
+    exc: CodeBlockTimeout,
+    *,
+    elapsed: float,
+    action_start: int | None,
+    step_start: int | None,
+) -> dict[str, Any]:
+    action_end = _low_level_count(env, "get_action_count")
+    step_end = _low_level_count(env, "get_step_count")
+    used_actions = (
+        action_end - action_start
+        if action_start is not None and action_end is not None
+        else None
+    )
+    used_steps = (
+        step_end - step_start
+        if step_start is not None and step_end is not None
+        else None
+    )
+    details = exc.details
+    line = details.get("line_number")
+    source = details.get("source_line", "")
+    diagnostic = (
+        "CAPX_FAILURE reason=code_block_timeout "
+        f"block={details.get('block_index')} "
+        f"elapsed_wall_seconds={elapsed:.1f} "
+        f"used_actions={used_actions} used_sim_steps={used_steps} "
+        f"generated_line={line} source={source!r}"
+    )
+    previous_output = getattr(env, "_interrupted_code_output", {})
+    print(f"[capx-trial] {diagnostic}", flush=True)
+    return {
+        "sandbox_rc": 1,
+        "stdout": f"{previous_output.get('stdout', '')}\n{diagnostic}",
+        "stderr": (
+            f"CodeBlockTimeout: {diagnostic}. Check the loop exit condition "
+            "and whether the block makes too many or too-slow actions; "
+            "continue from the current simulator state."
+        ),
+        "task_completed": False,
+    }
 
 
 def _clip_multiturn_code(text: str, max_chars: int, label: str) -> str:
@@ -1236,6 +1365,7 @@ def _handle_multi_turn_step(
     repair_turn_count: int = 0,
     raw_visual_snapshots: list[dict[str, Image.Image]] | None = None,
     visual_checkpoint_records: list[dict[str, Any]] | None = None,
+    agent_progress_path: Path | None = None,
 ) -> tuple[str, str | None, str | None, dict | None, list | None]:
     """Execute one multi-turn decision step.
 
@@ -1327,6 +1457,11 @@ def _handle_multi_turn_step(
     if trial_memory_context:
         complete_multi_turn_prompt = (
             f"{complete_multi_turn_prompt}\n\n{trial_memory_context}"
+        )
+    if agent_progress_path is not None:
+        complete_multi_turn_prompt += "\n\n" + progress_context(
+            agent_progress_path,
+            max_chars=int(config.get("agent_progress_file", {}).get("max_context_chars", 1000)),
         )
     if tactile_code_memory_trace is not None:
         memory_context = _build_tactile_code_memory_runtime_context(
@@ -1496,6 +1631,12 @@ def _run_single_trial(
     trial_start_time = time.time()
     print(f"[capx-trial] trial={trial} begin", flush=True)
 
+    agent_progress_path = progress_path(config, trial)
+    if agent_progress_path is not None:
+        initialize_progress(agent_progress_path)
+    if partial_artifacts is not None:
+        partial_artifacts["agent_progress_path"] = agent_progress_path
+
     use_video_diff = config.get("use_video_differencing", False)
     use_wrist = config.get("use_wrist_camera", False)
     should_record = config["record_video"] or use_video_diff
@@ -1516,6 +1657,8 @@ def _run_single_trial(
         )
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
     print(f"[capx-trial] trial={trial} reset end", flush=True)
+    if agent_progress_path is not None:
+        env.set_agent_progress_path(str(agent_progress_path.resolve()))
     # Reset clears the low-level deadline along with task state. Re-arm both
     # the process alarm and the adapter-side deadline after scene loading.
     _restart_action_deadline_after_reset(env, config)
@@ -1669,6 +1812,8 @@ def _run_single_trial(
     reward = 0.0
     terminated = truncated = False
     code_block_idx = 0
+    agent_action_origin = _low_level_count(env, "get_action_count")
+    agent_step_origin = _low_level_count(env, "get_step_count")
 
     # Track whether we're recording frames (for video diff or record_video)
     recording_frames = (
@@ -1689,6 +1834,10 @@ def _run_single_trial(
             partial_artifacts["current_frame_start"] = frame_start
 
         _set_code_block_action_budget(env, config, code_block_idx)
+        action_start = _low_level_count(env, "get_action_count")
+        step_start = _low_level_count(env, "get_step_count")
+        block_started = time.monotonic()
+        env._interrupted_code_output = {"stdout": "", "stderr": ""}
         begin_video_turn = getattr(env, "begin_video_turn", None)
         if recording_frames and callable(begin_video_turn):
             begin_video_turn(code_block_idx - 1)
@@ -1698,7 +1847,28 @@ def _run_single_trial(
                 f"{code_block_idx}/{len(code_blocks)} begin",
                 flush=True,
             )
-            obs_next, reward, terminated, truncated, info_step = env.step(code)
+            try:
+                with _code_block_wall_watchdog(
+                    config,
+                    code,
+                    code_block_idx,
+                    can_regenerate=bool(multi_turn_prompt)
+                    and code_block_idx <= MULTITURN_LIMIT
+                    and num_regenerations
+                    < int(config.get("max_regenerations", MULTITURN_LIMIT)),
+                ):
+                    obs_next, reward, terminated, truncated, info_step = env.step(code)
+            except CodeBlockTimeout as exc:
+                obs_next = obs
+                reward = 0.0
+                terminated = truncated = False
+                info_step = _code_block_timeout_info(
+                    env,
+                    exc,
+                    elapsed=time.monotonic() - block_started,
+                    action_start=action_start,
+                    step_start=step_start,
+                )
         finally:
             _clear_code_block_action_budget(env)
             end_video_turn = getattr(env, "end_video_turn", None)
@@ -1727,6 +1897,23 @@ def _run_single_trial(
                 flush=True,
             )
             break
+
+        if agent_progress_path is not None:
+            status = read_progress(agent_progress_path)["status"]
+            action_now = _low_level_count(env, "get_action_count")
+            step_now = _low_level_count(env, "get_step_count")
+            progressed = (
+                (agent_action_origin is not None and action_now is not None and action_now > agent_action_origin)
+                or (agent_step_origin is not None and step_now is not None and step_now > agent_step_origin)
+            )
+            if status in ("missing", "invalid") or (status == "uninitialized" and progressed):
+                diagnostic = f"CAPX_FAILURE reason=agent_progress_unavailable status={status}"
+                info_step["sandbox_rc"] = 1
+                info_step["stderr"] = f"{info_step.get('stderr', '')}\n{diagnostic}".strip()
+                if partial_artifacts is not None:
+                    partial_artifacts["info_step"] = info_step
+                print(f"[capx-trial] {diagnostic}", flush=True)
+                break
 
         # Multi-turn decision
         query_multi_turn = bool(multi_turn_prompt)
@@ -1782,6 +1969,7 @@ def _run_single_trial(
                     repair_turn_count=num_regenerations,
                     raw_visual_snapshots=raw_visual_snapshots,
                     visual_checkpoint_records=visual_checkpoint_records,
+                    agent_progress_path=agent_progress_path,
                 )
 
             if mt_ensemble is not None:
@@ -1903,6 +2091,7 @@ def _run_single_trial(
         multiturn_ensemble_data=multiturn_ensemble_data,
         llm_usage_events=llm_usage_events,
     )
+    save_progress_artifact(agent_progress_path, code_path)
     _save_visual_checkpoint_artifacts(code_path, visual_checkpoint_records)
 
     # Save per-turn and combined videos

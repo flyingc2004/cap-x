@@ -1349,6 +1349,13 @@ class UniVTACFrankaCompatApi(ApiBase):
             post_squeeze_qpos=float(cfg.get("post_squeeze_qpos", 0.0)),
             post_squeeze_steps=int(cfg.get("post_squeeze_steps", 0)),
             hold_steps=int(cfg.get("hold_steps", 0)),
+            raw_depth_target_mm=(
+                float(cfg["raw_depth_target_mm"])
+                if cfg.get("raw_depth_target_mm") is not None
+                else None
+            ),
+            raw_depth_gain_qpos_per_mm=float(cfg.get("raw_depth_gain_qpos_per_mm", 0.0005)),
+            raw_depth_min_step_qpos=float(cfg.get("raw_depth_min_step_qpos", 0.000005)),
         )
         return TactileAdaptiveGripperController(
             get_width=lambda: float(calibration_fn()["current_width"]),

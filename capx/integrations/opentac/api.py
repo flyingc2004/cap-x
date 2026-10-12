@@ -124,7 +124,9 @@ class OpenTacApi(ApiBase):
             A JSON-safe ``opentac_tension_control_contract.v1`` mapping. For
             one control sample, call ``wait_steps`` with
             ``sampling_cadence_steps`` and add
-            ``sampling_cadence_seconds`` to a local in-band timer.
+            ``sampling_cadence_seconds`` to a local in-band timer until it
+            reaches ``stage_hold_seconds``. There is no ``hold_duration_s``
+            or ``hold_duration_seconds`` key.
             ``observation_wait_steps`` and ``observation_dt_s`` are the
             corresponding primitive quantities retained for diagnostics.
         """

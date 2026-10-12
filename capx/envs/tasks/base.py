@@ -15,7 +15,7 @@ from gymnasium import Env, spaces
 from capx.envs.base import BaseEnv, ObsType, get_env
 from capx.envs.configs.instantiate import instantiate as cfg_instantiate
 from capx.envs.configs.loader import DictLoader
-from capx.envs.tasks.exceptions import HardStopTrial, RecoverableTaskFailure
+from capx.envs.tasks.exceptions import CodeBlockTimeout, HardStopTrial, RecoverableTaskFailure
 from capx.integrations.base_api import ApiBase, get_api
 
 
@@ -86,6 +86,8 @@ class SimpleExecutor:
             exec(code, g, g)
             return {"ok": True, "result": g.get("RESULT")}
         except HardStopTrial:
+            raise
+        except CodeBlockTimeout:
             raise
         except RecoverableTaskFailure as exc:
             return {
@@ -176,6 +178,9 @@ class CodeExecutionEnvBase(Env):
 
     def _exec_user_code(self, code: str) -> dict[str, Any]:
         obs = self._get_observation()
+        if getattr(getattr(self, "low_level_env", None), "policy_controls_termination", False):
+            # A previous block's END request must never carry into a continuation.
+            self._exec_globals["capx_stop"] = False
         # Update dynamic obs while retaining previously defined variables
         self._exec_globals["obs"] = obs
         self._exec_globals["env"] = self._exec_env_binding()
@@ -187,6 +192,7 @@ class CodeExecutionEnvBase(Env):
 
         stdout_buffer = io.StringIO()
         stderr_buffer = io.StringIO()
+        self._interrupted_code_output = {"stdout": "", "stderr": ""}
         if self.cfg.stream_user_code_output:
             tee_out = Tee(sys.stdout, stdout_buffer)
             tee_err = Tee(sys.stderr, stderr_buffer)
@@ -196,6 +202,7 @@ class CodeExecutionEnvBase(Env):
             tee_out = Tee(stdout_buffer)
             tee_err = Tee(stderr_buffer)
         ok = True
+        completed_normally = True
         undefined_names = self._find_static_undefined_globals(code)
         if undefined_names:
             ok = False
@@ -222,9 +229,14 @@ class CodeExecutionEnvBase(Env):
                 exec(code, self._exec_globals, self._exec_globals)
                 if should_auto_call_solve:
                     self._auto_call_generated_solve(previous_solve, progress_before)
-        except HardStopTrial:
+        except (HardStopTrial, CodeBlockTimeout):
+            self._interrupted_code_output = {
+                "stdout": stdout_buffer.getvalue(),
+                "stderr": stderr_buffer.getvalue(),
+            }
             raise
         except RecoverableTaskFailure as exc:
+            completed_normally = False
             self._exec_globals["RESULT"] = {
                 "recoverable_task_failure": True,
                 "reason": exc.reason,
@@ -240,6 +252,7 @@ class CodeExecutionEnvBase(Env):
         except KeyboardInterrupt:
             raise
         except SystemExit as exc:
+            completed_normally = False
             # Generated programs may use exit()/quit() to stop an expected
             # fallback branch. A zero/None status is normal completion; retain
             # non-zero exits as sandbox failures.
@@ -247,12 +260,14 @@ class CodeExecutionEnvBase(Env):
                 ok = False
                 traceback.print_exc(file=tee_err)
         except BaseException:  # defensive; propagate minimal info
+            completed_normally = False
             ok = False
             # Always print full traceback to the redirected stderr (tee -> console and buffer)
             traceback.print_exc(file=tee_err)
 
         return {
             "ok": ok,
+            "completed_normally": completed_normally,
             "stdout": stdout_buffer.getvalue(),
             "stderr": stderr_buffer.getvalue(),
             "result": self._exec_globals.get("RESULT"),
@@ -348,6 +363,10 @@ class CodeExecutionEnvBase(Env):
             for fn_name, fn in api.functions().items():
                 g[fn_name] = fn
         self._exec_globals = g
+
+    def set_agent_progress_path(self, path: str) -> None:
+        """Expose one runner-owned trial path to generated code, not task state."""
+        self._exec_globals["AGENT_PROGRESS_PATH"] = path
 
     def _exec_env_binding(self) -> Any:
         return self.low_level_env
@@ -476,6 +495,19 @@ class CodeExecutionEnvBase(Env):
         """
         self._step_count += 1
         exec_result = self._exec_user_code(action)
+        policy_end = False
+        if getattr(self.low_level_env, "policy_controls_termination", False):
+            stop_value = self._exec_globals.get("capx_stop")
+            if exec_result["ok"] and exec_result.get("completed_normally") and stop_value is True:
+                try:
+                    self.low_level_env.submit_policy_end()
+                    policy_end = True
+                except Exception:
+                    exec_result["ok"] = False
+                    exec_result["stderr"] += traceback.format_exc()
+            elif exec_result["ok"] and type(stop_value) is not bool:
+                exec_result["ok"] = False
+                exec_result["stderr"] += "capx_stop must be a bool\n"
         obs = self._get_observation()
         # Force viser 3D view update after code execution so the scene
         # reflects the final state (sim substep updates may have been skipped).
@@ -486,7 +518,7 @@ class CodeExecutionEnvBase(Env):
             task_completed = self.low_level_env.task_completed()
         else:
             task_completed = None
-        terminated = reward == 1.0
+        terminated = reward == 1.0 or policy_end
 
         truncated = getattr(self.low_level_env, "_sim_step_count", 0) >= getattr(
             self.low_level_env, "max_steps", 999999

@@ -7,7 +7,7 @@ env:
     stream_user_code_output: false
     low_level:
       _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
-      univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/sdc/ljz/ViTaForge}
+      univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/sdc/ljz/OpenTacBench_capx}
       task_name: tension_strap
       task_config: tension_strap
       force_task: true
@@ -26,7 +26,7 @@ env:
         enabled: true
         history_points: 360
       task_config_overrides:
-        # Keep native physical termination active for visual runs as well.
+        # Keep native physical safety checks; acceptance waits for agent END.
         official_task_protocol: true
         task_cfg_overrides:
           save_pre_move: false
@@ -40,7 +40,7 @@ env:
         force_task_adapter_pre_move: true
       runtime_preflight:
         enabled: true
-        tacex_root: ${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/ViTaForge/third_party/TacEx}
+        tacex_root: ${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/OpenTacBench_capx/third_party/TacEx}
         require_contact_gradient: true
         require_attached_gelpad_asset: true
         require_attachment_points: true
@@ -57,11 +57,13 @@ env:
           min_safe_z: 0.10
           max_gripper_servo_steps: 400
           adaptive_gripper:
-            # Same public two-tick, bounded-depth close protocol as the
-            # official expert.  The stop condition remains bilateral depth,
-            # never a seed-specific qpos.
+            # Match the expert's raw bilateral depth stop and remaining-depth
+            # taper, without a seed-specific qpos target.
             coarse_qpos_step: 0.0001
             fine_qpos_step: 0.0001
+            raw_depth_target_mm: 27.6
+            raw_depth_gain_qpos_per_mm: 0.0005
+            raw_depth_min_step_qpos: 0.000005
             settle_steps_per_command: 2
             contact_debounce_frames: 1
             stable_debounce_frames: 1
@@ -69,7 +71,7 @@ env:
             contact_balance_threshold: 1.0
             slip_threshold: 1.0
             one_sided_force_limit: 1.1
-            target_depth_delta_mm: 6.4
+            target_depth_delta_mm: 0.0
             min_stable_contact_area: 0.0
             post_squeeze_qpos: 0.0
             post_squeeze_steps: 0
@@ -107,19 +109,22 @@ env:
     privileged: false
     apis: [FrankaControlApi, OpenTacApi]
     prompt: |
-      Complete this public tension-strap task using only the documented top-level functions from FrankaControlApi and OpenTacApi. Do not import API modules, instantiate API classes, access the environment, task fields, actor state, true simulator tension, reward, success, metadata, or private observations.
+      Complete this public tension-strap task using only the documented top-level functions from FrankaControlApi and OpenTacApi. Do not import API modules, instantiate API classes, access the environment, task fields, actor state, true simulator tension, reward, success, metadata, or private observations. The only allowed file I/O is reading/writing AGENT_PROGRESS_PATH and its temporary sibling with Python json/os; never read other files.
 
-      The task is two ordered numerical tension holds with the same continuous grasp: first hold the public estimated tension in the first band returned by get_tactile_tension_control_contract(), then, without opening or regrasping, increase tension toward contract["stage_targets_N"][1] before holding the second stage. For the second stage, entering the lower edge of its band is not enough to stop lifting or start the timer; reach the public target within contract["controller_deadband_N"] first. Do not chase exact floating-point equality or deliberately exceed the official upper band edge. Each hold must remain in its required range for the full continuous duration returned by the contract. Do not use an image to estimate Newtons or decide that a stage is complete. Only available estimated_tension_N plus your own continuous timer can complete a stage.
+      AGENT_PROGRESS_PATH is a trial-specific JSON file supplied by the runner. EVERY block must load it before acting. The file EXISTS at the start of the initial block with status="uninitialized"; treat it as a fresh trial and construct a full status="active" record with grasp_confirmed=False, estimator_started=False, completed_stages=[], active_stage_index=0, hold_elapsed_s=0.0, filtered_tension_N=None, last_sample_step=None. Do not mistake it for a missing file or reject it as an invalid active record. Only the initial block may initialize it; a recovery block with a missing, invalid, or still-uninitialized file must print CAPX_FAILURE reason=agent_progress_unavailable and stop, not guess or replay. After grasp, estimator startup, every fresh estimate, and each completed hold, atomically save a full record by dumping to AGENT_PROGRESS_PATH + ".tmp" and using os.replace. Its public agent-authored fields are schema_version="capx_agent_progress.v1", status="active", grasp_confirmed, estimator_started, completed_stages ([], [0], or [0,1]), active_stage_index (0, 1, or 2), hold_elapsed_s, filtered_tension_N, last_sample_step. Never include task GT or private state; this file is not native task success.
+      Initial-block parse order: read the existing JSON, then test if saved.get("status") == "uninitialized" before validating active-record fields. Do not initialize only on FileNotFoundError. On a regenerated block, uninitialized is an error; accept only a valid active record.
 
-      The adapter has already placed an open gripper at the public non-contact strap approach. First call close_gripper(adaptive=True, target_force=0.0, max_steps=400). This is the expert's public bilateral-depth close budget, not a fixed qpos, width, depth, or physical-force target. Continue only if both its top-level stable and bilateral_contact booleans are true; otherwise print CAPX_FAILURE and raise RuntimeError. Do not start the estimator from a partial grasp and do not invent a regrasp policy. Then wait contract["estimator_settle_steps"] without motion, and call begin_tactile_tension_estimator() once. Print exactly CAPX_VISUAL_CHECKPOINT grasp_ready after that setup. Then use breakpoint_code_block() on its own line.
+      The task is two ordered numerical tension holds with the same continuous grasp: first hold the public estimated tension in the first band returned by get_tactile_tension_control_contract(), then, without opening or regrasping, increase tension toward contract["stage_targets_N"][1] before holding the second stage. For the second stage, entering the lower edge of its band is not enough to stop lifting or start the timer; reach the public target within contract["controller_deadband_N"] first. Once that hold starts, maintain it throughout the full official stage band; dipping below the entry threshold while still inside the band does not reset its timer. Do not chase exact floating-point equality or deliberately exceed the official upper band edge. Each hold must remain in its required range for the full continuous duration returned by the contract. Do not use an image to estimate Newtons or decide that a stage is complete. Only available estimated_tension_N plus your own continuous timer can complete a stage.
 
-      In the next block, retrieve a fresh contract. Use only get_tactile_tension_estimate() and its available / estimated_tension_N fields for local proportional z control. Positive move_delta(dz=...) pulls upward and increases tension; negative dz relaxes it. Read the first target from contract["stage_targets_N"][0] and its band from contract["stage_bands_N"][0]. The hold duration key is exactly contract["stage_hold_seconds"]; do not use hold_duration_seconds or any other invented key. At contract["sampling_cadence_steps"], sample the estimate. Maintain filtered_tension locally: initialize it from the first available estimated_tension_N, then update it at every later available sample with contract["force_filter_alpha"] as filtered += alpha * (raw - filtered). Use filtered_tension, not a single raw sample, for band membership and control. Add contract["sampling_cadence_seconds"] to your local in-band timer only for a filtered value inside the band, and reset it for every unavailable or filtered out-of-band sample. Outside the band, calculate error = target - filtered_tension; if abs(error) is at or below contract["controller_deadband_N"], do not move, otherwise call move_delta(dz=...) once using the clipped proportional delta from contract["proportional_delta_gain_m_per_N"] and contract["max_delta_z_m"]. A move_delta already advances one native control cadence: immediately read a fresh estimate on the next loop and do not add wait_steps immediately after it. Use wait_steps(contract["sampling_cadence_steps"]) only while holding inside the band or while an estimate is unavailable. Do not create a local sample, retry, action, or iteration cap; the native physical terminal conditions and trial timeout are the only bounds. When the first continuous hold finishes, call capture_tactile_stage_response() only as a diagnostic, print exactly CAPX_VISUAL_CHECKPOINT hold_12n_complete, and put breakpoint_code_block() on its own line. Do not require any 10D response distance or visual condition as a gate.
+      The adapter has already placed an open gripper at the public non-contact strap approach. In the initial block only, call close_gripper(adaptive=True, target_force=0.0, max_steps=400). The adapter follows the expert's public bilateral raw-depth stop and slows near the threshold; no seed-specific qpos or physical-force target is supplied. Continue only if both its top-level stable and bilateral_contact booleans are true; otherwise print CAPX_FAILURE and raise RuntimeError. Immediately save grasp_confirmed=true. Do not start the estimator from a partial grasp and do not invent a regrasp policy. Then wait contract["estimator_settle_steps"] without motion, call begin_tactile_tension_estimator() once, and save estimator_started=true. On recovery when those flags are recorded, do not reclose or repeat settling. Print exactly CAPX_VISUAL_CHECKPOINT grasp_ready after that setup. Then use breakpoint_code_block() on its own line.
 
-      In the third block, retrieve a fresh contract and continue the same grasp. Read the second official band from contract["stage_bands_N"][1] and the public target from contract["stage_targets_N"][1]. It requires additional upward motion after the first hold; do not release, reopen, or return to the approach pose. If filtered_tension is inside the second band but still below target - contract["controller_deadband_N"], continue bounded proportional upward adjustments instead of counting hold time. Start and continue the second hold only when filtered_tension is at least that near-target threshold and no greater than the official upper edge. If it leaves that range or the estimate becomes unavailable, reset the second-stage timer and reapproach; otherwise wait at the same pose, adding contract["sampling_cadence_seconds"] per valid cadence. When its continuous numerical hold finishes, call capture_tactile_stage_response() for diagnostics and end normally. The task independently applies the expert's physical terminal contract: two ordered 3-second physical holds, with grasp-loss, overload, travel-limit, and 60-second timeout handling. Do not invent arbitrary per-stage action-count limits, early-success conditions, or terminal heuristics.
+      In the next block, retrieve a fresh contract and load the progress file. If completed_stages already contains 0, skip the first hold entirely and continue with 18 N; never lower tension to repeat 12 N. Use only get_tactile_tension_estimate() and its available / estimated_tension_N fields for local proportional z control. Positive move_delta(dz=...) pulls upward and increases tension; negative dz relaxes it. Read the first target from contract["stage_targets_N"][0] and its band from contract["stage_bands_N"][0]. The hold duration key is exactly contract["stage_hold_seconds"]; read it before any physical action, and do not invent another key such as hold_duration_s or hold_duration_seconds. Maintain filtered_tension locally: initialize from the first available estimate, then update later samples with contract["force_filter_alpha"] as filtered += alpha * (raw - filtered). Use filtered_tension for band membership and control. On recovery, retain saved partial hold_elapsed_s and filtered_tension_N only if a fresh public estimate is available, inside the official stage band, and has the same sample_step as last_sample_step; for 18 N a positive saved hold_elapsed_s means the entry threshold was already reached. Otherwise clear only the active timer and reinitialize the filter, keeping completed_stages. While holding, call wait_steps(contract["sampling_cadence_steps"]), then read a fresh estimate and add contract["sampling_cadence_seconds"] only if the post-wait value remains inside the official stage band. Save every accepted sample atomically. On unavailable/out-of-band data clear and save the timer. Before every move_delta save hold_elapsed_s=0; then make one clipped proportional adjustment and sample again without another wait. Do not create a local sample, retry, action, or iteration cap; native physical terminal conditions and trial timeout bound the run. As soon as the first continuous hold finishes, save completed_stages=[0] and active_stage_index=1 BEFORE calling capture_tactile_stage_response() as a diagnostic, print exactly CAPX_VISUAL_CHECKPOINT hold_12n_complete, then put breakpoint_code_block() on its own line. No 10D or visual condition is a gate.
+
+      In the third block, retrieve a fresh contract and load the same progress file before acting; continue the same grasp at active_stage_index=1. Read the second official band from contract["stage_bands_N"][1] and target from contract["stage_targets_N"][1]. It requires additional upward motion after the first hold; do not release, reopen, return to the approach pose, or repeat 12 N. If filtered_tension is inside the second band but below target - contract["controller_deadband_N"] BEFORE the hold starts, continue bounded proportional upward adjustments instead of counting hold time. Start the hold only at or above that near-target threshold and no higher than the upper edge. The pre-wait sample establishes entry; after waiting, credit the next sample if it remains in the official band, even below the entry threshold. Once hold_elapsed_s is positive, wait without moving and continue counting every fresh available sample inside the full official band, even below the entry threshold. Reset only on an unavailable estimate or a value outside the official band, not on a dip below the entry threshold. On recovery retain a partial timer only if a fresh public estimate is inside the official band and has exactly the saved last_sample_step; do not reapply the entry threshold after a positive saved hold_elapsed_s. Otherwise reset the active timer only. After each wait read a fresh estimate before crediting time; atomically save each fresh sample, and clear/save the timer before every move. When its continuous numerical hold finishes, save completed_stages=[0,1] and active_stage_index=2 BEFORE diagnostic capture, then set capx_stop = True at top level and end normally. Native grasp-loss, overload, travel-limit, and timeout protections remain active; physical stage acceptance alone never stops the policy. The evaluator calls finish_episode() once after END and keeps its private verdict out of generated code. Never call finish_episode() yourself. Do not invent per-stage action-count limits, early-success conditions, or terminal heuristics.
 
       The initial prompt contains raw public head/wrist RGB. After grasp_ready and hold_12n_complete, the runner may attach a previous-versus-current raw camera comparison. Vision is an anomaly guard only: it may identify visible grasp loss, strap slackness, drift, or a sudden abnormal change. If vision looks concerning while the numerical estimate remains available, do not reverse or complete a stage based on the image. Instead use a smaller subsequent numerical adjustment or wait/re-observe. If the grasp is visibly lost and no bilateral grasp remains, print CAPX_FAILURE and raise RuntimeError. At a normal visual checkpoint, answer the runner's follow-up with CONTINUE so the next existing code block executes.
 
-      Every block must be independently executable. Retrieve contract again at the start of any block that needs it. Keep stdout concise. On a deliberate physical failure print CAPX_FAILURE and raise RuntimeError; do not swallow errors. Return all three blocks either in one Python fence with the two breakpoint_code_block() lines, or in three ordered Python fences. The runner preserves all fences in order.
+      Every block must be independently executable. Retrieve contract and read AGENT_PROGRESS_PATH at its start; do not depend on earlier Python locals. capx_stop is reset to False by the runner at the start of each block; only the completed third block may set the literal boolean True. Check the returned dictionary from EVERY wait_steps(...) and move_delta(...), including estimator settling. Use a small require_action(result) helper in each block. Any ok=False result must print CAPX_FAILURE and raise RuntimeError. Never continue a loop after an action returns ok=False. This uses public action status, not private task success. Keep stdout concise. Do not print capture metadata; capture_tactile_stage_response() stores it. On deliberate physical failure print CAPX_FAILURE and raise RuntimeError; do not swallow errors. Return all three blocks either in one Python fence with two breakpoint_code_block() lines, or in three ordered Python fences.
     multi_turn_prompt: |
       Executed code:
       {executed_code}
@@ -130,12 +135,14 @@ env:
       Console stderr:
       {console_stderr}
 
-      This is a checkpoint-or-failure continuation. At a normal CAPX_VISUAL_CHECKPOINT, preserve the numerical plan and answer CONTINUE so the next existing block runs. Regenerate only after a genuine execution failure or a clearly visible physical anomaly. The simulator is already at the executed state, so regenerated code must be a short self-contained continuation and must retrieve a fresh contract rather than relying on earlier Python variables. Raw RGB can identify grasp/strap anomalies but cannot estimate Newtons, complete a hold, reset a numerical timer, reveal true tension, or override estimated_tension_N. Preserve the environment-owned physical terminal contract; do not add action-count terminal conditions or claim task success yourself. Do not use actor state, true tension, reward, success, task metadata, or frozen-memory distances. Do not reopen or regrasp between normal 12N and 18N progression.
+      This is a checkpoint-or-failure continuation. At a normal CAPX_VISUAL_CHECKPOINT, answer CONTINUE so the next existing block reads AGENT_PROGRESS_PATH and runs. Regenerate only after a genuine failure or clearly visible anomaly. The appended agent_progress.json snapshot is an agent-authored public checkpoint, not task GT. A recovery block must read that file and a fresh contract before acting. If the file is missing, invalid, or uninitialized after physical actions, fail rather than guess. Keep completed_stages; preserve partial hold only with a fresh public estimate inside the official stage band whose sample_step equals last_sample_step; for 18 N a positive saved hold_elapsed_s already establishes entry. Otherwise reset only the active timer. If REGENERATE replaces pending blocks, include only unfinished stages. Check every wait_steps/move_delta return; any ok=False is failure. Raw RGB can identify anomalies but cannot estimate Newtons or complete/reset a numerical hold. Do not reopen or regrasp, access true tension/private state, or replay 12N after its saved completion. Only after both local holds are saved, set capx_stop = True at top level and return normally; never call finish_episode() yourself.
+      If the preceding block ended with code_block_timeout, inspect its generated line, elapsed time, action count, and simulator steps. Continue from the file and current public estimate, never from an assumed local variable.
 trials: 1
 num_workers: 1
 record_video: true
 output_dir: ./outputs/vitaforge_tension_strap_stage_memory_control_visual
-trial_timeout_seconds: 1800
+trial_timeout_seconds: 3000
+code_block_wall_timeout_seconds: 1800
 max_trial_retries: 1
 max_regenerations: 1
 stop_multiturn_when_regeneration_exhausted: true
@@ -157,8 +164,9 @@ visual_feedback_raw_camera_views: true
 visual_feedback_max_image_side_px: 512
 visual_feedback_jpeg_quality: 80
 visual_checkpoint_markers: [grasp_ready, hold_12n_complete]
-include_trial_memory_in_multiturn: true
-multiturn_trial_memory_max_chars: 1000
+agent_progress_file:
+  enabled: true
+  max_context_chars: 1000
 tactile_memory:
   trial:
     enabled: false

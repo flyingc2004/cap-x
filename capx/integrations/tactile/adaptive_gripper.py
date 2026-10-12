@@ -28,6 +28,9 @@ class AdaptiveGripperConfig:
     post_squeeze_qpos: float = 0.0
     post_squeeze_steps: int = 0
     hold_steps: int = 0
+    raw_depth_target_mm: float | None = None
+    raw_depth_gain_qpos_per_mm: float = 0.0005
+    raw_depth_min_step_qpos: float = 0.000005
 
     def __post_init__(self) -> None:
         if self.coarse_step <= 0.0 or self.fine_step <= 0.0:
@@ -46,6 +49,15 @@ class AdaptiveGripperConfig:
             raise ValueError("post_squeeze_steps must be non-negative")
         if self.hold_steps < 0:
             raise ValueError("hold_steps must be non-negative")
+        if self.raw_depth_target_mm is not None:
+            if not np.isfinite(self.raw_depth_target_mm) or self.raw_depth_target_mm <= 0.0:
+                raise ValueError("raw_depth_target_mm must be positive and finite")
+            if not np.isfinite(self.raw_depth_gain_qpos_per_mm) or self.raw_depth_gain_qpos_per_mm <= 0.0:
+                raise ValueError("raw_depth_gain_qpos_per_mm must be positive and finite")
+            if not np.isfinite(self.raw_depth_min_step_qpos) or not (
+                0.0 < self.raw_depth_min_step_qpos <= self.coarse_step * self.max_qpos
+            ):
+                raise ValueError("raw_depth_min_step_qpos must fit within the coarse step")
 
 
 class TactileAdaptiveGripperController:
@@ -109,6 +121,9 @@ class TactileAdaptiveGripperController:
         min_stable_contact_area = max(0.0, float(min_stable_contact_area))
         post_squeeze_steps = max(0, int(post_squeeze_steps))
         hold_steps = max(0, int(hold_steps))
+        raw_depth_target = self.config.raw_depth_target_mm
+        if raw_depth_target is not None and post_squeeze_qpos > 0.0 and post_squeeze_steps:
+            raise ValueError("raw-depth closing cannot apply a post-squeeze")
         post_squeeze_width = 0.0
         if self.config.max_qpos > 0.0:
             post_squeeze_width = max(0.0, float(post_squeeze_qpos)) / self.config.max_qpos
@@ -130,12 +145,29 @@ class TactileAdaptiveGripperController:
             left_force = float(summary["left"].get("normal_force", 0.0))
             right_force = float(summary["right"].get("normal_force", 0.0))
 
+            raw_depths: tuple[float, float] | None = None
+            depth_target_reached = False
+            if raw_depth_target is not None:
+                try:
+                    raw_depths = (
+                        float(summary["left"]["depth_min_mm"]),
+                        float(summary["right"]["depth_min_mm"]),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    self._append_trace("close", iteration, "invalid_raw_depth", width, summary)
+                    return self._close_result(False, "invalid_raw_depth", iteration + 1, summary)
+                if not all(np.isfinite(value) for value in raw_depths):
+                    self._append_trace("close", iteration, "invalid_raw_depth", width, summary)
+                    return self._close_result(False, "invalid_raw_depth", iteration + 1, summary)
+                depth_target_reached = all(value < raw_depth_target for value in raw_depths)
             stable_candidate = self._is_stable_close_candidate(
                 summary,
                 target_force=target_force,
-                target_depth_delta_mm=target_depth_delta_mm,
+                target_depth_delta_mm=0.0 if raw_depth_target is not None else target_depth_delta_mm,
                 min_stable_contact_area=min_stable_contact_area,
             )
+            if raw_depth_target is not None:
+                stable_candidate = bool(depth_target_reached and stable_candidate)
             stable_frames = stable_frames + 1 if stable_candidate else 0
             if not stable_candidate:
                 hold_frames = 0
@@ -153,7 +185,9 @@ class TactileAdaptiveGripperController:
             )
             needs_hold = bool(ready_to_accept and not needs_post_squeeze and hold_frames < hold_steps)
 
-            if needs_post_squeeze:
+            if raw_depth_target is not None and depth_target_reached:
+                phase = "raw_depth_target"
+            elif needs_post_squeeze:
                 phase = "post_squeeze"
             elif needs_hold:
                 phase = "hold_confirm"
@@ -171,6 +205,9 @@ class TactileAdaptiveGripperController:
                 phase = "coarse_close"
             self._append_trace("close", iteration, phase, width, summary)
 
+            if depth_target_reached and not stable_candidate:
+                return self._close_result(False, "raw_depth_target_unstable", iteration + 1, summary)
+
             if ready_to_accept:
                 if needs_post_squeeze:
                     post_squeeze_applied += 1
@@ -185,7 +222,7 @@ class TactileAdaptiveGripperController:
                     continue
                 return self._close_result(
                     True,
-                    "stable_grasp",
+                    "bilateral_depth_target" if raw_depth_target is not None else "stable_grasp",
                     iteration + 1,
                     summary,
                     post_squeeze_applied=post_squeeze_applied,
@@ -219,7 +256,16 @@ class TactileAdaptiveGripperController:
             if stable_candidate:
                 target_width = width
             else:
-                step = self.config.fine_step if (contact or ever_contact) else self.config.coarse_step
+                if raw_depths is not None and raw_depth_target is not None:
+                    remaining_mm = max(value - raw_depth_target for value in raw_depths)
+                    step_qpos = float(np.clip(
+                        remaining_mm * self.config.raw_depth_gain_qpos_per_mm,
+                        self.config.raw_depth_min_step_qpos,
+                        self.config.coarse_step * self.config.max_qpos,
+                    ))
+                    step = step_qpos / self.config.max_qpos
+                else:
+                    step = self.config.fine_step if (contact or ever_contact) else self.config.coarse_step
                 target_width = max(0.0, width - step)
             self._command_width(target_width, self.config.settle_steps_per_command)
 
@@ -406,6 +452,8 @@ class TactileAdaptiveGripperController:
             "depth_delta_mm": float(summary["depth_delta_mm"]),
             "left_depth_delta_mm": float(summary["left"].get("depth_delta_mm", 0.0)),
             "right_depth_delta_mm": float(summary["right"].get("depth_delta_mm", 0.0)),
+            "left_depth_min_mm": summary["left"].get("depth_min_mm"),
+            "right_depth_min_mm": summary["right"].get("depth_min_mm"),
             "post_squeeze_applied": int(post_squeeze_applied),
             "hold_steps": int(hold_steps),
             "slip_score": float(summary["slip_score"]),

@@ -33,3 +33,11 @@ class HardStopTrial(TimeoutError):
         self.reason = str(reason)
         self.details = dict(details or {})
         super().__init__(message or self.reason)
+
+
+class CodeBlockTimeout(BaseException):
+    """Watchdog interrupt that generated ``except Exception`` must not swallow."""
+
+    def __init__(self, message: str, *, details: dict[str, Any]) -> None:
+        self.details = dict(details)
+        super().__init__(message)

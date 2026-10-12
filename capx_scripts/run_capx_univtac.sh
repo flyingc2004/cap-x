@@ -27,6 +27,16 @@ fi
 
 export CAPX_ENV_AUTO_ACTIVATE=0
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+if [[ -n "${TACEX_RUNTIME_ROOT:-}" ]]; then
+  for package in tacex tacex_uipc tacex_assets tacex_tasks; do
+    source_dir="${TACEX_RUNTIME_ROOT}/source/${package}"
+    if [[ ! -d "${source_dir}" ]]; then
+      echo "[capx-univtac] ERROR: missing TacEx source: ${source_dir}" >&2
+      exit 2
+    fi
+    export PYTHONPATH="${source_dir}:${PYTHONPATH}"
+  done
+fi
 export HEADLESS="${HEADLESS:-1}"
 export LIVESTREAM="${LIVESTREAM:-0}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
@@ -43,9 +53,16 @@ print(f"[capx-univtac] mode=${MODE}, trials=${TRIALS}")
 PY
 
 if [[ -f "${CONDA_SH}" ]]; then
+  # Conda's binutils activation hook probes optional tool variables (for
+  # example ADDR2LINE) before defining them.  This launcher otherwise uses
+  # `set -u`, which makes that hook abort before CaP-X starts.  Relax nounset
+  # only while Conda runs its activation/deactivation hooks, then restore it
+  # for the actual trial command below.
+  set +u
   # shellcheck disable=SC1090
   source "${CONDA_SH}"
   conda activate "${CONDA_ENV_NAME}"
+  set -u
 fi
 
 python capx/envs/launch_univtac.py \

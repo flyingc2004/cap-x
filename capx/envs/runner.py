@@ -19,6 +19,7 @@ from typing import Any
 from tqdm import tqdm
 
 from capx.envs.configs.instantiate import instantiate
+from capx.envs.agent_progress import save_progress_artifact
 from capx.envs.tasks.base import CodeExecutionEnvBase
 from capx.llm.client import LLMQueryError, summarize_llm_usage
 from capx.envs.trial import (
@@ -565,6 +566,7 @@ def _build_aborted_summary(
             multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
             llm_usage_events=pa.get("llm_usage_events", []),
         )
+        save_progress_artifact(pa.get("agent_progress_path"), code_path)
         _save_visual_checkpoint_artifacts(
             code_path,
             pa.get("visual_checkpoint_records", []),
