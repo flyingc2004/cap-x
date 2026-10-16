@@ -111,6 +111,32 @@ def test_missing_piano_grasp_anchor_does_not_return_tool_pose():
         UniVTACFrankaCompatApi(PianoEnv(with_striker=False)).sample_grasp_pose("striker")
 
 
+def test_piano_landmarks_work_without_task_side_public_pose_method():
+    class Key:
+        def __init__(self, midi, y):
+            self.midi = midi
+            self.size = (.15, .0225, .0225)
+            self.strike_position = (.47, y, .0725)
+
+    class Task:
+        layout = (Key(60, -.1), Key(67, .05), Key(69, .1))
+        striker_position = (.34, .15, .003)
+        striker_grasp_height = .085
+
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env.task_name = "play_piano"
+    env._task = Task()
+    env._public_pose_cache = {}
+    env._refresh_public_pose_cache()
+
+    assert set(env._public_pose_cache) == {
+        "striker", "key_c4", "key_g4", "key_a4", "piano_safe_hover"
+    }
+    assert env._public_pose_cache["striker"]["position"] == pytest.approx((.34, .15, .088))
+    assert env._public_pose_cache["key_c4"]["position"] == pytest.approx((.47, -.1, .1605))
+    assert {record["source"] for record in env._public_pose_cache.values()} == {"piano_static_layout"}
+
+
 def test_piano_public_grasp_anchor_is_reachable_above_safety_floor():
     env = PianoEnv()
     api = UniVTACFrankaCompatApi(env)

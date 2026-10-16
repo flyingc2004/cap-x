@@ -3462,7 +3462,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         ]
 
     def _refresh_public_pose_cache(self) -> None:
-        """Cache only task-declared public anchors and slots for LLM APIs."""
+        """Cache public anchors, including the piano's fixed class layout."""
         self._public_pose_cache.clear()
         task = self._task
         if task is None:
@@ -3487,6 +3487,14 @@ class UniVTACLowLevelEnv(BaseEnv):
                     )
                     if parsed is not None:
                         self._public_pose_cache[str(name)] = parsed
+
+        if self.task_name == "play_piano" and not self._public_pose_cache:
+            for name, raw_pose in self._piano_static_public_pose_map(type(task)).items():
+                parsed = self._public_pose_entry_to_record(
+                    raw_pose, name=name, source="piano_static_layout"
+                )
+                if parsed is not None:
+                    self._public_pose_cache[name] = parsed
 
         object_extent = np.array([0.04, 0.04, 0.08], dtype=np.float32)
         slot_extent = np.array([0.10, 0.10, 0.02], dtype=np.float32)
@@ -3549,6 +3557,44 @@ class UniVTACLowLevelEnv(BaseEnv):
                 f"keys={sorted(self._public_pose_cache)}",
                 flush=True,
             )
+
+    @staticmethod
+    def _piano_static_public_pose_map(task_class: type) -> dict[str, dict[str, Any]]:
+        """Build public landmarks from the piano class layout, never live actors."""
+        layout = getattr(task_class, "layout", None)
+        striker_position = getattr(task_class, "striker_position", None)
+        if layout is None or striker_position is None:
+            raise ValueError("piano static layout or striker geometry is unavailable")
+        striker = np.asarray(striker_position, dtype=np.float32).reshape(3)
+        grasp_height = float(getattr(task_class, "striker_grasp_height", float("nan")))
+        if not np.all(np.isfinite(striker)) or not np.isfinite(grasp_height):
+            raise ValueError("piano static striker geometry is unavailable")
+        keys = {int(key.midi): key for key in layout}
+        if not {60, 67, 69}.issubset(keys):
+            raise ValueError("piano static layout is missing C4, G4, or A4")
+        quaternion = [1.0, 0.0, 0.0, 0.0]
+        poses = {
+            "striker": {
+                "position": (striker + [0.0, 0.0, grasp_height]).tolist(),
+                "quaternion_wxyz": quaternion,
+                "extent": [0.026, 0.026, 0.108],
+            },
+            "piano_safe_hover": {
+                "position": [0.42, 0.0, 0.23],
+                "quaternion_wxyz": quaternion,
+                "extent": [0.01, 0.01, 0.01],
+            },
+        }
+        for name, midi in (("key_c4", 60), ("key_g4", 67), ("key_a4", 69)):
+            key = keys[midi]
+            position = np.asarray(key.strike_position, dtype=np.float32).reshape(3)
+            position[2] += grasp_height + 0.003
+            poses[name] = {
+                "position": position.tolist(),
+                "quaternion_wxyz": quaternion,
+                "extent": list(key.size),
+            }
+        return poses
 
     def _public_pose_entry_to_record(
         self,
