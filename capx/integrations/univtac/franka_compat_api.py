@@ -406,6 +406,16 @@ class UniVTACFrankaCompatApi(ApiBase):
                 "get_robot_state": self.get_robot_state,
                 "wait_steps": self.wait_steps,
             }
+        elif getattr(self, "llm_api_profile", None) == "opentac_piano":
+            full = {
+                "get_object_pose": self._memory_match_get_object_pose,
+                "sample_grasp_pose": self.sample_grasp_pose,
+                "goto_pose": self._piano_goto_pose,
+                "move_delta": self._piano_move_delta,
+                "open_gripper": self.open_gripper,
+                "close_gripper": self.close_gripper,
+                "wait_steps": self._memory_match_wait_steps,
+            }
         return self._filter_llm_visible_functions(full)
 
     def _filter_llm_visible_functions(self, functions: dict[str, Any]) -> dict[str, Any]:
@@ -485,6 +495,89 @@ class UniVTACFrankaCompatApi(ApiBase):
             yaw_segment_rad=self.local_yaw_segment_rad,
             operation="move_delta",
         )
+
+    def _piano_goto_pose(
+        self,
+        position: np.ndarray,
+        quaternion_wxyz: np.ndarray,
+        z_approach: float = 0.0,
+        monitor_tactile: bool = False,
+    ) -> dict[str, Any]:
+        """Move the gripper center through bounded qpos waypoints.
+
+        The orientation argument is accepted for the usual CaP pose API, but
+        the piano bridge holds the current gripper orientation throughout.
+        """
+        target = np.asarray(position, dtype=np.float32).reshape(3)
+        quat = np.asarray(quaternion_wxyz, dtype=np.float32).reshape(4)
+        if not np.all(np.isfinite(target)) or not np.all(np.isfinite(quat)):
+            raise ValueError("goto_pose requires finite piano target pose")
+        if target[2] < self.min_safe_z:
+            return {"ok": False, "reason": "piano_min_safe_z", "min_safe_z": self.min_safe_z}
+        approach = float(z_approach)
+        if not np.isfinite(approach) or approach < 0.0:
+            raise ValueError("z_approach must be finite and nonnegative")
+        targets = [target]
+        if approach > 0.0:
+            hover = target.copy()
+            hover[2] += approach
+            targets.insert(0, hover)
+        last_result: dict[str, Any] = {"ok": True, "completed_steps": 0}
+        get_center = getattr(self._env, "get_piano_gripper_center_pose", None)
+        move_center = getattr(self._env, "move_piano_gripper_center_pose", None)
+        if not callable(get_center) or not callable(move_center):
+            return {"ok": False, "reason": "piano_qpos_bridge_unavailable"}
+        for waypoint in targets:
+            start, _ = get_center()
+            start = np.asarray(start, dtype=np.float32).reshape(3)
+            ratio = float(np.max(np.abs(waypoint - start))) / self.max_delta_xyz
+            steps = max(1, int(np.ceil(ratio - 1e-5)))
+            if self.max_goto_pose_actions is not None and steps > self.max_goto_pose_actions:
+                return {
+                    "ok": False,
+                    "reason": "piano_goto_action_limit",
+                    "requested_steps": steps,
+                    "max_steps": self.max_goto_pose_actions,
+                }
+            for step in range(1, steps + 1):
+                next_position = start + (waypoint - start) * (step / steps)
+                result = move_center(next_position)
+                if not bool(result.get("ok", False)):
+                    return {**result, "completed_steps": last_result["completed_steps"]}
+                last_result = {**result, "completed_steps": last_result["completed_steps"] + 1}
+                if monitor_tactile or self._holding_with_tactile:
+                    guard = self._tactile_guard_failure(
+                        abort_on_contact_loss=True,
+                        tactile_force_threshold=None,
+                        slip_threshold=None,
+                    )
+                    if guard is not None:
+                        return {**last_result, **guard}
+        return last_result
+
+    def _piano_move_delta(
+        self,
+        dx: float = 0.0,
+        dy: float = 0.0,
+        dz: float = 0.0,
+    ) -> dict[str, Any]:
+        """Apply one small world-frame gripper-center step for a key press."""
+        delta = np.asarray([dx, dy, dz], dtype=np.float32)
+        if not np.all(np.isfinite(delta)):
+            raise ValueError("move_delta requires finite dx, dy, dz")
+        distance = float(np.linalg.norm(delta))
+        if distance > self.local_delta_max_m + 1e-8:
+            return {
+                "ok": False,
+                "reason": "local_delta_limit",
+                "requested_distance_m": distance,
+                "max_distance_m": self.local_delta_max_m,
+            }
+        get_center = getattr(self._env, "get_piano_gripper_center_pose", None)
+        if not callable(get_center):
+            return {"ok": False, "reason": "piano_qpos_bridge_unavailable"}
+        center, quat = get_center()
+        return self._piano_goto_pose(np.asarray(center) + delta, quat)
 
     def _opentac_tension_move_delta(self, dz: float) -> dict[str, Any]:
         """Apply one bounded world-Z adjustment for a ViTaForge force task.
@@ -950,6 +1043,12 @@ class UniVTACFrankaCompatApi(ApiBase):
         grasp_pose = self._public_grasp_pose(key)
         if grasp_pose is not None:
             return grasp_pose
+        if self.llm_api_profile == "opentac_piano" and self._normalize_name(key) == "striker":
+            anchor = self._public_anchor_pose(key)
+            if anchor is None:
+                raise KeyError("public piano striker grasp anchor is unavailable")
+            print("[univtac-franka] grasp_source=public_piano_anchor object=striker", flush=True)
+            return anchor[0], anchor[1]
         if key == "can":
             raise KeyError("object 'can' is not available for UniVTAC grasp sampling")
         tool_pos, tool_quat = self._current_tool_pose()

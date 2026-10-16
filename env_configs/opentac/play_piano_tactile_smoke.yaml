@@ -1,0 +1,126 @@
+# Engineering smoke only: native key force is not available to the policy.
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    stream_user_code_output: false
+    low_level:
+      _target_: capx.envs.simulators.univtac.UniVTACLowLevelEnv
+      univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/sdc/ljz/OpenTacBench_capx}
+      task_name: play_piano
+      task_config: play_piano
+      force_task: true
+      force_task_seed: ${oc.env:CAPX_FORCE_TASK_SEED,0}
+      seed_base: ${oc.env:CAPX_FORCE_TASK_SEED,0}
+      device: cuda:0
+      video_renderer: task_native
+      video_stream_fps: 15.0
+      tactile_summary_timeline_enabled: true
+      tactile_summary_timeline_max_records: 2048
+      live_preview_enabled: true
+      live_preview_path: ${oc.env:CAPX_LIVE_PREVIEW_PATH,/mnt/sdc/ljz/t-cap/capx-runs/play_piano_latest.jpg}
+      live_preview_stride: 5
+      task_config_overrides:
+        official_task_protocol: true
+        defer_piano_scoring_failure_until_end: true
+        task_cfg_overrides:
+          save_pre_move: false
+        runtime_task_mode: eval_test
+        render_frequency: 2
+        video_frequency: 0
+        record_video_during_reset: false
+        record_pre_move_frames: false
+        skip_task_pre_move: false
+      runtime_preflight:
+        enabled: true
+        tacex_root: ${oc.env:TACEX_RUNTIME_ROOT,/mnt/sdc/ljz/OpenTacBench_capx/third_party/TacEx}
+        require_contact_gradient: true
+        require_attached_gelpad_asset: true
+        require_attachment_points: true
+        expected_attachment_points_per_obj: 83
+      api_configs:
+        franka_control_api:
+          llm_api_profile: opentac_piano
+          llm_visible_functions: [get_object_pose, sample_grasp_pose, goto_pose, move_delta, open_gripper, close_gripper, wait_steps]
+          rgbd_perception_enabled: false
+          public_anchor_pose_enabled: true
+          public_grasp_anchor_objects: [striker]
+          use_task_grasp_actor_for_objects: false
+          use_task_place_actor_for_landmarks: false
+          use_native_pose_planner: false
+          preserve_landmark_orientation: true
+          tactile_adaptive_gripper_enabled: true
+          min_safe_z: 0.08
+          max_delta_xyz: 0.004
+          max_goto_pose_actions: 120
+          local_delta_max_m: 0.000075
+          local_delta_segment_m: 0.000075
+          local_wait_max_steps: 90
+          max_gripper_servo_steps: 400
+          goto_pose_tactile_guard_force_threshold: 0.12
+          adaptive_gripper:
+            coarse_qpos_step: 0.0001
+            fine_qpos_step: 0.0001
+            raw_depth_target_mm: 27.4
+            raw_depth_gain_qpos_per_mm: 0.0005
+            raw_depth_min_step_qpos: 0.000005
+            settle_steps_per_command: 2
+            contact_debounce_frames: 1
+            stable_debounce_frames: 1
+            contact_force_threshold: 0.0
+            contact_balance_threshold: 1.0
+            slip_threshold: 1.0
+            one_sided_force_limit: 1.1
+            target_depth_delta_mm: 0.0
+            min_stable_contact_area: 0.0
+            post_squeeze_qpos: 0.0
+            post_squeeze_steps: 0
+            hold_steps: 0
+        univtac_tactile_api:
+          llm_visible_functions: [get_tactile_summary, is_grasp_stable]
+      expose_actor_pose: false
+      privileged: false
+      enable_render: true
+    privileged: false
+    apis: [FrankaControlApi, UniVTACTactileApi]
+    prompt: |
+      Play exactly five notes with the piano striker: C4 short, C4 long, G4 short, G4 long, A4 short. This is a complete-sequence engineering smoke, not a calibrated-force trial. Attempt all five notes before asking the environment for its final verdict. Call only the injected FrankaControlApi and UniVTACTactileApi functions directly. Do not call the task expert, task atoms, finish_episode(), or access env, actor state, key_forces, score, reward, success, metadata, or hidden task fields.
+
+      The task pre_move only raises the gripper for clearance; it does not open the fingers or grasp the striker. Public poses are fixed GRIPPER-CENTER landmarks, not live actor tracking. sample_grasp_pose("striker") returns the static grasp center. get_object_pose("key_c4"), get_object_pose("key_g4"), get_object_pose("key_a4"), and get_object_pose("piano_safe_hover") return nominal control poses. Preserve the current gripper orientation. goto_pose uses bounded qpos waypoints; move_delta is a single very small world-frame gripper-center adjustment. Neither function grasps or presses automatically.
+
+      Generate one finite, self-contained Python block. Start with capx_stop = False. Follow the public part of the task expert's sequence: open_gripper(adaptive=True, target_width=0.7), checking released and ok; approach the striker from directly above; descend to sample_grasp_pose("striker"); close_gripper(adaptive=True, target_force=0.0, max_steps=240), then wait_steps(12) to let the grasp settle; require a stable bilateral grasp with is_grasp_stable() before lifting. The close step budget is needed for the slow adaptive servo to reach bilateral contact from the open pose; do not interpret max_steps exhaustion as a stable grasp. Do not request fully open width 1.0: the adaptive servo may exhaust its step budget before reaching it. Check every motion result's ok field, and stop explicitly on failure. Lift the held striker vertically to the public piano_safe_hover height before any lateral travel.
+
+      Visit the keys in this exact order and articulation: (key_c4, short), (key_c4, long), (key_g4, short), (key_g4, long), (key_a4, short). get_object_pose(key_name) returns (position, quaternion_wxyz). Implement all five note attempts in this block, not just grasp or the first note. First travel horizontally at safe hover height, then descend at fixed XY to the nominal key control landmark. Press through a finite series of separate move_delta(dz=...) calls, each no larger than 0.000075 m downward. Do not estimate or control key force in this smoke. Use tactile readings only to confirm the striker remains grasped; never use them as a key-force estimate or as evidence that a note was accepted. Hold briefly for short notes and longer for long notes: the official minimum durations are 0.20 s and 0.60 s, and one wait_steps(1) advances one 1/120 s simulation tick. Hold for at least 30 ticks on short notes and 78 ticks on long notes, with each wait_steps call no larger than 90. These waits do not prove that hidden force requirements were met. For each note, lift the striker vertically with goto_pose to a clear height before any lateral move, including repeated C4 and G4 notes. Keep the gripper closed throughout the melody. Print a concise PIANO_NOTE checkpoint after each attempt, not a claim that the task accepted it. A missed note may be recorded by the environment; do not restart the melody or stop solely because you suspect a note was wrong. Stop on any native motion, overload, or grasp protection failure. The expert uses privileged live tool-tip geometry, key surface and true key force to servo exact notes; those are unavailable here, so this remains an engineering smoke rather than force-controlled playing.
+
+      Maintain a local completed_notes counter and increment it only after each press-hold-lift attempt. After all five attempts, require completed_notes == 5, then set capx_stop = True at top level exactly once and finish normally. The evaluator alone calls finish_episode() and keeps its private verdict out of your code. Do not claim success from a tactile proxy.
+    multi_turn_prompt: |
+      Executed code:
+      {executed_code}
+
+      Console stdout:
+      {console_stdout}
+
+      Console stderr:
+      {console_stderr}
+
+      Repair only the failed public-action stage with bounded code. Do not read private task fields or use native key force as a control signal. A possible scoring miss is not a reason to replay earlier notes; finish the remaining note attempts unless a physical safety guard stops motion. Set capx_stop=True only after all five note attempts complete normally.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ./outputs/opentac_play_piano_tactile_smoke
+trial_timeout_seconds: 3000
+code_block_wall_timeout_seconds: 1800
+max_trial_retries: 1
+max_regenerations: 1
+multi_turn_on_failure_only: true
+filter_multiturn_console: true
+multiturn_console_max_lines: 12
+multiturn_console_max_chars: 1500
+multiturn_executed_code_max_chars: 2500
+multiturn_remaining_code_max_chars: 1000
+tactile_memory:
+  trial:
+    enabled: false
+    include_in_multiturn: false
+  persistent:
+    enabled: false

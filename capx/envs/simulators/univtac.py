@@ -65,6 +65,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         memory_overlay_enabled: bool = False,
         selection_only_audit: bool = False,
         tactile_buffer_size: int = 500,
+        tactile_summary_timeline_enabled: bool = False,
+        tactile_summary_timeline_max_records: int = 2048,
         lift_success_height_delta: float = 0.10,
         lift_success_require_contact: bool = True,
         privileged: bool = False,
@@ -157,6 +159,8 @@ class UniVTACLowLevelEnv(BaseEnv):
         # Native tension videos are converted after writers are closed.
         self._video_stream_h264 = self.video_renderer == "task_native"
         self._tactile_buffer = UniVTACTactileBuffer(maxlen=tactile_buffer_size)
+        self.tactile_summary_timeline_enabled = bool(tactile_summary_timeline_enabled)
+        self.tactile_summary_timeline_max_records = max(1, int(tactile_summary_timeline_max_records))
         self.lift_success_height_delta = float(lift_success_height_delta)
         self.lift_success_require_contact = bool(lift_success_require_contact)
         self._initial_lift_object_z: float | None = None
@@ -169,6 +173,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._start_time = time.time()
         self._debug_records: list[dict[str, Any]] = []
         self._tactile_gripper_trace: list[dict[str, Any]] = []
+        self._tactile_summary_timeline: list[dict[str, Any]] = []
         self._opentac_tension_estimator_trace: list[dict[str, Any]] = []
         # This is an evaluator-only sidecar. It is intentionally separate
         # from the public estimator trace so a true force value can never be
@@ -249,6 +254,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._start_time = time.time()
         self._debug_records.clear()
         self._tactile_gripper_trace.clear()
+        self._tactile_summary_timeline.clear()
         self._opentac_tension_estimator_trace.clear()
         self._opentac_tension_calibration_audit.clear()
         self._primitive_trace.clear()
@@ -444,6 +450,64 @@ class UniVTACLowLevelEnv(BaseEnv):
             f"[capx-univtac] internal observer error name={name} phase={phase}: {exc!r}",
             flush=True,
         )
+
+    def get_piano_gripper_center_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return robot kinematics for the piano motion bridge, not task scoring."""
+        if self.task_name != "play_piano" or not self._force_task_mode:
+            raise RuntimeError("piano gripper-center bridge is unavailable")
+        pose = self._task._robot_manager.get_gripper_center_pose()
+        return (
+            np.asarray(pose.p, dtype=np.float32).reshape(3),
+            np.asarray(pose.q, dtype=np.float32).reshape(4),
+        )
+
+    def move_piano_gripper_center_pose(self, position: np.ndarray) -> dict[str, Any]:
+        """Convert one agent-requested center waypoint to a native qpos action."""
+        if self.task_name != "play_piano" or not self._force_task_mode:
+            return {"ok": False, "reason": "piano_qpos_bridge_unavailable"}
+        center_target = np.asarray(position, dtype=np.float32).reshape(3)
+        if not np.all(np.isfinite(center_target)):
+            raise ValueError("piano gripper-center position must be finite")
+        manager = self._task._robot_manager
+        try:
+            center_pose = manager.get_gripper_center_pose()
+            target_center_pose = type(center_pose)(center_target, center_pose.q)
+            target_ee = manager.gripper_center_to_ee(target_center_pose)
+            if getattr(manager, "_ik_controller", None) is None:
+                manager._setup_ik_controller()
+            ee_pos, ee_quat = manager.get_ee_pose_tensor()
+            target = torch.as_tensor(
+                np.r_[target_ee.p, target_ee.q],
+                dtype=torch.float32,
+                device=self._task.device,
+            ).reshape(1, 7)
+            manager._ik_controller.set_command(target)
+            joints = manager.robot.data.joint_pos[:, manager._arm_ids]
+            goal = manager._ik_controller.compute(
+                ee_pos,
+                ee_quat,
+                manager.jacobian_b[:, :, manager._arm_ids],
+                joints,
+            )
+            if not bool(torch.isfinite(goal).all()) or float(torch.abs(goal - joints).max()) > 0.08:
+                return {"ok": False, "reason": "piano_ik_discontinuity"}
+            limits = manager.robot.data.soft_joint_pos_limits[:, manager._arm_ids]
+            if bool(torch.any(goal < limits[..., 0])) or bool(torch.any(goal > limits[..., 1])):
+                return {"ok": False, "reason": "piano_joint_limit"}
+            gripper = manager.robot.data.joint_pos[:, manager._gripper_ids][0, 0]
+            qpos = torch.cat([goal.reshape(-1)[:7], gripper.reshape(1)])
+        except Exception as exc:
+            return {"ok": False, "reason": "piano_ik_target_failed", "message": str(exc)}
+        result = self.take_action(qpos, action_type="qpos")
+        self._apply_official_task_protocol()
+        if self._protocol_stopped:
+            return {
+                **result,
+                "ok": False,
+                "reason": self._protocol_stop_reason or "piano_native_early_stop",
+                "motion_path": "piano_center_ik_to_qpos",
+            }
+        return {**result, "motion_path": "piano_center_ik_to_qpos"}
 
     def move_force_task_vertical_delta(self, *, dz: float) -> dict[str, Any]:
         """Execute a public vertical delta through force-task absolute qpos.
@@ -759,10 +823,38 @@ class UniVTACLowLevelEnv(BaseEnv):
                     if not getattr(self, "policy_controls_termination", False) and bool(self._task.check_success()):
                         self._task.eval_success = True
                         self._stop_protocol("native_success")
-                    elif bool(self._task.check_early_stop()):
+                    elif bool(self._task.check_early_stop()) and not self._deferred_piano_scoring_failure():
                         self._stop_protocol("early_stop")
                 except Exception as exc:
                     self._stop_protocol(f"protocol_check_error:{type(exc).__name__}")
+
+    def _deferred_piano_scoring_failure(self) -> bool:
+        """Keep a piano smoke running after a missed note, without erasing its verdict."""
+        return bool(
+            getattr(self, "_defer_piano_scoring_failure_until_end", False)
+            and self.task_name == "play_piano"
+            and getattr(self._task, "phase_id", None) != getattr(self._task, "PHASE_TERMINAL", object())
+            and getattr(self._task, "failure", None)
+            in {"wrong_key", "wrong_note_force", "note_too_short", "note_too_long"}
+        )
+
+    def _resume_piano_step_after_scoring_failure(self, was_movable: bool) -> None:
+        # The native memory task latches plan_success=False on any scoring miss.
+        # Keep the physical smoke moving, but leave failure/score untouched for END.
+        if was_movable and self._deferred_piano_scoring_failure():
+            self._task.plan_success = True
+
+    def _install_piano_scoring_failure_deferral(self) -> None:
+        if not (getattr(self, "_defer_piano_scoring_failure_until_end", False) and self.task_name == "play_piano"):
+            return
+        native_check_early_stop = self._task.check_early_stop
+
+        def _capx_piano_check_early_stop():
+            if self._deferred_piano_scoring_failure():
+                return False
+            return native_check_early_stop()
+
+        self._task.check_early_stop = _capx_piano_check_early_stop
 
     def refresh_live_preview(self) -> None:
         """Refresh the local preview after a high-level action attempt.
@@ -1391,6 +1483,21 @@ class UniVTACLowLevelEnv(BaseEnv):
             if record.get("operation") not in {"close", "open"}:
                 raise ValueError("tactile gripper trace may only contain close/open operations")
             self._tactile_gripper_trace.append(_jsonable(record))
+
+    def append_tactile_summary_timeline(
+        self, *, window: int, hand: str, summary: dict[str, Any]
+    ) -> None:
+        """Audit bounded public tactile reads without recording raw sensor arrays."""
+        if not self.tactile_summary_timeline_enabled:
+            return
+        self._tactile_summary_timeline.append({
+            "step": int(self.get_step_count()),
+            "window": int(window),
+            "hand": str(hand),
+            "summary": _jsonable(summary),
+        })
+        if len(self._tactile_summary_timeline) > self.tactile_summary_timeline_max_records:
+            del self._tactile_summary_timeline[0]
 
     def append_opentac_tension_estimator_trace(self, record: dict[str, Any]) -> None:
         """Store public marker-flow estimator samples for offline calibration audit.
@@ -2092,6 +2199,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         """Write private UniVTAC diagnostics for audit, never for LLM prompts."""
         debug_records = getattr(self, "_debug_records", [])
         gripper_trace = getattr(self, "_tactile_gripper_trace", [])
+        tactile_summary_timeline = getattr(self, "_tactile_summary_timeline", [])
         estimator_trace = getattr(self, "_opentac_tension_estimator_trace", [])
         force_audit = getattr(self, "_opentac_tension_calibration_audit", [])
         primitive_trace = getattr(self, "_primitive_trace", [])
@@ -2103,6 +2211,7 @@ class UniVTACLowLevelEnv(BaseEnv):
         if (
             not debug_records
             and not gripper_trace
+            and not tactile_summary_timeline
             and not estimator_trace
             and not force_audit
             and not primitive_trace
@@ -2143,6 +2252,12 @@ class UniVTACLowLevelEnv(BaseEnv):
             with open(trace_path, "w", encoding="utf-8") as f:
                 json.dump(gripper_trace, f, indent=2, sort_keys=True)
             print(f"[capx-univtac] saved tactile gripper trace to {trace_path}", flush=True)
+        timeline_path = None
+        if tactile_summary_timeline:
+            timeline_path = output_path / "tactile_summary_timeline.json"
+            with open(timeline_path, "w", encoding="utf-8") as f:
+                json.dump(tactile_summary_timeline, f, indent=2, sort_keys=True)
+            print(f"[capx-univtac] saved tactile summary timeline to {timeline_path}", flush=True)
         estimator_trace_path = None
         if estimator_trace:
             estimator_trace_path = output_path / "opentac_tension_estimator_trace.json"
@@ -2215,6 +2330,8 @@ class UniVTACLowLevelEnv(BaseEnv):
             return str(debug_path)
         if gripper_trace:
             return str(trace_path)
+        if timeline_path is not None:
+            return str(timeline_path)
         if estimator_trace_path is not None:
             return str(estimator_trace_path)
         if force_audit_path is not None:
@@ -2483,6 +2600,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         self._official_task_protocol = bool(
             self._task_config.get("official_task_protocol", False)
         )
+        self._defer_piano_scoring_failure_until_end = bool(
+            self._task_config.get("defer_piano_scoring_failure_until_end", False)
+        )
         self._validate_runtime_preflight()
         self._install_task_runtime_patches()
 
@@ -2617,6 +2737,7 @@ class UniVTACLowLevelEnv(BaseEnv):
             )
 
         if bool(config.get("require_attachment_points", False)):
+            expected_count = config.get("expected_attachment_points_per_obj")
             tactiles = getattr(
                 getattr(self._task, "_tactile_manager", None), "tactiles", {}
             )
@@ -2627,6 +2748,10 @@ class UniVTACLowLevelEnv(BaseEnv):
                 diagnostics["attachments"][name] = count
                 if not isinstance(count, int) or count <= 0:
                     errors.append(f"{name} attachment has no points: {count!r}")
+                elif expected_count is not None and count != int(expected_count):
+                    errors.append(
+                        f"{name} attachment count is {count}, expected {int(expected_count)}"
+                    )
 
         self._runtime_preflight_diagnostics = _jsonable(diagnostics)
         if errors:
@@ -2693,6 +2818,8 @@ class UniVTACLowLevelEnv(BaseEnv):
 
         self._install_force_task_adapter_pre_move()
 
+        self._install_piano_scoring_failure_deferral()
+
         if skip_task_pre_move:
             def _capx_noop_pre_move():
                 target = getattr(self._task, "target", None)
@@ -2709,7 +2836,9 @@ class UniVTACLowLevelEnv(BaseEnv):
         original_step = self._task._step
 
         def _capx_step(*args, **kwargs):
+            was_movable = bool(getattr(self._task, "plan_success", True))
             result = original_step(*args, **kwargs)
+            self._resume_piano_step_after_scoring_failure(was_movable)
             self._notify_post_step_observers()
             self._record_pre_move_tactile_step()
             # Read the post-step tactile frame so externally executed probes

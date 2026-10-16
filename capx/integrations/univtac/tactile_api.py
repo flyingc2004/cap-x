@@ -120,6 +120,9 @@ class UniVTACTactileApi(ApiBase):
             hand=hand,
             **_native_tactile_calibration(self._env),
         )
+        timeline = getattr(self._env, "append_tactile_summary_timeline", None)
+        if callable(timeline):
+            timeline(window=window, hand=hand, summary=summary)
         print(
             "[univtac-tactile] "
             f"hand={hand} contact={summary['contact']} "
