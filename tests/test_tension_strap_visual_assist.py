@@ -166,6 +166,9 @@ def test_visual_yaml_keeps_numerical_stage_authority() -> None:
     assert low_level["task_config_overrides"]["video_frame_stride"] == 8
     assert config["visual_checkpoint_markers"] == ["grasp_ready", "hold_12n_complete"]
     assert "Do not use an image to estimate Newtons or decide that a stage is complete" in prompt
+    assert "reaches 11.6 N inside the official first band" in prompt
+    assert "between 11.5 N and 11.6 N is still approach" in prompt
+    assert "below 11.5 N resets the timer" in config["env"]["cfg"]["multi_turn_prompt"]
     assert "Do not invent per-stage action-count limits" in prompt
     assert "Check the returned dictionary from EVERY wait_steps(...) and move_delta(...)" in prompt
     assert "native_success" not in prompt

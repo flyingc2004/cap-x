@@ -2453,6 +2453,18 @@ class UniVTACLowLevelEnv(BaseEnv):
         if self._force_task_mode:
             if self.force_task_seed is None:
                 raise ValueError("force_task config requires low_level.force_task_seed")
+            manifest = self._task_config.pop("force_sequence_manifest", "")
+            if manifest:
+                if self.task_name != "tension_strap":
+                    raise ValueError("force_sequence_manifest applies only to tension_strap")
+                from capx.integrations.opentac.seed_suite import load_seed_sequence
+
+                sequence = load_seed_sequence(manifest, self.force_task_seed)
+                self._task_config["task_parameters"] = {
+                    **dict(self._task_config.get("task_parameters", {}) or {}),
+                    "force_time_sequence": sequence,
+                }
+                _bind_tension_stage_sequence(self.api_configs, sequence)
             try:
                 from envs._force_task_utils import prepare_force_task_config
             except Exception as exc:
@@ -4668,3 +4680,16 @@ def _is_pose_like(value: Any) -> bool:
 def _env_flag(name: str) -> bool:
     value = os.getenv(name, "")
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _bind_tension_stage_sequence(api_configs: dict[str, Any], sequence: Any) -> None:
+    opentac_config = api_configs.get("opentac_api")
+    if not isinstance(opentac_config, dict):
+        raise ValueError("frozen strap instructions require an OpenTacApi config")
+    if not isinstance(sequence, (list, tuple)) or len(sequence) != 4:
+        raise ValueError("frozen strap instruction must contain two force/time stages")
+    values = [float(value) for value in sequence]
+    if not all(math.isfinite(value) and value > 0 for value in values):
+        raise ValueError("frozen strap force and duration values must be positive and finite")
+    opentac_config["stage_targets_N"] = [values[0], values[2]]
+    opentac_config["stage_hold_seconds_per_stage"] = [values[1], values[3]]

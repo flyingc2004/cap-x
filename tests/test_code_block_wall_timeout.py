@@ -349,7 +349,7 @@ def test_trial_regenerates_after_block_timeout_without_reset(monkeypatch, tmp_pa
     assert read_progress(tmp_path / "agent_progress.json")["completed_stages"] == [0]
 
 
-def test_tension_configs_allow_1800_second_blocks_with_3000_second_trials() -> None:
+def test_tension_configs_allow_3000_second_blocks_with_3600_second_trials() -> None:
     import yaml
     from pathlib import Path
 
@@ -359,8 +359,8 @@ def test_tension_configs_allow_1800_second_blocks_with_3000_second_trials() -> N
         "tension_strap_stage_memory_control_visual.yaml",
     ):
         cfg = yaml.safe_load((root / "env_configs" / "univtac" / name).read_text())
-        assert cfg["code_block_wall_timeout_seconds"] == 1800
-        assert cfg["trial_timeout_seconds"] == 3000
+        assert cfg["code_block_wall_timeout_seconds"] == 3000
+        assert cfg["trial_timeout_seconds"] == 3600
 
 
 def test_tension_watchdog_reaches_runtime_config() -> None:
@@ -377,8 +377,8 @@ def test_tension_watchdog_reaches_runtime_config() -> None:
         path = root / "env_configs" / "univtac" / name
         args = build_parser().parse_args(["--config-path", str(path)])
         _, runtime_config, _ = _load_config(args)
-        assert runtime_config["code_block_wall_timeout_seconds"] == 1800
-        assert runtime_config["trial_timeout_seconds"] == 3000
+        assert runtime_config["code_block_wall_timeout_seconds"] == 3000
+        assert runtime_config["trial_timeout_seconds"] == 3600
         assert runtime_config["agent_progress_file"] == {
             "enabled": True,
             "max_context_chars": 1000,

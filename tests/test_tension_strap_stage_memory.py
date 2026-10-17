@@ -215,11 +215,11 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     prompt = config["env"]["cfg"]["prompt"]
     assert "true tension" in prompt
     assert "10D response is recorded" in prompt
-    assert "12 N" in prompt
-    assert "18 N" in prompt
-    assert "[11.5, 12.5]" in prompt
-    assert "For 18 N, merely crossing the lower band edge is not arrival" in prompt
-    assert "Time is a strict continuous requirement" in prompt
+    assert "12 N" not in prompt and "18 N" not in prompt
+    assert 'contract["stage_entry_thresholds_N"][stage_index]' in prompt
+    assert 'contract["stage_hold_seconds_per_stage"][stage_index]' in prompt
+    assert "a descending second stage may require relaxation" in prompt
+    assert "full duration" in prompt
     assert "never join separated intervals" in prompt
     assert 'memory["stages"]' not in prompt
     assert 'stage["memory_id"]' not in prompt
@@ -228,7 +228,7 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert "already injected as top-level Python functions" in prompt
     assert "Do not import API modules" in prompt
     assert "physical scorer" in OpenTacApi.__doc__
-    assert "public target bands" in prompt
+    assert 'contract["stage_bands_N"]' in prompt
     assert "A move_delta already advances one native control cadence" in prompt
     assert "Check the returned dictionary from EVERY wait_steps(...) and move_delta(...)" in prompt
     assert "native_success" not in prompt
@@ -237,19 +237,18 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert "Do not create a local sample, retry, action, or iteration cap" in prompt
     assert "stage_bands_N" in prompt
     assert 'contract["stage_targets_N"][stage_index]' in prompt
-    assert 'target - contract["controller_deadband_N"]' in prompt
-    assert "Once hold_elapsed_s is positive, continue counting every fresh sample inside the full official band" in prompt
-    assert "a dip below the entry threshold alone must not reset the timer" in prompt
+    assert 'contract["stage_entry_thresholds_N"]' in prompt
+    assert "Once hold_elapsed_s is positive, count every fresh sample inside the full band" in prompt
     assert "do not require reaching that threshold again to preserve the timer" in prompt
     assert "The pre-wait sample establishes entry" in prompt
     assert "Start and continue its hold timer only while filtered_tension is at least" not in prompt
-    assert "do not derive another band" in prompt
+    assert "official band" in prompt
     assert "adapter does not track stage progress" in prompt.lower()
     assert "AGENT_PROGRESS_PATH" in prompt
     assert 'file EXISTS at the start of the first block with status="uninitialized"' in prompt
     assert 'saved.get("status") == "uninitialized"' in prompt
-    assert 'contract["stage_hold_seconds"]' in prompt
-    assert 'Read and store this key before any physical action' in prompt
+    assert 'contract["stage_hold_seconds_per_stage"]' in prompt
+    assert "before any physical action" in prompt
     assert "Do not print capture fields" in prompt
     assert "os.replace" in prompt
     assert "completed_stages" in prompt
@@ -259,6 +258,8 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert tactile["estimator_settle_steps"] == 30
     assert tactile["force_filter_time_constant_s"] == pytest.approx(0.15)
     assert tactile["controller_deadband_N"] == pytest.approx(0.20)
+    assert tactile["stage_targets_N"] == [12.0, 18.0]
+    assert tactile["stage_entry_offsets_N"] == [0.4, 0.2]
     assert 'contract["sampling_cadence_steps"]' in prompt
     assert 'contract["sampling_cadence_seconds"]' in prompt
     assert 'grasp["bilateral_contact"]' in prompt
@@ -276,6 +277,7 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert low_level["tension_response_panel"] == {"enabled": True, "history_points": 360}
     assert low_level["task_config_overrides"] == {
         "official_task_protocol": True,
+        "force_sequence_manifest": '${oc.env:CAPX_FORCE_SEQUENCE_MANIFEST,""}',
         "task_cfg_overrides": {"save_pre_move": False},
         "record_video_during_reset": False,
         "record_pre_move_frames": False,

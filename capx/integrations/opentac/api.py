@@ -125,14 +125,19 @@ class OpenTacApi(ApiBase):
             one control sample, call ``wait_steps`` with
             ``sampling_cadence_steps`` and add
             ``sampling_cadence_seconds`` to a local in-band timer until it
-            reaches ``stage_hold_seconds``. There is no ``hold_duration_s``
-            or ``hold_duration_seconds`` key.
+            reaches ``stage_hold_seconds_per_stage[stage_index]``.
+            ``stage_entry_thresholds_N`` gives the pre-hold approach target;
+            after entry, only the official band governs continuous holding.
             ``observation_wait_steps`` and ``observation_dt_s`` are the
             corresponding primitive quantities retained for diagnostics.
         """
         config = self._runtime_config()
         stage_targets = _float_list(config.get("stage_targets_N", [12.0, 18.0]))
         stage_tolerance = float(config.get("stage_tolerance_N", 0.5))
+        hold_seconds = _float_list(config.get(
+            "stage_hold_seconds_per_stage", [config.get("stage_hold_seconds", 3.0)] * 2
+        ))
+        entry_offsets = _float_list(config.get("stage_entry_offsets_N", [0.4, 0.2]))
         observation_wait_steps = int(config.get("observation_wait_steps", 2))
         observation_dt_s = float(config.get("observation_dt_s", 1.0 / 60.0))
         filter_time_constant_s = float(config.get("force_filter_time_constant_s", 0.15))
@@ -149,7 +154,8 @@ class OpenTacApi(ApiBase):
             # sampling cadence but exposed only its component factors.
             "sampling_cadence_steps": observation_wait_steps,
             "sampling_cadence_seconds": sampling_cadence_seconds,
-            "stage_hold_seconds": float(config.get("stage_hold_seconds", 3.0)),
+            "stage_hold_seconds": hold_seconds[0] if len(hold_seconds) == 2 and hold_seconds[0] == hold_seconds[1] else None,
+            "stage_hold_seconds_per_stage": hold_seconds,
             "estimator_settle_steps": int(config.get("estimator_settle_steps", 30)),
             "force_filter_time_constant_s": filter_time_constant_s,
             "force_filter_alpha": float(
@@ -163,6 +169,10 @@ class OpenTacApi(ApiBase):
             "stage_bands_N": [
                 [float(target - stage_tolerance), float(target + stage_tolerance)]
                 for target in stage_targets
+            ],
+            "stage_entry_thresholds_N": [
+                float(target + offset if index and target < stage_targets[index - 1] else target - offset)
+                for index, (target, offset) in enumerate(zip(stage_targets, entry_offsets))
             ],
             "estimator_update_stride": int(config.get("estimator_update_stride", 1)),
             "max_estimate_age_steps": int(config.get("max_estimate_age_steps", 3)),
@@ -181,6 +191,10 @@ class OpenTacApi(ApiBase):
             or contract["max_estimate_age_steps"] < 0
             or len(contract["stage_targets_N"]) != 2
             or any(target <= 0.0 for target in contract["stage_targets_N"])
+            or len(hold_seconds) != 2
+            or any(seconds <= 0.0 for seconds in hold_seconds)
+            or len(entry_offsets) != 2
+            or any(offset < 0.0 or offset > stage_tolerance for offset in entry_offsets)
         ):
             raise RuntimeError("OpenTac control step limits must be positive")
         return _jsonable(contract)
