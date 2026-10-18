@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import importlib
 import inspect
 import json
@@ -285,7 +286,16 @@ class UniVTACLowLevelEnv(BaseEnv):
             f"[capx-univtac] reset begin trial={trial} seed={actual_seed}",
             flush=True,
         )
-        self._task.reset(seed=actual_seed, instructions=self._instructions())
+        debug_reset = _env_flag("UNIVTAC_DEBUG_RESET")
+        if debug_reset:
+            self._debug_reset_active = True
+            faulthandler.dump_traceback_later(60, file=sys.stderr)
+        try:
+            self._task.reset(seed=actual_seed, instructions=self._instructions())
+        finally:
+            if debug_reset:
+                faulthandler.cancel_dump_traceback_later()
+                self._debug_reset_active = False
         self._refresh_public_pose_cache()
         self._initial_lift_object_z = self._active_object_height("can")
         debug = self._append_debug_record("after_reset")
@@ -2721,13 +2731,29 @@ class UniVTACLowLevelEnv(BaseEnv):
         original_step = self._task._step
 
         def _capx_step(*args, **kwargs):
+            step_before = int(getattr(self._task, "step_count", 0))
+            debug_reset_step = (
+                bool(getattr(self, "_debug_reset_active", False)) and step_before < 10
+            )
+            if debug_reset_step:
+                print(f"[capx-univtac] reset native step begin step={step_before + 1}", flush=True)
             result = original_step(*args, **kwargs)
+            if debug_reset_step:
+                print(
+                    f"[capx-univtac] reset native step end step={getattr(self._task, 'step_count', None)}",
+                    flush=True,
+                )
             self._notify_post_step_observers()
             self._record_pre_move_tactile_step()
             # Read the post-step tactile frame so externally executed probes
             # are reduced by the same v3 schema as the task-side expert.
             self._record_active_public_probe_frame()
             self._record_frame_after_task_step()
+            if debug_reset_step:
+                print(
+                    f"[capx-univtac] reset adapter callbacks end step={getattr(self._task, 'step_count', None)}",
+                    flush=True,
+                )
             return result
 
         self._task._step = _capx_step
@@ -2749,6 +2775,23 @@ class UniVTACLowLevelEnv(BaseEnv):
                 return original_update_render()
 
             self._task._update_render = _capx_update_render
+
+        if _env_flag("UNIVTAC_DEBUG_RESET"):
+            original_update_render = self._task._update_render
+
+            def _capx_debug_reset_render(*args, **kwargs):
+                log = bool(getattr(self, "_debug_reset_active", False)) and int(
+                    getattr(self._task, "step_count", 0)
+                ) < 10
+                if log:
+                    print("[capx-univtac] reset render begin", flush=True)
+                try:
+                    return original_update_render(*args, **kwargs)
+                finally:
+                    if log:
+                        print("[capx-univtac] reset render end", flush=True)
+
+            self._task._update_render = _capx_debug_reset_render
 
         if debug_pre_move:
             original_pre_move = self._task.pre_move

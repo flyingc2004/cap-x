@@ -1239,6 +1239,7 @@ def test_univtac_video_step_hook_records_action_frames() -> None:
     env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
     env._task = Task()
     env._task_config = {}
+    env._force_task_mode = False
     env._record_frames = True
     env._record_action_frames = True
     env._record_pre_move_frames = True
@@ -1259,12 +1260,48 @@ def test_univtac_video_step_hook_records_action_frames() -> None:
         },
     }
     env._record_frame = lambda obs=None, force=False: env._frame_buffer.append(obs)
+    env._notify_post_step_observers = lambda: None
+    env._record_pre_move_tactile_step = lambda: None
+    env._record_active_public_probe_frame = lambda: None
 
     UniVTACLowLevelEnv._install_task_runtime_patches(env)
     for _ in range(5):
         env._task._step()
 
     assert len(env._frame_buffer) == 5
+
+
+def test_univtac_reset_diagnostics_log_native_step_and_render(monkeypatch, capsys) -> None:
+    class Task:
+        step_count = 0
+
+        def _step(self):
+            self.step_count += 1
+
+        def _update_render(self):
+            return None
+
+    monkeypatch.setenv("UNIVTAC_DEBUG_RESET", "1")
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._task = Task()
+    env._task_config = {}
+    env._force_task_mode = False
+    env._record_frames = False
+    env._debug_reset_active = True
+    env._notify_post_step_observers = lambda: None
+    env._record_pre_move_tactile_step = lambda: None
+    env._record_active_public_probe_frame = lambda: None
+
+    UniVTACLowLevelEnv._install_task_runtime_patches(env)
+    env._task._step()
+    env._task._update_render()
+
+    output = capsys.readouterr().out
+    assert "reset native step begin step=1" in output
+    assert "reset native step end step=1" in output
+    assert "reset adapter callbacks end step=1" in output
+    assert "reset render begin" in output
+    assert "reset render end" in output
 
 
 def test_univtac_control_api_compat_name_still_registered() -> None:
