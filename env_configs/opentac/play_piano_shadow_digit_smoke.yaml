@@ -1,0 +1,56 @@
+# Shadow Hand engineering smoke. Native pitch/hold/release scoring remains intact;
+# only this config disables the official dynamics requirement for this run.
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    stream_user_code_output: false
+    low_level:
+      _target_: capx.envs.simulators.opentac_shadow.ShadowPianoLowLevelEnv
+      univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/a/ljz/cap/OpenTacBench}
+      piano_notes: ['C#4', C4, G4, A4, E4, F4]
+      piano_dynamics: [light, heavy, light, heavy, light, heavy]
+      piano_require_dynamics: false
+      seed_base: 0
+      device: cuda:0
+      tactile_image_width: 320
+      video_frame_stride: 3
+      video_width: 640
+    privileged: false
+    apis: [ShadowPianoControlApi]
+    prompt: |
+      Engineering smoke: with the Franka-mounted Shadow Hand index finger, attempt exactly six notes in this order: C#4 light, C4 heavy, G4 light, A4 heavy, E4 light, F4 heavy. The native hold duration for each note is 0.12 seconds; a released key must return to rest before the next note counts. This config sets the official piano_require_dynamics switch to false. Light/heavy are sequence labels only for this smoke: do not map them to different finger commands or claim calibrated force or strict dynamics success.
+
+      Write one finite Python program, with one note attempt per code block. Set capx_stop = False first. Separate the six blocks with breakpoint_code_block() on its own line; the runner preserves globals between blocks. Define a reusable bounded note helper in the first block, then call it once in each note block. After each completed note 1-5, print exactly CAPX_VISUAL_CHECKPOINT note_1 (or the corresponding index) before the breakpoint. The runner then sends the scene camera image to the model before the next block. Use that image to check alignment, visible key motion and unexpected contact; do not infer an exact hinge angle or contact force from pixels. On a failed note, print CAPX_FAILURE, leave a persistent stop flag, and have every later block skip actions when that flag is set. Call only the injected ShadowPianoControlApi functions directly. Never inspect env, the task, reward, score, success/failure, native info, key force, hidden fields or the demonstration policy. get_note_target(note) returns nominal static geometry, including wrist_x_offset_m, wrist_y_m, press_lift_z_m and hover_lift_z_m. move_shadow_index(x,y,z,flexion,steps) sends an absolute four-dimensional target to the native task; values outside the native action space are rejected. A single step advances eight physics ticks at 240 Hz (about 0.033 seconds). The native task rate-limits motion, so use enough steps for travel, descent, press, hold, release and lift. Use get_hand_state(), get_key_angles([note]) and get_index_tactile_rgb() for public feedback. get_key_angles is simulator telemetry supplied by this smoke adapter, not a measurement inferred from vision. DIGIT RGB is tactile appearance, not a force estimate.
+
+      The native key-down angle threshold is 0.025 radians and its released angle is at most 0.008 radians. For each note, travel at hover height with the finger open, then use the returned get_hand_state() wrist X/Y/Z values to check that the actual wrist settled within 0.003 m of the commanded hover target. Keep holding the same target with a finite step budget if it has not settled; do not flex the finger while the arm is still travelling. Descend to the nominal press height, check actual wrist convergence again, then flex gradually toward 0.50 radians. Save the value returned by get_key_angles([note]) and branch on it; calling this function without using its value does not verify a press. If the requested key does not reach 0.025 radians, keep the same XY and boundedly lower the wrist from its nominal press height in 0.001 m increments, no more than 0.006 m total, checking key angles and native_done after each move. Never travel to the next note if the requested key did not reach the down threshold. Keep it down for at least 0.12 seconds, then open the finger and wait until its angle stays at or below 0.008 radians for at least 0.10 seconds. Set finite limits on all feedback loops; if the public-angle check cannot be met, print a failed PIANO_NOTE checkpoint and stop safely without claiming that note was played. RGB may help inspect contact appearance, but must not be converted into a force estimate.
+
+      Check every action's native_done field; a native terminal means no more actions may be sent. On notes 1-5, lift to hover height before moving sideways. On note 6, native success may terminate during the release command; treat that as a completed final release and submit END without an extra lift call. Do not call a demonstration action or alter physics/scoring. Print one line beginning PIANO_NOTE with the attempt index, requested note, whether the requested key reached its down and release angles, and whether the physical action chain completed. Count an attempt only after verified press, hold and release (plus lift for notes 1-5); a print line does not assert a scored note.
+
+      After all six attempts finish, require completed_notes == 6, then set capx_stop = True at top level exactly once. END returns the saved native verdict to the evaluator. If the native task terminates early, stop action calls and report that fact; do not invent remaining attempts or claim success.
+    multi_turn_prompt: |
+      Previous code:
+      {executed_code}
+      Stdout:
+      {console_stdout}
+      Stderr:
+      {console_stderr}
+      The attached scene image is visual assistance; use it to inspect alignment and unexpected contact, not to claim an exact hinge angle or force. At a completed CAPX_VISUAL_CHECKPOINT, answer CONTINUE to execute the next prepared note block if the image is consistent with the printed public telemetry; otherwise REGENERATE only the unfinished blocks. Do not read private score or force. Set capx_stop=True only after six complete attempts.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: /mnt/data/ljz/opentacbench/capx-runs/shadow_piano_digit_smoke
+trial_timeout_seconds: 3600
+code_block_wall_timeout_seconds: 3300
+max_trial_retries: 1
+max_regenerations: 1
+multi_turn_on_failure_only: true
+multiturn_requires_checkpoint_or_failure: true
+split_code_blocks_on_breakpoint: true
+visual_checkpoint_markers: [note_1, note_2, note_3, note_4, note_5]
+use_visual_feedback: true
+visual_feedback_allow_unlisted_model: true
+visual_feedback_require_image_input: true
+tactile_memory:
+  trial: {enabled: false, include_in_multiturn: false}
+  persistent: {enabled: false}

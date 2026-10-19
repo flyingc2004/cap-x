@@ -724,14 +724,15 @@ def _save_trial_video(
         return
 
     suffix = f"{reward:.3f}"
+    fps = float(getattr(getattr(env, "low_level_env", None), "video_fps", 30))
     if suffix_extra:
         suffix += f"_{suffix_extra}"
 
     if isinstance(frames, list):
-        _write_video(frames, base_dir, suffix=suffix)
+        _write_video(frames, base_dir, suffix=suffix, fps=fps)
     elif isinstance(frames, dict):
         for key, frame in frames.items():
-            _write_video(frame, base_dir, suffix=f"{suffix}_{key}")
+            _write_video(frame, base_dir, suffix=f"{suffix}_{key}", fps=fps)
 
 
 def _save_turn_and_combined_videos(
@@ -755,6 +756,7 @@ def _save_turn_and_combined_videos(
         return
 
     base_dir = _trial_video_dir(config, trial, info_step, reward)
+    fps = float(getattr(getattr(env, "low_level_env", None), "video_fps", 30))
     finalize_stream = getattr(env, "finalize_streamed_video", None)
     if callable(finalize_stream) and bool(finalize_stream(base_dir)):
         return
@@ -769,17 +771,17 @@ def _save_turn_and_combined_videos(
         # Multi-camera: write each camera stream as a combined video
         for key, frames in all_frames.items():
             if frames:
-                _write_video(frames, base_dir, suffix=f"combined_{key}")
+                _write_video(frames, base_dir, suffix=f"combined_{key}", fps=fps)
         return
 
     # Per-turn videos
     for i, (start, end) in enumerate(turn_frame_ranges):
         turn_frames = all_frames[start:end]
         if turn_frames:
-            _write_video(turn_frames, base_dir, suffix=f"turn_{i:02d}")
+            _write_video(turn_frames, base_dir, suffix=f"turn_{i:02d}", fps=fps)
 
     # Combined video
-    _write_video(all_frames, base_dir, suffix="combined")
+    _write_video(all_frames, base_dir, suffix="combined", fps=fps)
 
     # Wrist camera videos
     if config.get("use_wrist_camera") and hasattr(env, "get_wrist_video_frames"):
@@ -788,8 +790,8 @@ def _save_turn_and_combined_videos(
             for i, (start, end) in enumerate(turn_frame_ranges):
                 wrist_turn = wrist_frames[start:end]
                 if wrist_turn:
-                    _write_video(wrist_turn, base_dir, suffix=f"turn_{i:02d}_wrist")
-            _write_video(wrist_frames, base_dir, suffix="combined_wrist")
+                    _write_video(wrist_turn, base_dir, suffix=f"turn_{i:02d}_wrist", fps=fps)
+            _write_video(wrist_frames, base_dir, suffix="combined_wrist", fps=fps)
 
 
 def _save_tactile_artifacts(
@@ -1042,7 +1044,7 @@ def _capture_initial_visual_feedback(
         )
 
     needs_visual = (
-        (config["use_visual_feedback"] and args.model in VLM_MODELS)
+        _visual_feedback_enabled(config, args)
         or (config["use_img_differencing"] and visual_differencing_args.model in VLM_MODELS)
         or config.get("use_video_differencing", False)
     )
@@ -1484,7 +1486,7 @@ def _handle_multi_turn_step(
         config.get("visual_feedback_raw_camera_views", False)
     )
     needs_visual = (
-        (config["use_visual_feedback"] and args.model in VLM_MODELS)
+        _visual_feedback_enabled(config, args)
         or (config["use_img_differencing"] and visual_differencing_args.model in VLM_MODELS)
     )
     if direct_raw_visual:

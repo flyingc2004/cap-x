@@ -35,7 +35,9 @@ def _encode_video_base64(frames: list[np.ndarray], fps: int = 30) -> str:
     return f"data:video/mp4;base64,{b64}"
 
 
-def _write_video(frames: list[np.ndarray], output_dir: str | None, *, suffix: str) -> None:
+def _write_video(
+    frames: list[np.ndarray], output_dir: str | None, *, suffix: str, fps: float = 30
+) -> None:
     """Write video frames to MP4 file.
 
     Args:
@@ -46,7 +48,7 @@ def _write_video(frames: list[np.ndarray], output_dir: str | None, *, suffix: st
     parent = Path(output_dir) / "videos"
     out_path = parent / f"video_{suffix}.mp4"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with imageio.get_writer(out_path, fps=30, format="FFMPEG", codec="libx264") as writer:
+    with imageio.get_writer(out_path, fps=fps, format="FFMPEG", codec="libx264") as writer:
         for frame in frames:
             writer.append_data(np.ascontiguousarray(frame))
     print(f"Saved interaction video to {out_path} ({len(frames)} frames)")

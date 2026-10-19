@@ -738,7 +738,7 @@ def _save_trial_artifacts(
             initial_prompt_content = all_responses[0].get("initial_prompt")
             if initial_prompt_content:
                 prompt_text = initial_prompt_content[-1]["content"][0]["text"]
-                (trial_dir / "initial_prompt.txt").write_text(str(prompt_text))
+                (trial_dir / "initial_prompt.txt").write_text(str(prompt_text), encoding="utf-8")
         except Exception:
             pass
 
@@ -774,7 +774,7 @@ def _save_trial_artifacts(
                 initial_prompt_content = response["initial_prompt"][-1]["content"][0]["text"]
                 if isinstance(initial_prompt_content, list):
                     initial_prompt_content = "\n".join(map(str, initial_prompt_content))
-                (trial_dir / "prompts_and_responses" / "initial_prompt.txt").write_text(str(initial_prompt_content))
+                (trial_dir / "prompts_and_responses" / "initial_prompt.txt").write_text(str(initial_prompt_content), encoding="utf-8")
             except Exception as e:
                 print(f"Error saving initial_prompt: {e}")
         if "multi_turn_prompt" in response and response["multi_turn_prompt"] is not None:
@@ -782,7 +782,7 @@ def _save_trial_artifacts(
                 multi_turn_prompt_content = response["multi_turn_prompt"][-1]["content"][0]["text"]
                 if isinstance(multi_turn_prompt_content, list):
                     multi_turn_prompt_content = "\n".join(map(str, multi_turn_prompt_content))
-                (trial_dir / "prompts_and_responses" / f"multi_turn_prompt_{i:02d}.txt").write_text(str(multi_turn_prompt_content))
+                (trial_dir / "prompts_and_responses" / f"multi_turn_prompt_{i:02d}.txt").write_text(str(multi_turn_prompt_content), encoding="utf-8")
             except Exception as e:
                 print(f"Error saving multi_turn_prompt_{i}: {e}")
             i += 1
@@ -848,7 +848,7 @@ def _save_in_progress_trial_artifacts(
             if initial_prompt_content:
                 print("[capx-trial] in-progress save initial_prompt", flush=True)
                 prompt_text = initial_prompt_content[-1]["content"][0]["text"]
-                (trial_dir / "initial_prompt.txt").write_text(str(prompt_text))
+                (trial_dir / "initial_prompt.txt").write_text(str(prompt_text), encoding="utf-8")
                 print("[capx-trial] in-progress save initial_prompt done", flush=True)
         except Exception:
             pass
