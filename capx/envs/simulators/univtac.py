@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Callable
 
@@ -292,6 +293,10 @@ class UniVTACLowLevelEnv(BaseEnv):
             faulthandler.dump_traceback_later(60, file=sys.stderr)
         try:
             self._task.reset(seed=actual_seed, instructions=self._instructions())
+        except BaseException:
+            if debug_reset:
+                self._debug_reset_fabric_meshes("reset_exception")
+            raise
         finally:
             if debug_reset:
                 faulthandler.cancel_dump_traceback_later()
@@ -2409,6 +2414,75 @@ class UniVTACLowLevelEnv(BaseEnv):
         if root_str not in sys.path:
             sys.path.insert(0, root_str)
 
+    def _debug_reset_fabric_meshes(self, phase: str) -> None:
+        """Inspect Fabric meshes without changing task state or masking reset errors."""
+        try:
+            import omni.usd
+            import usdrt
+
+            stage_id = None
+            stage_id_error = None
+            try:
+                stage_id = omni.usd.get_context().get_stage_id()
+            except BaseException as exc:
+                stage_id_error = f"{type(exc).__name__}: {exc}"
+            uipc_sim = getattr(self._task, "uipc_sim", None)
+            meshes = list(getattr(uipc_sim, "_fabric_meshes", ()))
+            print(
+                f"[capx-univtac] fabric meshes phase={phase} "
+                f"stage_id={stage_id} stage_id_error={stage_id_error} "
+                f"count={len(meshes)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            for index, prim in enumerate(meshes):
+                record: dict[str, Any] = {
+                    "phase": phase,
+                    "stage_id": stage_id,
+                    "stage_id_error": stage_id_error,
+                    "index": index,
+                    "prim_path": None,
+                    "prim_valid": None,
+                    "matrix_attr_valid": None,
+                    "matrix_get_shape": None,
+                    "matrix_get_type": None,
+                }
+                try:
+                    record["prim_path"] = str(prim.GetPath())
+                except BaseException as exc:
+                    record["prim_path_error"] = f"{type(exc).__name__}: {exc}"
+                try:
+                    record["prim_valid"] = bool(prim.IsValid())
+                except BaseException as exc:
+                    record["prim_valid_error"] = f"{type(exc).__name__}: {exc}"
+                try:
+                    attr = usdrt.Rt.Xformable(prim).GetFabricHierarchyWorldMatrixAttr()
+                    try:
+                        record["matrix_attr_valid"] = bool(attr.IsValid())
+                    except BaseException as exc:
+                        record["matrix_attr_valid_error"] = f"{type(exc).__name__}: {exc}"
+                    try:
+                        value = attr.Get()
+                        record["matrix_get_type"] = type(value).__name__
+                        record["matrix_get_shape"] = list(np.asarray(value).shape)
+                    except BaseException as exc:
+                        record["matrix_get_error"] = f"{type(exc).__name__}: {exc}"
+                except BaseException as exc:
+                    record["matrix_attr_error"] = f"{type(exc).__name__}: {exc}"
+                print(
+                    "[capx-univtac] fabric mesh "
+                    + json.dumps(record, ensure_ascii=False, sort_keys=True, default=str),
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except BaseException as exc:
+            print(
+                f"[capx-univtac] fabric mesh diagnostic error phase={phase} "
+                f"error={type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     def _build_task(self) -> None:
         task_config_file = self._task_config_path()
         with open(task_config_file, encoding="utf-8") as f:
@@ -2493,6 +2567,8 @@ class UniVTACLowLevelEnv(BaseEnv):
                 "runtime_task_mode must be one of 'collect', 'eval', or 'eval_test'"
             )
         self._task = task_module.Task(env_cfg, mode=task_runtime_mode)
+        if _env_flag("UNIVTAC_DEBUG_RESET"):
+            self._debug_reset_fabric_meshes("post_task_construct")
         self.policy_controls_termination = bool(
             getattr(env_cfg, "policy_controls_termination", False)
         )
@@ -2737,7 +2813,19 @@ class UniVTACLowLevelEnv(BaseEnv):
             )
             if debug_reset_step:
                 print(f"[capx-univtac] reset native step begin step={step_before + 1}", flush=True)
-            result = original_step(*args, **kwargs)
+            try:
+                result = original_step(*args, **kwargs)
+            except BaseException as exc:
+                if debug_reset_step:
+                    print(
+                        f"[capx-univtac] reset native step error step={step_before + 1} "
+                        f"error={type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    traceback.print_exc(file=sys.stderr)
+                    sys.stderr.flush()
+                raise
             if debug_reset_step:
                 print(
                     f"[capx-univtac] reset native step end step={getattr(self._task, 'step_count', None)}",
@@ -2786,10 +2874,21 @@ class UniVTACLowLevelEnv(BaseEnv):
                 if log:
                     print("[capx-univtac] reset render begin", flush=True)
                 try:
-                    return original_update_render(*args, **kwargs)
-                finally:
+                    result = original_update_render(*args, **kwargs)
+                except BaseException as exc:
                     if log:
-                        print("[capx-univtac] reset render end", flush=True)
+                        print(
+                            f"[capx-univtac] reset render error "
+                            f"error={type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        traceback.print_exc(file=sys.stderr)
+                        sys.stderr.flush()
+                    raise
+                if log:
+                    print("[capx-univtac] reset render end", flush=True)
+                return result
 
             self._task._update_render = _capx_debug_reset_render
 

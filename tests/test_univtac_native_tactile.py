@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sys
 import types
 
@@ -1302,6 +1303,124 @@ def test_univtac_reset_diagnostics_log_native_step_and_render(monkeypatch, capsy
     assert "reset adapter callbacks end step=1" in output
     assert "reset render begin" in output
     assert "reset render end" in output
+
+
+@pytest.mark.parametrize("failure_stage", ["native", "render"])
+def test_univtac_reset_diagnostics_report_step_failure(
+    monkeypatch, capsys, failure_stage: str
+) -> None:
+    class Task:
+        step_count = 0
+
+        def _step(self):
+            self.step_count += 1
+            if failure_stage == "native":
+                raise RuntimeError("native reset failure")
+            self._update_render()
+
+        def _update_render(self):
+            raise ValueError("render reset failure")
+
+    monkeypatch.setenv("UNIVTAC_DEBUG_RESET", "1")
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._task = Task()
+    env._task_config = {}
+    env._force_task_mode = False
+    env._record_frames = False
+    env._debug_reset_active = True
+    env._notify_post_step_observers = lambda: None
+    env._record_pre_move_tactile_step = lambda: None
+    env._record_active_public_probe_frame = lambda: None
+
+    UniVTACLowLevelEnv._install_task_runtime_patches(env)
+    expected_error = RuntimeError if failure_stage == "native" else ValueError
+    with pytest.raises(expected_error):
+        env._task._step()
+
+    captured = capsys.readouterr()
+    assert "reset native step begin step=1" in captured.out
+    assert "reset native step end" not in captured.out
+    assert "reset adapter callbacks end" not in captured.out
+    assert "reset native step error step=1" in captured.err
+    if failure_stage == "render":
+        assert "reset render begin" in captured.out
+        assert "reset render end" not in captured.out
+        assert "reset render error" in captured.err
+    assert "Traceback (most recent call last):" in captured.err
+
+
+def test_univtac_reset_fabric_mesh_diagnostic_records_each_mesh(
+    monkeypatch, capsys
+) -> None:
+    class Attr:
+        def __init__(self, value, valid=True, error=None):
+            self.value = value
+            self.valid = valid
+            self.error = error
+
+        def IsValid(self):
+            return self.valid
+
+        def Get(self):
+            if self.error is not None:
+                raise self.error
+            return self.value
+
+    class Prim:
+        def __init__(self, path, attr, valid=True):
+            self.path = path
+            self.attr = attr
+            self.valid = valid
+
+        def GetPath(self):
+            return self.path
+
+        def IsValid(self):
+            return self.valid
+
+    omni = types.ModuleType("omni")
+    omni.__path__ = []
+    omni.usd = types.ModuleType("omni.usd")
+    omni.usd.get_context = lambda: types.SimpleNamespace(get_stage_id=lambda: 73)
+    usdrt = types.ModuleType("usdrt")
+    usdrt.Rt = types.SimpleNamespace(
+        Xformable=lambda prim: types.SimpleNamespace(
+            GetFabricHierarchyWorldMatrixAttr=lambda: prim.attr
+        )
+    )
+    monkeypatch.setitem(sys.modules, "omni", omni)
+    monkeypatch.setitem(sys.modules, "omni.usd", omni.usd)
+    monkeypatch.setitem(sys.modules, "usdrt", usdrt)
+
+    meshes = [
+        Prim("/World/strap", Attr(np.eye(4))),
+        Prim("/World/gelpad_left", Attr(None, valid=False), valid=False),
+        Prim("/World/gelpad_right", Attr(None, error=RuntimeError("read failed"))),
+    ]
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env._task = types.SimpleNamespace(
+        uipc_sim=types.SimpleNamespace(_fabric_meshes=meshes)
+    )
+    env._debug_reset_fabric_meshes("reset_exception")
+
+    output = capsys.readouterr().err.splitlines()
+    records = [
+        json.loads(line.split("fabric mesh ", 1)[1])
+        for line in output
+        if line.startswith("[capx-univtac] fabric mesh ")
+    ]
+    assert [record["index"] for record in records] == [0, 1, 2]
+    assert [record["prim_path"] for record in records] == [
+        "/World/strap", "/World/gelpad_left", "/World/gelpad_right"
+    ]
+    assert all(record["stage_id"] == 73 for record in records)
+    assert records[0]["prim_valid"] is True
+    assert records[0]["matrix_attr_valid"] is True
+    assert records[0]["matrix_get_shape"] == [4, 4]
+    assert records[1]["prim_valid"] is False
+    assert records[1]["matrix_attr_valid"] is False
+    assert records[1]["matrix_get_shape"] == []
+    assert records[2]["matrix_get_error"] == "RuntimeError: read failed"
 
 
 def test_univtac_control_api_compat_name_still_registered() -> None:
