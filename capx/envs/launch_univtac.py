@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import os
 import sys
 import time
+import traceback
 
 os.environ.setdefault("CAPX_UNIVTAC_MINIMAL_IMPORTS", "1")
 
@@ -82,15 +84,23 @@ def main() -> None:
     _apply_univtac_env_overrides(env_factory)
     server_procs = _start_api_servers(api_servers)
     run_ok = False
+    run_error: BaseException | None = None
     try:
         _run_headless_trials(args, env_factory, config, start_time)
         run_ok = True
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
+        run_error = exc
         print(
             "[capx-univtac] interrupted by user after partial artifact save",
             flush=True,
         )
         raise SystemExit(130)
+    except BaseException as exc:
+        run_error = exc
+        print("[capx-univtac] run error before Kit shutdown", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        raise
     finally:
         _stop_api_servers(server_procs)
         if app is not None:
@@ -103,7 +113,20 @@ def main() -> None:
             }
             if force_exit and run_ok:
                 os._exit(0)
-            app.close()
+            print("[capx-univtac] Kit close begin", flush=True)
+            faulthandler.dump_traceback_later(60, file=sys.stderr)
+            try:
+                app.close()
+            except BaseException:
+                print("[capx-univtac] Kit close error", file=sys.stderr, flush=True)
+                traceback.print_exc(file=sys.stderr)
+                sys.stderr.flush()
+                if run_error is None:
+                    raise
+            else:
+                print("[capx-univtac] Kit close end", flush=True)
+            finally:
+                faulthandler.cancel_dump_traceback_later()
 
 
 def _prepare_univtac_import_path() -> None:

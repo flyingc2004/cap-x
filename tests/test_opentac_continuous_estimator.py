@@ -7,7 +7,9 @@ from typing import Any
 import numpy as np
 import pytest
 
+from capx.envs.simulators.univtac import _bind_tension_stage_sequence
 from capx.integrations.opentac import OpenTacApi
+from capx.integrations.opentac.seed_suite import load_seed_sequence
 from capx.integrations.univtac.franka_compat_api import UniVTACFrankaCompatApi
 
 
@@ -144,6 +146,8 @@ def test_control_contract_exposes_exact_stage_bands(monkeypatch) -> None:
 
     assert contract["stage_targets_N"] == [12.0, 18.0]
     assert contract["stage_bands_N"] == [[11.5, 12.5], [17.5, 18.5]]
+    assert contract["stage_hold_seconds_per_stage"] == [0.3, 0.3]
+    assert contract["stage_entry_thresholds_N"] == pytest.approx([11.6, 17.8])
     assert contract["sampling_cadence_steps"] == contract["observation_wait_steps"]
     assert contract["sampling_cadence_seconds"] == pytest.approx(
         contract["observation_wait_steps"] * contract["observation_dt_s"]
@@ -160,6 +164,53 @@ def test_control_contract_exposes_exact_stage_bands(monkeypatch) -> None:
     assert "stage_tolerance_N" not in contract
     assert "max_control_actions_per_stage" not in contract
     assert "max_consecutive_invalid_samples" not in contract
+
+
+def test_control_contract_supports_frozen_per_seed_targets_and_holds() -> None:
+    env = _ObserverEnv()
+    env.api_configs["opentac_api"].update({
+        "stage_targets_N": [10.0, 15.0],
+        "stage_hold_seconds_per_stage": [1.3, 2.0],
+    })
+    contract = OpenTacApi(env).get_tactile_tension_control_contract()
+    assert contract["stage_targets_N"] == [10.0, 15.0]
+    assert contract["stage_bands_N"] == [[9.5, 10.5], [14.5, 15.5]]
+    assert contract["stage_hold_seconds_per_stage"] == [1.3, 2.0]
+    assert contract["stage_entry_thresholds_N"] == pytest.approx([9.6, 14.8])
+    assert contract["stage_hold_seconds"] is None
+
+    env.api_configs["opentac_api"]["stage_targets_N"] = [17.2, 15.2]
+    descending = OpenTacApi(env).get_tactile_tension_control_contract()
+    assert descending["stage_entry_thresholds_N"] == pytest.approx([16.8, 15.4])
+
+
+def test_frozen_task_sequence_binds_the_agent_contract() -> None:
+    env = _ObserverEnv()
+    _bind_tension_stage_sequence(env.api_configs, [10.0, 1.3, 15.0, 2.0])
+    contract = OpenTacApi(env).get_tactile_tension_control_contract()
+    assert contract["stage_targets_N"] == [10.0, 15.0]
+    assert contract["stage_hold_seconds_per_stage"] == [1.3, 2.0]
+
+    _bind_tension_stage_sequence(env.api_configs, [17.2, 1.7, 15.2, 1.5])
+    descending = OpenTacApi(env).get_tactile_tension_control_contract()
+    assert descending["stage_targets_N"] == [17.2, 15.2]
+    assert descending["stage_hold_seconds_per_stage"] == [1.7, 1.5]
+    assert descending["stage_entry_thresholds_N"] == pytest.approx([16.8, 15.4])
+
+    with pytest.raises(ValueError, match="two force/time stages"):
+        _bind_tension_stage_sequence(env.api_configs, [12.0, 3.0])
+
+
+def test_capx_seed_suite_is_frozen_and_balanced() -> None:
+    manifest = "env_configs/univtac/tension_strap_seed_suite_1_30.v1.json"
+    assert load_seed_sequence(manifest, 0) == [10.0, 1.3, 15.0, 2.0]
+    sequences = [load_seed_sequence(manifest, seed) for seed in range(1, 31)]
+    assert len({tuple(sequence) for sequence in sequences}) == 30
+    assert sum(sequence[0] < sequence[2] for sequence in sequences) == 15
+    assert sum(sequence[0] > sequence[2] for sequence in sequences) == 15
+    assert all(10 <= sequence[0] <= 18 and 10 <= sequence[2] <= 18 for sequence in sequences)
+    with pytest.raises(KeyError):
+        load_seed_sequence(manifest, 31)
 
 
 def test_estimate_is_cached_and_stale_without_new_task_steps(monkeypatch) -> None:

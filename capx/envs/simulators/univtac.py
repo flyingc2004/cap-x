@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import importlib
 import inspect
 import json
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Callable
 
@@ -291,7 +293,20 @@ class UniVTACLowLevelEnv(BaseEnv):
             f"[capx-univtac] reset begin trial={trial} seed={actual_seed}",
             flush=True,
         )
-        self._task.reset(seed=actual_seed, instructions=self._instructions())
+        debug_reset = _env_flag("UNIVTAC_DEBUG_RESET")
+        if debug_reset:
+            self._debug_reset_active = True
+            faulthandler.dump_traceback_later(60, file=sys.stderr)
+        try:
+            self._task.reset(seed=actual_seed, instructions=self._instructions())
+        except BaseException:
+            if debug_reset:
+                self._debug_reset_fabric_meshes("reset_exception")
+            raise
+        finally:
+            if debug_reset:
+                faulthandler.cancel_dump_traceback_later()
+                self._debug_reset_active = False
         self._refresh_public_pose_cache()
         self._initial_lift_object_z = self._active_object_height("can")
         debug = self._append_debug_record("after_reset")
@@ -2516,6 +2531,75 @@ class UniVTACLowLevelEnv(BaseEnv):
         if root_str not in sys.path:
             sys.path.insert(0, root_str)
 
+    def _debug_reset_fabric_meshes(self, phase: str) -> None:
+        """Inspect Fabric meshes without changing task state or masking reset errors."""
+        try:
+            import omni.usd
+            import usdrt
+
+            stage_id = None
+            stage_id_error = None
+            try:
+                stage_id = omni.usd.get_context().get_stage_id()
+            except BaseException as exc:
+                stage_id_error = f"{type(exc).__name__}: {exc}"
+            uipc_sim = getattr(self._task, "uipc_sim", None)
+            meshes = list(getattr(uipc_sim, "_fabric_meshes", ()))
+            print(
+                f"[capx-univtac] fabric meshes phase={phase} "
+                f"stage_id={stage_id} stage_id_error={stage_id_error} "
+                f"count={len(meshes)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            for index, prim in enumerate(meshes):
+                record: dict[str, Any] = {
+                    "phase": phase,
+                    "stage_id": stage_id,
+                    "stage_id_error": stage_id_error,
+                    "index": index,
+                    "prim_path": None,
+                    "prim_valid": None,
+                    "matrix_attr_valid": None,
+                    "matrix_get_shape": None,
+                    "matrix_get_type": None,
+                }
+                try:
+                    record["prim_path"] = str(prim.GetPath())
+                except BaseException as exc:
+                    record["prim_path_error"] = f"{type(exc).__name__}: {exc}"
+                try:
+                    record["prim_valid"] = bool(prim.IsValid())
+                except BaseException as exc:
+                    record["prim_valid_error"] = f"{type(exc).__name__}: {exc}"
+                try:
+                    attr = usdrt.Rt.Xformable(prim).GetFabricHierarchyWorldMatrixAttr()
+                    try:
+                        record["matrix_attr_valid"] = bool(attr.IsValid())
+                    except BaseException as exc:
+                        record["matrix_attr_valid_error"] = f"{type(exc).__name__}: {exc}"
+                    try:
+                        value = attr.Get()
+                        record["matrix_get_type"] = type(value).__name__
+                        record["matrix_get_shape"] = list(np.asarray(value).shape)
+                    except BaseException as exc:
+                        record["matrix_get_error"] = f"{type(exc).__name__}: {exc}"
+                except BaseException as exc:
+                    record["matrix_attr_error"] = f"{type(exc).__name__}: {exc}"
+                print(
+                    "[capx-univtac] fabric mesh "
+                    + json.dumps(record, ensure_ascii=False, sort_keys=True, default=str),
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except BaseException as exc:
+            print(
+                f"[capx-univtac] fabric mesh diagnostic error phase={phase} "
+                f"error={type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     def _build_task(self) -> None:
         task_config_file = self._task_config_path()
         with open(task_config_file, encoding="utf-8") as f:
@@ -2570,6 +2654,18 @@ class UniVTACLowLevelEnv(BaseEnv):
         if self._force_task_mode:
             if self.force_task_seed is None:
                 raise ValueError("force_task config requires low_level.force_task_seed")
+            manifest = self._task_config.pop("force_sequence_manifest", "")
+            if manifest:
+                if self.task_name != "tension_strap":
+                    raise ValueError("force_sequence_manifest applies only to tension_strap")
+                from capx.integrations.opentac.seed_suite import load_seed_sequence
+
+                sequence = load_seed_sequence(manifest, self.force_task_seed)
+                self._task_config["task_parameters"] = {
+                    **dict(self._task_config.get("task_parameters", {}) or {}),
+                    "force_time_sequence": sequence,
+                }
+                _bind_tension_stage_sequence(self.api_configs, sequence)
             try:
                 from envs._force_task_utils import prepare_force_task_config
             except Exception as exc:
@@ -2588,6 +2684,8 @@ class UniVTACLowLevelEnv(BaseEnv):
                 "runtime_task_mode must be one of 'collect', 'eval', or 'eval_test'"
             )
         self._task = task_module.Task(env_cfg, mode=task_runtime_mode)
+        if _env_flag("UNIVTAC_DEBUG_RESET"):
+            self._debug_reset_fabric_meshes("post_task_construct")
         self.policy_controls_termination = bool(
             getattr(env_cfg, "policy_controls_termination", False)
         )
@@ -2837,14 +2935,42 @@ class UniVTACLowLevelEnv(BaseEnv):
 
         def _capx_step(*args, **kwargs):
             was_movable = bool(getattr(self._task, "plan_success", True))
-            result = original_step(*args, **kwargs)
+            step_before = int(getattr(self._task, "step_count", 0))
+            debug_reset_step = (
+                bool(getattr(self, "_debug_reset_active", False)) and step_before < 10
+            )
+            if debug_reset_step:
+                print(f"[capx-univtac] reset native step begin step={step_before + 1}", flush=True)
+            try:
+                result = original_step(*args, **kwargs)
+            except BaseException as exc:
+                if debug_reset_step:
+                    print(
+                        f"[capx-univtac] reset native step error step={step_before + 1} "
+                        f"error={type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    traceback.print_exc(file=sys.stderr)
+                    sys.stderr.flush()
+                raise
             self._resume_piano_step_after_scoring_failure(was_movable)
+            if debug_reset_step:
+                print(
+                    f"[capx-univtac] reset native step end step={getattr(self._task, 'step_count', None)}",
+                    flush=True,
+                )
             self._notify_post_step_observers()
             self._record_pre_move_tactile_step()
             # Read the post-step tactile frame so externally executed probes
             # are reduced by the same v3 schema as the task-side expert.
             self._record_active_public_probe_frame()
             self._record_frame_after_task_step()
+            if debug_reset_step:
+                print(
+                    f"[capx-univtac] reset adapter callbacks end step={getattr(self._task, 'step_count', None)}",
+                    flush=True,
+                )
             return result
 
         self._task._step = _capx_step
@@ -2866,6 +2992,34 @@ class UniVTACLowLevelEnv(BaseEnv):
                 return original_update_render()
 
             self._task._update_render = _capx_update_render
+
+        if _env_flag("UNIVTAC_DEBUG_RESET"):
+            original_update_render = self._task._update_render
+
+            def _capx_debug_reset_render(*args, **kwargs):
+                log = bool(getattr(self, "_debug_reset_active", False)) and int(
+                    getattr(self._task, "step_count", 0)
+                ) < 10
+                if log:
+                    print("[capx-univtac] reset render begin", flush=True)
+                try:
+                    result = original_update_render(*args, **kwargs)
+                except BaseException as exc:
+                    if log:
+                        print(
+                            f"[capx-univtac] reset render error "
+                            f"error={type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        traceback.print_exc(file=sys.stderr)
+                        sys.stderr.flush()
+                    raise
+                if log:
+                    print("[capx-univtac] reset render end", flush=True)
+                return result
+
+            self._task._update_render = _capx_debug_reset_render
 
         if debug_pre_move:
             original_pre_move = self._task.pre_move
@@ -4843,3 +4997,16 @@ def _is_pose_like(value: Any) -> bool:
 def _env_flag(name: str) -> bool:
     value = os.getenv(name, "")
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _bind_tension_stage_sequence(api_configs: dict[str, Any], sequence: Any) -> None:
+    opentac_config = api_configs.get("opentac_api")
+    if not isinstance(opentac_config, dict):
+        raise ValueError("frozen strap instructions require an OpenTacApi config")
+    if not isinstance(sequence, (list, tuple)) or len(sequence) != 4:
+        raise ValueError("frozen strap instruction must contain two force/time stages")
+    values = [float(value) for value in sequence]
+    if not all(math.isfinite(value) and value > 0 for value in values):
+        raise ValueError("frozen strap force and duration values must be positive and finite")
+    opentac_config["stage_targets_N"] = [values[0], values[2]]
+    opentac_config["stage_hold_seconds_per_stage"] = [values[1], values[3]]
