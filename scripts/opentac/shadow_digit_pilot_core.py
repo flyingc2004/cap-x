@@ -188,7 +188,10 @@ def audit_episode(episode_dir: Path) -> dict:
         indices = np.searchsorted(psteps, steps)
         if np.any(indices >= len(psteps)) or not np.array_equal(psteps[indices], steps):
             raise ValueError("Public frames do not have exact-step force labels")
-        midi = np.asarray(pub["requested_midi"], int)
+        # The public key is the command target; the native score can advance
+        # within a control step.  Use the private key at this exact physics step
+        # when selecting the force channel for the offline audit.
+        midi = np.asarray(priv["requested_midi"][indices], int)
         force = np.asarray(priv["key_contact_force_N"][indices, :])[np.arange(len(steps)), midi - 21]
         angle = np.asarray(pub["key_angles_rad"])[np.arange(len(steps)), midi - 21]
         depth = np.asarray(pub["tactile/index/depth_m"], np.float32)

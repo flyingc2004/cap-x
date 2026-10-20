@@ -8,6 +8,27 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/data/ljz/opentacbench/shadow_digit_force_v1}"
 CONDA_SH="${CONDA_SH:-/mnt/a/ljz/miniconda/etc/profile.d/conda.sh}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-/mnt/data/ljz/opentacbench/conda-envs/UniVTAC}"
 
+# The collector runs from OpenTacBench, so resolve a caller-relative phrase
+# before changing directories. Preserve every other argument verbatim.
+PILOT_ARGS=("$@")
+for ((i=0; i<${#PILOT_ARGS[@]}; i++)); do
+  if [[ "${PILOT_ARGS[i]}" == "--sequence-config" ]]; then
+    if ((i + 1 >= ${#PILOT_ARGS[@]})); then
+      echo '--sequence-config requires a path' >&2
+      exit 2
+    fi
+    if [[ "${PILOT_ARGS[i+1]}" != /* && "${PILOT_ARGS[i+1]}" != '~/'* ]]; then
+      PILOT_ARGS[i+1]="${PWD}/${PILOT_ARGS[i+1]}"
+    fi
+    i=$((i + 1))
+  elif [[ "${PILOT_ARGS[i]}" == --sequence-config=* ]]; then
+    config_path="${PILOT_ARGS[i]#--sequence-config=}"
+    if [[ "${config_path}" != /* && "${config_path}" != '~/'* ]]; then
+      PILOT_ARGS[i]="--sequence-config=${PWD}/${config_path}"
+    fi
+  fi
+done
+
 if [[ -z "${GPU:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   echo 'Set GPU or CUDA_VISIBLE_DEVICES explicitly before running the pilot' >&2
   exit 2
@@ -34,4 +55,4 @@ export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${LD_LIBRARY_PATH:-}"
 cd "${UNIVTAC_ROOT}"
 exec python "${SCRIPT_DIR}/collect_shadow_digit_pilot.py" \
   --opentac-root "${UNIVTAC_ROOT}" --capx-root "${CAPX_DIR}" \
-  --output-root "${OUTPUT_ROOT}" "$@"
+  --output-root "${OUTPUT_ROOT}" "${PILOT_ARGS[@]}"

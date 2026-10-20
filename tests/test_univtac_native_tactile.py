@@ -24,6 +24,58 @@ from capx.integrations.univtac.tactile_api import UniVTACTactileApi
 from capx.integrations.univtac.touch_manipulation_api import UniVTACTouchManipulationApi
 
 
+def test_force_task_color_override_preserves_native_parameters(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "tension_strap.yml"
+    config_path.write_text(yaml.safe_dump({
+        "task_parameters": {
+            "force_time_sequence": [12.0, 3.0, 18.0, 3.0],
+            "geometry": "bundle",
+            "motion_speed_scale": 3.0,
+            "strap_color_mode": "blue",
+        },
+    }))
+    env = UniVTACLowLevelEnv.__new__(UniVTACLowLevelEnv)
+    env.task_name = env.task_config_name = "tension_strap"
+    env._task_config_path = lambda: config_path
+    env.task_config_overrides = {"task_parameters": {"strap_color_mode": "tricolor"}}
+    env.expose_actor_pose = True
+    env.device_override = None
+    env._force_task_requested = True
+    env.force_task_seed = 7
+    env.api_configs = {}
+    env._validate_runtime_preflight = lambda: None
+    env._install_task_runtime_patches = lambda: None
+
+    cfg = types.SimpleNamespace(
+        decimation=1, save_frequency=1, video_frequency=1,
+        reset_time_limit=1, step_lim=1, max_save_frames=1,
+        planner_time_dilation_factor=1.0,
+        scene=types.SimpleNamespace(num_envs=1),
+        sim=types.SimpleNamespace(device="cpu"),
+    )
+    task_module = types.ModuleType("envs.tension_strap")
+    task_module.TaskCfg = lambda: cfg
+    task_module.Task = lambda task_cfg, mode: types.SimpleNamespace(cfg=task_cfg, mode=mode)
+    utils_module = types.ModuleType("envs._force_task_utils")
+    utils_module.prepare_force_task_config = (
+        lambda task_cfg, config, path, *, seed:
+        setattr(task_cfg, "force_task_parameters", dict(config["task_parameters"]))
+    )
+    envs_module = types.ModuleType("envs")
+    envs_module.__path__ = []
+    monkeypatch.setitem(sys.modules, "envs", envs_module)
+    monkeypatch.setitem(sys.modules, "envs.tension_strap", task_module)
+    monkeypatch.setitem(sys.modules, "envs._force_task_utils", utils_module)
+
+    env._build_task()
+    assert cfg.force_task_parameters == {
+        "force_time_sequence": [12.0, 3.0, 18.0, 3.0],
+        "geometry": "bundle",
+        "motion_speed_scale": 3.0,
+        "strap_color_mode": "tricolor",
+    }
+
+
 def _depth(indented: bool) -> np.ndarray:
     arr = np.full((16, 16), 34.0, dtype=np.float32)
     if indented:

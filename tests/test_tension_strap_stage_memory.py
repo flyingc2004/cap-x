@@ -278,6 +278,7 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     assert low_level["task_config_overrides"] == {
         "official_task_protocol": True,
         "force_sequence_manifest": '${oc.env:CAPX_FORCE_SEQUENCE_MANIFEST,""}',
+        "task_parameters": {"strap_color_mode": "${oc.env:CAPX_STRAP_COLOR_MODE,tricolor}"},
         "task_cfg_overrides": {"save_pre_move": False},
         "record_video_during_reset": False,
         "record_pre_move_frames": False,
@@ -302,6 +303,9 @@ def test_tension_strap_control_yaml_uses_opentac_and_frozen_memory() -> None:
     )
     visual_grasp = visual["env"]["cfg"]["low_level"]["api_configs"]["franka_control_api"]["adaptive_gripper"]
     assert visual_grasp == grasp
+    assert visual["env"]["cfg"]["low_level"]["task_config_overrides"]["task_parameters"] == {
+        "strap_color_mode": "${oc.env:CAPX_STRAP_COLOR_MODE,tricolor}"
+    }
     assert low_level["api_configs"]["franka_control_api"]["max_gripper_servo_steps"] == 400
     assert grasp["coarse_qpos_step"] == pytest.approx(1.0e-4)
     assert grasp["fine_qpos_step"] == pytest.approx(1.0e-4)

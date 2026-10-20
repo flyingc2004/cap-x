@@ -1,4 +1,4 @@
-"""Two-episode Shadow DIGIT force pilot; run only in an Isaac Kit Python env.
+"""Shadow DIGIT force pilot; run only in an Isaac Kit Python env.
 
 No Responses API or CaP-X generated code is involved.  The expert episode
 uses the native demonstration policy; the C4 probe uses a fixed public-geometry
@@ -8,6 +8,7 @@ trajectory and never reads measured force for action decisions.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -22,6 +23,67 @@ from shadow_digit_pilot_core import PilotRecorder, SCHEMA, audit_episode, prepar
 
 EXPERT_NOTES = ["C#4", "C4", "G4", "A4", "E4", "F4"]
 EXPERT_DYNAMICS = ["light", "heavy"] * 3
+WHITE_NOTES = ("C4", "D4", "E4", "F4", "G4", "A4", "B4")
+BLACK_NOTES = ("C#4", "D#4", "F#4", "G#4", "A#4")
+
+
+def _balanced_eight(seed: int) -> tuple[list[str], list[str]]:
+    """Pair light/heavy on each of four keys; balance both phrase halves."""
+    index = seed - 3100
+    white = [WHITE_NOTES[(2 * index + j) % len(WHITE_NOTES)] for j in range(2)]
+    black = [BLACK_NOTES[(2 * index + j) % len(BLACK_NOTES)] for j in range(2)]
+    first = [(white[0], "light"), (white[1], "heavy"),
+             (black[0], "light"), (black[1], "heavy")]
+    second = [(white[0], "heavy"), (white[1], "light"),
+              (black[0], "heavy"), (black[1], "light")]
+    rng = np.random.default_rng(seed)
+    rng.shuffle(first)
+    rng.shuffle(second)
+    pairs = first + second
+    return [note for note, _ in pairs], [dynamic for _, dynamic in pairs]
+
+
+def _expert_request(root: Path, *, seed: int, sequence_config: Path | None,
+                    random_note_count: int | None, balanced_eight: bool = False) -> dict:
+    """Resolve a phrase with the task's own note/dynamics/hold parser."""
+    if sequence_config is None and random_note_count is None and not balanced_eight:
+        return dict(notes=EXPERT_NOTES, dynamics=EXPERT_DYNAMICS,
+                    holds=[.12] * len(EXPERT_NOTES), strict=True,
+                    source="legacy_example", suffix="")
+
+    import yaml
+    sys.path.insert(0, str(root))
+    from envs._piano_sequence import make_sequence
+
+    if balanced_eight:
+        notes, dynamics = _balanced_eight(seed)
+        count, holds, strict = 8, .12, True
+        source, config_sha256 = "balanced_four_groups_8note_v1", None
+    elif sequence_config is not None:
+        path = sequence_config.expanduser().resolve()
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise ValueError("Piano sequence config must be a YAML mapping")
+        notes = config.get("piano_notes")
+        count = config.get("piano_note_count", 6)
+        dynamics = config.get("piano_dynamics")
+        holds = config.get("piano_hold_seconds", .12)
+        strict = config.get("piano_require_dynamics", True)
+        if not isinstance(strict, bool):
+            raise ValueError("piano_require_dynamics must be boolean")
+        source = str(path)
+        config_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    else:
+        notes, count, dynamics, holds, strict = None, random_note_count, None, .12, True
+        source, config_sha256 = f"seeded_random_{count}", None
+    sequence = make_sequence(notes, count=count, dynamics=dynamics, holds=holds,
+                             rng=np.random.default_rng(seed))
+    normalized = sequence.as_dict()
+    identity = dict(sequence=normalized, strict=strict, seed=seed)
+    suffix = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:10]
+    return dict(notes=normalized["notes"], dynamics=normalized["dynamics"],
+                holds=normalized["hold_seconds"], strict=strict,
+                source=source, source_sha256=config_sha256, suffix=suffix)
 
 
 def _commit(root: Path) -> str:
@@ -109,29 +171,38 @@ def _probe_actions(task):
 
 def _run_episode(*, root: Path, capx_root: Path, output_root: Path,
                  config_path: Path, config_provenance: dict,
-                 episode_kind: str, seed: int, app):
-    import imageio.v2 as imageio
+                 episode_kind: str, seed: int, app, expert_request: dict,
+                 record_video: bool = True):
     from env.tasks.arm_shadow_piano import Task, TaskCfg
     import env.tasks._digit_tactile as native_digit
     from shadow_digit_bridge import make_digit_bridge_class
 
     is_expert = episode_kind == "expert"
-    notes = EXPERT_NOTES if is_expert else ["C4"]
-    dynamics = EXPERT_DYNAMICS if is_expert else ["light"]
-    holds = .12 if is_expert else .6
-    strict = bool(is_expert)
-    episode_dir = output_root / "episodes" / f"{seed}_{episode_kind}"
+    notes = expert_request["notes"] if is_expert else ["C4"]
+    dynamics = expert_request["dynamics"] if is_expert else ["light"]
+    holds = expert_request["holds"] if is_expert else .6
+    strict = expert_request["strict"] if is_expert else False
+    suffix = f"_{expert_request['suffix']}" if is_expert and expert_request["suffix"] else ""
+    episode_dir = output_root / "episodes" / f"{seed}_{episode_kind}{suffix}"
     metadata = dict(schema=SCHEMA, seed=seed, controller=episode_kind,
                     notes=notes, dynamics=dynamics, hold_seconds=holds,
                     require_dynamics=strict, physics_dt_s=1 / 240,
                     action_repeat=8, public_control_frequency_hz=30,
+                    record_video=record_video,
                     opentac_root=str(root), opentac_commit=_commit(root),
-                    capx_commit=_commit(capx_root))
+                    capx_commit=_commit(capx_root),
+                    collector_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     metadata.update(config_provenance)
+    if is_expert:
+        metadata["sequence_source"] = expert_request["source"]
+        if expert_request.get("source_sha256") is not None:
+            metadata["sequence_source_sha256"] = expert_request["source_sha256"]
     recorder = PilotRecorder(episode_dir, metadata=metadata)
     task = None
     scene_writer = None
     tactile_writer = None
+    video_steps = []
+    audio_info = None
     status = "running"
     error = None
     start = time.monotonic()
@@ -140,20 +211,26 @@ def _run_episode(*, root: Path, capx_root: Path, output_root: Path,
                       tactile_image_width=320, piano_notes=notes,
                       piano_dynamics=dynamics, piano_hold_seconds=holds,
                       piano_require_dynamics=strict, piano_seed=seed,
-                      record_video=True)
+                      record_video=record_video)
         original_class = native_digit.DigitTactile
         native_digit.DigitTactile = make_digit_bridge_class(
             original_class, opentac_root=root, piano_config=config_path,
             episode_dir=episode_dir)
         try:
-            task = Task(cfg=cfg, render_mode="rgb_array")
+            task = Task(cfg=cfg, render_mode="rgb_array" if record_video else None)
         finally:
             native_digit.DigitTactile = original_class
-        _configure_camera(task)
+        if record_video:
+            _configure_camera(task)
         observation, info = task.reset(seed=seed)
-        for _ in range(16):
-            task.sim.render()
-            task.camera.update(task.cfg.physics_dt, force_recompute=True)
+        if (list(task.sequence.as_dict()["notes"]) != list(notes) or
+                list(task.sequence.dynamics) != list(dynamics) or
+                list(task.sequence.holds) != (list(holds) if is_expert else [holds])):
+            raise RuntimeError("Native piano sequence differs from the requested phrase")
+        if record_video:
+            for _ in range(16):
+                task.sim.render()
+                task.camera.update(task.cfg.physics_dt, force_recompute=True)
         if not isinstance(observation, dict) or task.tactile.depth_m is None:
             raise RuntimeError("CaP-X DIGIT bridge did not return RGB and depth")
         if task.tactile._geometry["config_path"] != str(config_path):
@@ -189,16 +266,20 @@ def _run_episode(*, root: Path, capx_root: Path, output_root: Path,
 
         append_public(observation, np.asarray(task._action_state(), np.float32),
                       int(task.cfg.melody[0]), "expert" if is_expert else "hover")
-        scene_writer = imageio.get_writer(episode_dir / "video.mp4", fps=30, codec="libx264", quality=8)
-        tactile_writer = imageio.get_writer(episode_dir / "digit.mp4", fps=30, codec="libx264", quality=8)
+        if record_video:
+            import imageio.v2 as imageio
+            scene_writer = imageio.get_writer(episode_dir / "video.mp4", fps=30, codec="libx264", quality=8)
+            tactile_writer = imageio.get_writer(episode_dir / "digit.mp4", fps=30, codec="libx264", quality=8)
         if is_expert:
             while app.is_running() and not task._done:
-                requested = int(task.cfg.melody[min(task._demo_note, len(task.cfg.melody) - 1)])
                 command = np.asarray(task.demonstration_action("demo"), np.float32)
+                requested = int(task.cfg.melody[min(task._demo_note, len(task.cfg.melody) - 1)])
                 observation, _, terminated, truncated, info = task.step(command)
                 append_public(observation, command, requested, "expert")
-                scene_writer.append_data(task.render())
-                tactile_writer.append_data(observation["tactile"]["index"]["rgb"])
+                if record_video:
+                    scene_writer.append_data(task.render())
+                    tactile_writer.append_data(observation["tactile"]["index"]["rgb"])
+                    video_steps.append(int(task.step_count))
                 if terminated or truncated:
                     break
         else:
@@ -209,12 +290,24 @@ def _run_episode(*, root: Path, capx_root: Path, output_root: Path,
                     raise ValueError(f"Probe command outside native bounds: {command}")
                 observation, _, terminated, truncated, info = task.step(command)
                 append_public(observation, command, requested, phase)
-                scene_writer.append_data(task.render())
-                tactile_writer.append_data(observation["tactile"]["index"]["rgb"])
+                if record_video:
+                    scene_writer.append_data(task.render())
+                    tactile_writer.append_data(observation["tactile"]["index"]["rgb"])
+                    video_steps.append(int(task.step_count))
                 if terminated or truncated:
                     break
-        status = "complete" if task._done else "probe_finished" if not is_expert else "interrupted"
         task.audio_contacts.finish(task.step_count)
+        if scene_writer is not None:
+            scene_writer.close()
+            scene_writer = None
+        if tactile_writer is not None:
+            tactile_writer.close()
+            tactile_writer = None
+        if video_steps:
+            from envs._piano_audio import add_piano_audio
+            audio_info = add_piano_audio(episode_dir / "video.mp4", task.audio_contacts.events,
+                                         video_steps, fps=30)
+        status = "complete" if task._done else "probe_finished" if not is_expert else "interrupted"
     except BaseException as exc:
         status = "error"
         error = f"{type(exc).__name__}: {exc}"
@@ -229,6 +322,8 @@ def _run_episode(*, root: Path, capx_root: Path, output_root: Path,
             result = dict(metadata=metadata, status=status, error=error,
                           wall_seconds=time.monotonic() - start,
                           physics_step=int(task.step_count) if task is not None and hasattr(task, "step_count") else None,
+                          audio=audio_info,
+                          audio_events=task.audio_contacts.events if task is not None and hasattr(task, "audio_contacts") else [],
                           native_info=task._info() if task is not None and hasattr(task, "score") else None,
                           native_events=task.score.events if task is not None and hasattr(task, "score") else [],
                           tactile_metadata=task.tactile.metadata() if task is not None and task.tactile is not None else None)
@@ -242,15 +337,30 @@ def _run_episode(*, root: Path, capx_root: Path, output_root: Path,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Collect the two Shadow DIGIT force pilot episodes")
+    parser = argparse.ArgumentParser(description="Collect Shadow DIGIT force pilot episodes")
     parser.add_argument("--opentac-root", type=Path, required=True)
     parser.add_argument("--capx-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, default=Path("/mnt/data/ljz/opentacbench/shadow_digit_force_v1"))
     parser.add_argument("--episode", choices=("expert", "probe", "both"), default="both")
+    parser.add_argument("--expert-seed", type=int, default=3000)
+    phrase = parser.add_mutually_exclusive_group()
+    phrase.add_argument("--sequence-config", type=Path,
+                        help="YAML with piano_notes, piano_dynamics and piano_hold_seconds")
+    phrase.add_argument("--random-note-count", type=int,
+                        help="Seeded random C4-B4 phrase of this length")
+    phrase.add_argument("--balanced-eight", action="store_true",
+                        help="Eight notes: two light and two heavy for each key color")
+    parser.add_argument("--no-video", action="store_true",
+                        help="Keep synchronized RGB/depth/force HDF5 data but omit MP4/WAV")
     args = parser.parse_args()
     root = args.opentac_root.expanduser().resolve()
     capx_root = args.capx_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
+    expert_request = _expert_request(root, seed=args.expert_seed,
+                                     sequence_config=args.sequence_config,
+                                     random_note_count=args.random_note_count,
+                                     balanced_eight=args.balanced_eight)
+    print(f"PILOT_PHRASE {json.dumps(expert_request, ensure_ascii=False, sort_keys=True)}", flush=True)
     original = root / ".cache/piano_tactile/digit/venv/lib/python3.11/site-packages/tacto/config_digit.yml"
     config = output_root / "config" / "config_digit_piano_0_2.yml"
     config_provenance = prepare_piano_config(original, config)
@@ -260,16 +370,19 @@ def main():
     _check_force_ramp(root, config, output_root)
     sys.path.insert(0, str(root))
     from isaaclab.app import AppLauncher
-    app = AppLauncher(argparse.Namespace(enable_cameras=True, num_envs=1, headless=True)).app
+    app = AppLauncher(argparse.Namespace(enable_cameras=not args.no_video,
+                                        num_envs=1, headless=True)).app
     try:
         if args.episode in ("expert", "both"):
             _run_episode(root=root, capx_root=capx_root, output_root=output_root,
                          config_path=config, config_provenance=config_provenance,
-                         episode_kind="expert", seed=3000, app=app)
+                         episode_kind="expert", seed=args.expert_seed, app=app,
+                         expert_request=expert_request, record_video=not args.no_video)
         if args.episode in ("probe", "both"):
             _run_episode(root=root, capx_root=capx_root, output_root=output_root,
                          config_path=config, config_provenance=config_provenance,
-                         episode_kind="probe", seed=3001, app=app)
+                         episode_kind="probe", seed=3001, app=app,
+                         expert_request=expert_request, record_video=not args.no_video)
     finally:
         app.close(wait_for_replicator=False)
 

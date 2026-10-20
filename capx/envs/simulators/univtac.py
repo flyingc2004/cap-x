@@ -2606,11 +2606,22 @@ class UniVTACLowLevelEnv(BaseEnv):
             self._task_config = yaml.safe_load(f) or {}
         config_task_overrides = dict(self._task_config.get("task_cfg_overrides", {}) or {})
         runtime_task_overrides = dict(self.task_config_overrides.get("task_cfg_overrides", {}) or {})
+        config_parameters = dict(self._task_config.get("task_parameters", {}) or {})
+        runtime_parameters = self.task_config_overrides.get("task_parameters")
+        if runtime_parameters is not None and not isinstance(runtime_parameters, dict):
+            raise ValueError("task_parameters override must be a mapping")
         self._task_config.update(self.task_config_overrides)
         if config_task_overrides or runtime_task_overrides:
             self._task_config["task_cfg_overrides"] = {
                 **config_task_overrides,
                 **runtime_task_overrides,
+            }
+        if runtime_parameters is not None:
+            # A presentation-only override must retain the native force task's
+            # geometry, calibration, timing, and acceptance parameters.
+            self._task_config["task_parameters"] = {
+                **config_parameters,
+                **runtime_parameters,
             }
 
         task_module = importlib.import_module(f"envs.{self.task_name}")

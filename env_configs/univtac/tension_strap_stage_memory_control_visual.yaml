@@ -28,6 +28,8 @@ env:
       task_config_overrides:
         # Keep native physical safety checks; acceptance waits for agent END.
         official_task_protocol: true
+        task_parameters:
+          strap_color_mode: ${oc.env:CAPX_STRAP_COLOR_MODE,tricolor}
         task_cfg_overrides:
           save_pre_move: false
         record_video_during_reset: false

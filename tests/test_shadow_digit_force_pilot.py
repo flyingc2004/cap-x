@@ -13,10 +13,29 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts/opentac"))
 from shadow_digit_pilot_core import PilotRecorder, audit_episode, prepare_piano_config, sha256
+from collect_shadow_digit_pilot import _expert_request
 
 
 ROOT = Path(__file__).resolve().parents[3] / "OpenTacBench"
 ORIGINAL = ROOT / ".cache/piano_tactile/digit/venv/lib/python3.11/site-packages/tacto/config_digit.yml"
+
+
+def test_expert_accepts_arbitrary_piano_phrase(tmp_path):
+    phrase = tmp_path / "phrase.yml"
+    phrase.write_text("piano_notes: [D4, F#4, A4, G4, E4, C#4, B4, A4]\n"
+                      "piano_dynamics: [light, heavy, light, heavy, light, heavy, light, heavy]\n"
+                      "piano_hold_seconds: [0.12, 0.18, 0.12, 0.24, 0.12, 0.18, 0.12, 0.24]\n"
+                      "piano_require_dynamics: true\n")
+    requested = _expert_request(ROOT, seed=3002, sequence_config=phrase,
+                                random_note_count=None)
+    assert requested["notes"] == ["D4", "F#4", "A4", "G4", "E4", "C#4", "B4", "A4"]
+    assert requested["holds"][3] == .24
+    assert requested["source_sha256"] == sha256(phrase)
+    random_request = _expert_request(ROOT, seed=3002, sequence_config=None,
+                                     random_note_count=8)
+    assert len(random_request["notes"]) == len(random_request["dynamics"]) == 8
+    assert random_request == _expert_request(ROOT, seed=3002, sequence_config=None,
+                                             random_note_count=8)
 
 
 def test_piano_config_changes_only_range_force(tmp_path):
@@ -59,7 +78,7 @@ def test_public_private_exact_step_separation_and_audit(tmp_path):
                                    hand_state=np.zeros(21, np.float32),
                                    key_angles_rad=angles,
                                    action_target=np.zeros(4, np.float32),
-                                   requested_midi=60, phase="hover")
+                                   requested_midi=60 if step == 0 else 61, phase="hover")
     recorder.close()
     with h5py.File(episode / "public.h5") as public, h5py.File(episode / "private_labels.h5") as private:
         assert public["physics_step"][:].tolist() == [0, 8]
@@ -71,6 +90,7 @@ def test_public_private_exact_step_separation_and_audit(tmp_path):
         assert public["tactile/index/reference_depth_m"].shape == (4, 6)
     report = audit_episode(episode)
     assert report["exact_step_alignment"] is True
+    assert report["max_target_key_force_N"] == pytest.approx(2.4)
     assert report["frames_at_or_above_2_N"] == 1
     assert report["private_steps_any_key_at_or_above_2_N"] == 2
     assert (episode / "alignment.png").is_file()

@@ -1,0 +1,8 @@
+# Shadow Hand index DIGIT force-calibration smoke.
+# Two white keys and two black keys, each played once light and once heavy.
+# Each half of the phrase contains one example from every key-color/dynamic group.
+piano_notes: [F4, C#4, G4, F#4, C#4, G4, F#4, F4]
+piano_dynamics: [light, heavy, heavy, light, light, light, heavy, heavy]
+piano_note_count: 8
+piano_hold_seconds: 0.12
+piano_require_dynamics: true
