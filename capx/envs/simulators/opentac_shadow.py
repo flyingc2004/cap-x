@@ -7,7 +7,9 @@ Native scoring and force measurements stay in the evaluator-side event log.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -36,6 +38,13 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         video_width: int = 640,
         task_factory: Callable[["ShadowPianoLowLevelEnv"], Any] | None = None,
         output_dir: str | None = None,
+        visual_key_mode: bool = False,
+        mirror_head_view: bool = False,
+        auto_clear_keyboard_for_visual: bool = False,
+        snap_visual_key_pixels: bool = False,
+        digit_piano_config: str | None = None,
+        digit_force_sidecar: str | None = None,
+        private_audit_root: str | None = None,
     ) -> None:
         super().__init__()
         self.univtac_root = Path(univtac_root).expanduser().resolve()
@@ -48,8 +57,28 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self.tactile_image_width = int(tactile_image_width)
         self.video_frame_stride = max(1, int(video_frame_stride))
         self.video_width = int(video_width)
+        self.visual_key_mode = bool(visual_key_mode)
+        self.mirror_head_view = bool(mirror_head_view)
+        self.auto_clear_keyboard_for_visual = bool(auto_clear_keyboard_for_visual)
+        self.snap_visual_key_pixels = bool(snap_visual_key_pixels)
+        self._visual_key_map_ready = False
+        if self.mirror_head_view and not self.visual_key_mode:
+            raise ValueError("Mirrored HEAD view requires visual key mode")
+        if self.auto_clear_keyboard_for_visual and not self.visual_key_mode:
+            raise ValueError("Automatic keyboard clearing requires visual key mode")
+        if self.snap_visual_key_pixels and not self.visual_key_mode:
+            raise ValueError("Visual key pixel snapping requires visual key mode")
+        self.digit_piano_config = Path(digit_piano_config).expanduser().resolve() if digit_piano_config else None
+        self.digit_force_sidecar = Path(digit_force_sidecar).expanduser().resolve() if digit_force_sidecar else None
+        self.private_audit_root = Path(private_audit_root or "/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1").expanduser().resolve()
+        if self.visual_key_mode and (self.digit_piano_config is None or self.digit_force_sidecar is None):
+            raise ValueError("Visual Shadow smoke requires the matched DIGIT config and force sidecar")
         self._output_dir = Path(output_dir or os.environ.get("CAPX_OUTPUT_DIR", "")) if (output_dir or os.environ.get("CAPX_OUTPUT_DIR")) else None
         self._task = task_factory(self) if task_factory else self._create_native_task()
+        self._force_estimator = None
+        if self.visual_key_mode:
+            from capx.integrations.opentac_shadow_force import PublicDigitKeyForce
+            self._force_estimator = PublicDigitKeyForce(self.digit_force_sidecar, self.digit_piano_config)
         self._configure_camera()
         self.video_fps = float(getattr(self._task, "metadata", {}).get("render_fps", 30)) / self.video_frame_stride
         self._observation: dict[str, Any] | None = None
@@ -59,8 +88,12 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self._policy_end_verdict = False
         self._sim_step_count = 0
         self._last_native_notes_completed = 0
+        self._last_private_piano_record = 0
+        self._last_private_score_event = 0
         self._record_frames = False
         self._frame_buffer: list[np.ndarray] = []
+        self._private_audit_dir: Path | None = None
+        self._private_audit_streams: dict[str, Any] = {}
         self._action = np.zeros(4, dtype=np.float32)
         self.max_steps = 100000
         self._closed = False
@@ -81,20 +114,90 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             piano_seed=self.seed_base,
             record_video=True,
         )
-        return Task(cfg=cfg, render_mode="rgb_array")
+        if not self.visual_key_mode:
+            return Task(cfg=cfg, render_mode="rgb_array")
+        import env.tasks._digit_tactile as native_digit
+        from capx.integrations.opentac_shadow_runtime_bridge import make_runtime_digit_bridge
+
+        native_class = native_digit.DigitTactile
+        native_digit.DigitTactile = make_runtime_digit_bridge(
+            native_class, opentac_root=self.univtac_root,
+            piano_config=self.digit_piano_config,
+            output_dir=self._output_dir,
+        )
+        try:
+            task = Task(cfg=cfg, render_mode="rgb_array")
+        finally:
+            native_digit.DigitTactile = native_class
+        expected = hashlib.sha256(self.digit_piano_config.read_bytes()).hexdigest()
+        if task.tactile._geometry.get("config_path") != str(self.digit_piano_config):
+            task.close()
+            raise RuntimeError("Shadow task used a different TACTO renderer config")
+        print(f"[capx-shadow] TACTO config sha256={expected} version={task.tactile._geometry.get('tacto_version')}", flush=True)
+        return task
 
     @property
     def task(self):
         return self._task
 
+    @property
+    def visual_key_map_ready(self) -> bool:
+        """Whether this episode has an accepted visual key map."""
+        return self._visual_key_map_ready
+
+    def get_keyboard_endpoints(self) -> dict[str, Any]:
+        """Expose only the static A0/C8 white-key centers and their HEAD pixels."""
+        if not self.visual_key_mode:
+            raise RuntimeError("Visual keyboard endpoints are not enabled")
+        from envs._piano import keyboard_layout
+        from capx.integrations.opentac_shadow_vision import head_world_to_display_pixel
+
+        layout = keyboard_layout()
+        anchors = {}
+        for name, key in (("A0", layout[0]), ("C8", layout[-1])):
+            if key.black:
+                raise RuntimeError("Keyboard endpoint must be a white key")
+            x, y, z = key.position
+            point = (float(x), float(y), float(z + key.size[2]))
+            anchors[name] = {
+                "midi": int(key.midi),
+                "world_key_top_center_m": list(point),
+                "display_image_center_px": head_world_to_display_pixel(
+                    point, mirrored=self.mirror_head_view,
+                ),
+            }
+        white_count = sum(not key.black for key in layout)
+        intervals = white_count - 1
+        return {
+            "frame": "fixed_HEAD_display_image",
+            "mirrored": self.mirror_head_view,
+            "display_image_size_px": [960, 662],
+            "camera_picture_origin_px": [0, 22],
+            "white_key_count": white_count,
+            "white_center_intervals": intervals,
+            "white_center_spacing_m": (
+                anchors["C8"]["world_key_top_center_m"][1]
+                - anchors["A0"]["world_key_top_center_m"][1]
+            ) / intervals,
+            "A0": anchors["A0"],
+            "C8": anchors["C8"],
+        }
+
     def _configure_camera(self) -> None:
         if not hasattr(self._task, "camera"):
             return
+        if self.visual_key_mode:
+            from capx.integrations.opentac_shadow_vision import HEAD_EYE, HEAD_LOOK_AT
+            self._set_camera_pose(HEAD_EYE.tolist(), HEAD_LOOK_AT.tolist())
+        else:
+            target_y = self._task.layout[self._task.target].position[1]
+            self._set_camera_pose([-.58, .85, .66], [.12, target_y, .095])
+
+    def _set_camera_pose(self, eye, target) -> None:
         import torch
-        target_y = self._task.layout[self._task.target].position[1]
         self._task.camera.set_world_poses_from_view(
-            torch.tensor([[-.58, .85, .66]], device=self._task.sim.device),
-            torch.tensor([[.12, target_y, .095]], device=self._task.sim.device),
+            torch.tensor([eye], dtype=torch.float32, device=self._task.sim.device),
+            torch.tensor([target], dtype=torch.float32, device=self._task.sim.device),
         )
 
     def _write_native_event(self, kind: str) -> None:
@@ -108,8 +211,11 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         row = {"kind": kind, "action_step": self._sim_step_count,
                "action_target": self._action.tolist(), "key_angles_rad": key_angles,
                "native_done": self._native_done, "native_info": self._native_info}
-        with (self._output_dir / "shadow_native_events.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(row, default=lambda v: v.tolist() if hasattr(v, "tolist") else str(v)) + "\n")
+        if self.visual_key_mode:
+            self._append_private_audit("shadow_native_events.jsonl", row)
+        else:
+            with (self._output_dir / "shadow_native_events.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row, default=lambda v: v.tolist() if hasattr(v, "tolist") else str(v)) + "\n")
 
     def _save_tactile_snapshot(self, filename: str) -> None:
         if self._output_dir is None:
@@ -120,12 +226,15 @@ class ShadowPianoLowLevelEnv(BaseEnv):
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         actual_seed = self.seed_base if seed is None else self.seed_base + int(seed)
+        self._visual_key_map_ready = False
         self._observation, self._native_info = self._task.reset(seed=actual_seed)
         self._native_done = False
         self._policy_end_submitted = False
         self._policy_end_verdict = False
         self._sim_step_count = 0
         self._last_native_notes_completed = 0
+        self._last_private_piano_record = 0
+        self._last_private_score_event = 0
         self._action = np.zeros(4, dtype=np.float32)
         self._frame_buffer.clear()
         if hasattr(self._task, "camera"):
@@ -134,8 +243,32 @@ class ShadowPianoLowLevelEnv(BaseEnv):
                 self._task.sim.render()
                 self._task.camera.update(self._task.cfg.physics_dt, force_recompute=True)
         self._write_native_event("reset")
+        if self.visual_key_mode:
+            self._append_private_audit(
+                "shadow_visual_key_maps.jsonl",
+                {"kind": "reset", "ready": 0, "action_step": 0, "seed": actual_seed},
+            )
+            print("[capx-shadow] visual_key_map_ready=0 reset", flush=True)
+            self._write_private_force_audit("reset")
+            self._write_private_piano_timeline()
         self._save_tactile_snapshot("shadow_digit_initial.png")
+        if self.auto_clear_keyboard_for_visual:
+            self._clear_keyboard_for_visual()
         return self.get_observation(), {}
+
+    def _clear_keyboard_for_visual(self) -> None:
+        """Move the open index away from the keyboard before the sole initial image."""
+        current_y = float(self.get_observation()["hand_state"]["wrist_y_m"])
+        for y, steps in ((current_y, 30), (.24, 40), (.24, 40), (.24, 40)):
+            result = self.command([0., y, .05, 0.], steps)
+            if result["native_done"]:
+                raise RuntimeError("Native Shadow episode ended while clearing the keyboard view")
+            if y == .24 and abs(
+                float(self.get_observation()["hand_state"]["wrist_y_m"]) - .24
+            ) <= .025:
+                print(f"[capx-shadow] keyboard clear at action_step={self._sim_step_count}", flush=True)
+                return
+        raise RuntimeError("Shadow wrist did not reach the clear-view position")
 
     def _validate_action(self, action: Any) -> np.ndarray:
         value = np.asarray(action, dtype=np.float32)
@@ -146,15 +279,42 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             raise ValueError(f"Shadow action outside native bounds: {value.tolist()}")
         return value
 
+    def _require_xy_arrival_before_press(self, target: np.ndarray) -> None:
+        """Keep a moving index clear of adjacent keys in visual-key mode."""
+        if not self.visual_key_mode or not self._visual_key_map_ready:
+            return
+        # Hovering with the index extended remains available while the arm
+        # travels. Lowering or curling requires measured, settled wrist X/Y.
+        if float(target[2]) >= .035 and float(target[3]) <= .05:
+            return
+        hand = self.get_observation()["hand_state"]
+        actual_xy = np.array([hand["wrist_x_offset_m"], hand["wrist_y_m"]], dtype=float)
+        target_xy = np.asarray(target[:2], dtype=float)
+        error_m = float(np.linalg.norm(actual_xy - target_xy))
+        y_speed_m_s = float(hand["wrist_and_index_velocity"][0])
+        if not np.isfinite(error_m) or not np.isfinite(y_speed_m_s):
+            raise ValueError("Shadow wrist XY arrival state is not finite")
+        if error_m > .002 or abs(y_speed_m_s) > .015:
+            raise ValueError(
+                "Shadow wrist XY has not settled before lowering/flexion: "
+                f"target={target_xy.tolist()}, actual={actual_xy.tolist()}, "
+                f"error_m={error_m:.6f}, y_speed_m_s={y_speed_m_s:.6f}; "
+                "hold the extended index at hover and recheck get_hand_state()"
+            )
+
     def step(self, action):
         if self._policy_end_submitted or self._native_done:
             raise RuntimeError("Native piano episode has ended; no further action is allowed")
         value = self._validate_action(action)
+        self._require_xy_arrival_before_press(value)
         self._observation, reward, terminated, truncated, self._native_info = self._task.step(value)
         self._action = value.copy()
         self._sim_step_count += 1
         self._native_done = bool(terminated or truncated)
         self._write_native_event("action")
+        if self.visual_key_mode:
+            self._write_private_force_audit("action")
+            self._write_private_piano_timeline()
         completed = int(self._native_info.get("notes_completed", 0))
         if completed > self._last_native_notes_completed:
             for index in range(self._last_native_notes_completed + 1, completed + 1):
@@ -191,12 +351,147 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         native_action_state = np.asarray(self._task._action_state(), dtype=np.float32)
         if native_action_state.shape != (4,):
             raise RuntimeError(f"Unexpected native Shadow action-state shape: {native_action_state.shape}")
-        return {"hand_state": {"wrist_x_offset_m": float(native_action_state[0]),
+        public = {"hand_state": {"wrist_x_offset_m": float(native_action_state[0]),
                                "wrist_y_m": float(state[0]), "wrist_z_m": float(state[1]),
                                "index_flexion_rad": float(state[2]), "wrist_and_index_velocity": state[3:6].tolist(),
                                "arm_joint_position_rad": state[97:104].tolist(),
-                               "arm_joint_velocity_rad_s": state[104:111].tolist()},
-                "key_angles_rad": state[6:94].tolist()}
+                               "arm_joint_velocity_rad_s": state[104:111].tolist()}}
+        if self.visual_key_mode:
+            public["hand_state"]["visual_key_map_ready"] = int(self._visual_key_map_ready)
+        if not self.visual_key_mode:
+            public["key_angles_rad"] = state[6:94].tolist()
+        return public
+
+    def _write_private_force_audit(self, kind: str) -> None:
+        if self._output_dir is None or not hasattr(self._task, "tactile"):
+            return
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        forces = np.asarray(self._task.tactile.key_forces(), float)
+        if forces.shape != (88,) or not np.isfinite(forces).all():
+            raise RuntimeError("Invalid private key-force audit")
+        row = {"kind": kind, "action_step": self._sim_step_count,
+               "physics_step": int(getattr(self._task, "step_count", 0)),
+               "key_contact_force_N": forces.tolist()}
+        self._append_private_audit("shadow_private_force_audit.jsonl", row)
+
+    def _write_private_piano_timeline(self) -> None:
+        """Copy native 240 Hz annotations and score events without altering them."""
+        records = self._task.piano_annotations.records
+        for row in records[self._last_private_piano_record:]:
+            self._append_private_audit("shadow_piano_physics_trace.jsonl", dict(row))
+        self._last_private_piano_record = len(records)
+        events = self._task.score.events
+        for event in events[self._last_private_score_event:]:
+            self._append_private_audit("shadow_piano_score_events.jsonl", dict(event))
+        self._last_private_score_event = len(events)
+
+    def locate_visual_keys(self, pixels: dict[str, dict]) -> dict[str, dict]:
+        if not self.visual_key_mode:
+            raise RuntimeError("Visual key location is not enabled")
+        from capx.integrations.opentac_shadow_vision import (
+            HEAD_FOCAL_PX, HEAD_HEIGHT, HEAD_WIDTH, locate_key_pixels,
+            snap_key_pixels_to_visible_centers,
+        )
+        camera = self._task.camera
+        if camera.cfg.width != HEAD_WIDTH or camera.cfg.height != HEAD_HEIGHT:
+            raise RuntimeError("Head camera geometry differs from visual calibration")
+        intrinsics = camera.data.intrinsic_matrices[0].detach().cpu().numpy()
+        if (intrinsics.shape != (3, 3) or
+                abs(float(intrinsics[0, 0]) - HEAD_FOCAL_PX) > 2 or
+                abs(float(intrinsics[1, 1]) - HEAD_FOCAL_PX) > 2 or
+                abs(float(intrinsics[0, 2]) - HEAD_WIDTH / 2) > 2 or
+                abs(float(intrinsics[1, 2]) - HEAD_HEIGHT / 2) > 2):
+            raise RuntimeError("Head camera intrinsics differ from visual calibration")
+        selected_pixels = pixels
+        snap_audit = None
+        if self.snap_visual_key_pixels:
+            pixels, snap_audit = snap_key_pixels_to_visible_centers(
+                pixels, self.render_head(),
+            )
+            print(
+                "[capx-shadow] visual key pixel snap "
+                + " ".join(
+                    f"{note}={row['delta_x_px']:+.2f}px"
+                    for note, row in snap_audit.items()
+                ),
+                flush=True,
+            )
+        targets = locate_key_pixels(
+            pixels, expected_notes=self.piano_notes, mirrored=self.mirror_head_view,
+        )
+        self._append_private_audit(
+            "shadow_visual_key_maps.jsonl",
+            {"kind": "accepted", "ready": 1, "action_step": self._sim_step_count,
+             "targets": targets, "selected_pixels": selected_pixels,
+             "pixel_snap": snap_audit},
+        )
+        os.fsync(self._private_audit_streams["shadow_visual_key_maps.jsonl"].fileno())
+        self._visual_key_map_ready = True
+        print(f"[capx-shadow] visual_key_map_ready=1 action_step={self._sim_step_count}", flush=True)
+        return targets
+
+    def estimate_key_force(self, note: str | int) -> dict[str, Any]:
+        if not self.visual_key_mode or self._force_estimator is None:
+            raise RuntimeError("DIGIT key-force calibration is not enabled")
+        from capx.integrations.opentac_shadow_vision import parse_note
+        midi, black = parse_note(note)
+        tactile = self._task.tactile
+        if tactile.depth_m is None or tactile.reference_depth_m is None:
+            return {"estimated_key_force_N": None, "sample_step": None,
+                    "age_steps": None, "quality": "unavailable",
+                    "calibration_version": self._force_estimator.sidecar["schema"]}
+        estimate = self._force_estimator.predict(
+            tactile.depth_m, tactile.reference_depth_m,
+            color="black" if black else "white",
+            sample_step=self._sim_step_count, current_step=self._sim_step_count,
+        )
+        if self._output_dir is not None:
+            truth = float(np.asarray(tactile.key_forces())[midi - 21])
+            self._append_private_audit(
+                "shadow_force_estimates_private_audit.jsonl",
+                {"note": str(note), "action_step": self._sim_step_count,
+                 "physics_step": int(getattr(self._task, "step_count", 0)),
+                 "estimate": estimate, "private_key_top_force_N": truth},
+            )
+        return estimate
+
+    def _append_private_audit(self, filename: str, row: dict) -> None:
+        """Immediately append a private label outside the generated-code artifacts."""
+        if self._private_audit_dir is None:
+            self.private_audit_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.private_audit_root.chmod(0o300)
+            run_id = self._output_dir.name if self._output_dir is not None else "shadow"
+            self._private_audit_dir = self.private_audit_root / f"{run_id}_{uuid.uuid4().hex}"
+            # During generated-code execution the random subdirectory cannot
+            # be listed and the files are write-only. Their path is not
+            # included in the public API, prompt or observation.
+            self._private_audit_dir.mkdir(mode=0o300)
+        stream = self._private_audit_streams.get(filename)
+        if stream is None:
+            fd = os.open(self._private_audit_dir / filename,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o200)
+            stream = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
+            self._private_audit_streams[filename] = stream
+        stream.write(json.dumps(row, default=lambda v: v.tolist() if hasattr(v, "tolist") else str(v)) + "\n")
+        stream.flush()
+
+    def _close_private_audit(self) -> None:
+        for stream in self._private_audit_streams.values():
+            try:
+                os.fsync(stream.fileno())
+            finally:
+                stream.close()
+        self._private_audit_streams.clear()
+        self.private_audit_root.chmod(0o700)
+        if self._private_audit_dir is not None:
+            self._private_audit_dir.chmod(0o700)
+            for path in self._private_audit_dir.iterdir():
+                path.chmod(0o600)
+        if self._private_audit_dir is not None and self._output_dir is not None:
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+            (self._output_dir / "shadow_private_audit_location.json").write_text(
+                json.dumps({"private_audit_dir": str(self._private_audit_dir)}) + "\n", encoding="utf-8"
+            )
 
     def get_index_tactile_rgb(self) -> np.ndarray:
         if self._observation is None:
@@ -238,6 +533,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         if frame.ndim != 3 or frame.shape[2] < 3:
             raise RuntimeError(f"Invalid native piano video frame: {frame.shape}")
         frame = np.asarray(frame[:, :, :3], dtype=np.uint8)
+        if self.mirror_head_view:
+            frame = np.ascontiguousarray(frame[:, ::-1])
         if frame.shape[1] > self.video_width:
             from PIL import Image
             width = self.video_width
@@ -273,13 +570,46 @@ class ShadowPianoLowLevelEnv(BaseEnv):
     def render(self, mode: str = "rgb_array") -> np.ndarray:
         if mode != "rgb_array":
             raise ValueError("Only rgb_array rendering is supported")
-        return np.asarray(self._task.render())
+        return self.render_head() if self.visual_key_mode else np.asarray(self._task.render())
+
+    def render_head(self) -> np.ndarray:
+        if self.visual_key_mode:
+            self._configure_camera()
+            self._task.sim.render()
+        frame = np.asarray(self._task.render())
+        return np.ascontiguousarray(frame[:, ::-1]) if self.mirror_head_view else frame
+
+    def render_wrist(self) -> np.ndarray | None:
+        if not self.visual_key_mode:
+            return None
+        palm = self._task.hand.data.body_pos_w[0, self._task._palm].detach().cpu().numpy()
+        eye = palm + np.array([-.18, .0, .20])
+        target = palm + np.array([.24, .0, -.035])
+        self._set_camera_pose(eye.tolist(), target.tolist())
+        try:
+            self._task.sim.render()
+            frame = np.asarray(self._task.render()).copy()
+        finally:
+            self._configure_camera()
+        return frame
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         try:
+            if self.visual_key_mode and self._output_dir is not None:
+                try:
+                    self._close_private_audit()
+                    from capx.integrations.opentac_shadow_audit import save_force_alignment, save_native_piano_summary
+                    summary = save_native_piano_summary(self._private_audit_dir)
+                    if summary is not None:
+                        print(f"[capx-shadow] native piano audit={summary}", flush=True)
+                    result = save_force_alignment(self._private_audit_dir)
+                    if result is not None:
+                        print(f"[capx-shadow] force alignment plot={result}", flush=True)
+                except Exception as exc:
+                    print(f"[capx-shadow] force audit plot unavailable: {exc}", flush=True)
             self._task.close()
         finally:
             ACTIVE_SHADOW_ENVS.discard(self)

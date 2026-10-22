@@ -69,6 +69,8 @@ def audit_episode(episode: Path) -> dict:
         record["pressure_trace_step_max"] = max((int(x["step"]) for x in trace), default=None)
         record["marker_reference_reset_result"] = meta.get("marker_reference_reset_result")
     h5path = _hdf5_path(episode)
+    native_path = episode / "piano_steps" / f"{seed}.jsonl"
+    record["target_key_force_trace_present"] = native_path.is_file() and native_path.stat().st_size > 1024
     if not h5path.exists():
         return record
     if h5path.stat().st_size < 1024:
@@ -94,6 +96,19 @@ def audit_episode(episode: Path) -> dict:
             actual_force_max_N=float(np.max(h5["piano/actual_force_N"])),
             contact_frames=int(np.count_nonzero(h5["piano/contact"])),
         )
+        if record["target_key_force_trace_present"]:
+            native_steps = []
+            with native_path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    if line.strip():
+                        native_steps.append(int(json.loads(line)["physics_step"]))
+            record["target_key_force_trace_count"] = len(native_steps)
+            record["target_key_force_trace_consecutive"] = bool(
+                len(native_steps) > 1 and np.all(np.diff(native_steps) == 1)
+            )
+            record["saved_steps_have_exact_target_key_labels"] = bool(
+                np.isin(steps, native_steps).all()
+            )
         if "pressure_trace_count" in record:
             meta = _json(metadata_path)[str(seed)]
             trace_steps = np.asarray([int(x["step"]) for x in meta["piano_pressure_trace"]])
@@ -118,28 +133,57 @@ def _plot_force_only(episodes: list[Path], output: Path) -> list[str]:
 
     paths: list[str] = []
     candidates = [ep for ep in episodes if _hdf5_path(ep).exists() and _hdf5_path(ep).stat().st_size > 1024]
-    for episode in (candidates[:2] + candidates[-1:]):
+    for episode in dict.fromkeys(candidates[:2] + candidates[-1:]):
         with h5py.File(_hdf5_path(episode)) as h5:
             t = np.asarray(h5["piano/time_s"])
             force = np.asarray(h5["piano/actual_force_N"])
+            steps = np.asarray(h5["piano/physics_step"])
             target = np.asarray(h5["piano/target_force_N"])
             contact = np.asarray(h5["piano/contact"])
             numeric_missing = any(name not in h5 for name in REQUIRED_TACTILE)
+            features = None
+            if not numeric_missing:
+                # This is a diagnostic plot, sampled more sparsely than training.
+                selected = np.arange(0, len(t), 4)
+                features = np.asarray([
+                    extract_public_tactile_force_features(
+                        (h5[f"tactile/{side}/depth"][i] for side in ("left_tactile", "right_tactile")),
+                        (h5[f"tactile/{side}/marker"][i] for side in ("left_tactile", "right_tactile")),
+                        far_plane_mm=34.0,
+                    )
+                    for i in selected
+                ])
+        native_path = episode / "piano_steps" / f"{episode.name}.jsonl"
+        if native_path.exists():
+            native_force = {}
+            with native_path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    if line.strip():
+                        row = json.loads(line)
+                        native_force[int(row["physics_step"])] = float(row["measured_target_force_N"])
+            if not all(int(step) in native_force for step in steps):
+                raise ValueError(f"seed {episode.name}: force plot lacks exact saved-step labels")
+            force = np.asarray([native_force[int(step)] for step in steps])
         fig, axes = plt.subplots(3, 1, figsize=(12, 5.8), sharex=True, layout="constrained")
-        axes[0].plot(t, force, linewidth=0.8, label="measured max key force (private label)")
+        axes[0].plot(t, force, linewidth=0.8, label="measured target-key force (private label)")
         axes[0].plot(t, target, linewidth=0.7, alpha=0.55, label="requested force (not a label)")
         axes[0].fill_between(t, 0, 0.15, where=contact, alpha=0.18, label="native contact")
         axes[0].set_ylabel("N")
         axes[0].legend(loc="upper right", fontsize=7)
-        for axis, hand in zip(axes[1:], ("left", "right"), strict=True):
-            axis.set_ylim(0, 1)
-            axis.set_yticks([])
+        for axis, hand, offset in zip(axes[1:], ("left", "right"), (0, 13), strict=True):
             axis.set_ylabel(hand)
             if numeric_missing:
                 axis.text(0.5, 0.5, "numeric depth / marker coordinates absent from HDF5",
                           ha="center", va="center", transform=axis.transAxes)
+                axis.set_ylim(0, 1)
+                axis.set_yticks([])
+            else:
+                axis.plot(t[selected], features[:, offset], linewidth=0.7, label="depth p98 indent (mm)")
+                axis.plot(t[selected], features[:, offset + 5], linewidth=0.7,
+                          label="marker mean displacement (px)")
+                axis.legend(loc="upper right", fontsize=7)
         axes[-1].set_xlabel("time (s)")
-        fig.suptitle(f"play_piano seed {episode.name}: force clock and unavailable 26D inputs")
+        fig.suptitle(f"play_piano seed {episode.name}: measured force and public Mini features")
         path = output / f"seed_{episode.name}_force_alignment.png"
         fig.savefig(path, dpi=140)
         plt.close(fig)
@@ -161,8 +205,25 @@ def _stage(step: int, note: int, force: float, target: float, hold_s: float,
 
 def load_samples(episode: Path, far_plane_mm: float) -> dict[str, np.ndarray | list]:
     seed = int(episode.name)
-    meta = _json(episode / "metadata.json")[str(seed)]
+    metadata_path = episode / "metadata.json"
+    meta = _json(metadata_path).get(str(seed), {}) if metadata_path.exists() else {}
     trace = {int(x["step"]): x for x in meta.get("piano_pressure_trace", [])}
+    native_path = episode / "piano_steps" / f"{seed}.jsonl"
+    native_labels = {}
+    if native_path.exists():
+        with native_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                key = int(row["target_key_index"])
+                values = np.asarray(row["key_forces_N"], dtype=float)
+                if values.shape != (88,) or not np.isfinite(values).all() or np.any(values < 0):
+                    raise ValueError(f"seed {seed}: invalid private key-force vector")
+                expected = float(values[key]) if 0 <= key < 88 else 0.0
+                if not np.isclose(expected, float(row["measured_target_force_N"]), atol=1e-7):
+                    raise ValueError(f"seed {seed}: target key-force label differs from 88-key vector")
+                native_labels[int(row["physics_step"])] = (int(row["target_midi"]), expected)
     press_end: dict[int, int] = {}
     for row in trace.values():
         i = int(row["note"])
@@ -172,7 +233,6 @@ def load_samples(episode: Path, far_plane_mm: float) -> dict[str, np.ndarray | l
         for row in meta.get("piano_contact_events", [])
         if int(row.get("next_note", -1)) > int(row.get("previous_note", -1))
     }
-    sequence = meta["episode_context"]["piano_sequence"]
     with h5py.File(_hdf5_path(episode)) as h5:
         missing = [name for name in REQUIRED_TACTILE if name not in h5]
         if missing:
@@ -184,15 +244,20 @@ def load_samples(episode: Path, far_plane_mm: float) -> dict[str, np.ndarray | l
         target_force = np.asarray(h5["piano/target_force_N"], dtype=float)
         note_index = np.asarray(h5["piano/target_index"], dtype=int)
         dt = float(json.loads(h5.attrs["episode_context_json"])["timing_contract"]["physics_dt_s"])
-        xs, ys, keys, holds, stages, times, kept_steps = [], [], [], [], [], [], []
+        sequence = json.loads(h5.attrs["episode_context_json"])["piano_sequence"]
+        xs, ys, keys, holds, dynamics, stages, times, kept_steps = [], [], [], [], [], [], [], []
         for frame, step_raw in enumerate(steps):
             step = int(step_raw)
             note = int(note_index[frame])
             if note >= len(sequence["midi"]) or int(target_midi[frame]) < 0:
                 continue
             key = int(target_midi[frame])
-            row = trace.get(step)
-            if row is not None and int(row["key"]) + 21 == key:
+            if native_labels:
+                native = native_labels.get(step)
+                if native is None or native[0] != key:
+                    raise ValueError(f"seed {seed}: saved step {step} lacks matching native target-key label")
+                label = native[1]
+            elif (row := trace.get(step)) is not None and int(row["key"]) + 21 == key:
                 label = float(row["force_N"])
             elif actual[frame] <= 0.01:
                 label = 0.0  # the maximum of all 88 key forces is zero
@@ -212,16 +277,21 @@ def load_samples(episode: Path, far_plane_mm: float) -> dict[str, np.ndarray | l
             ys.append(label)
             keys.append(key)
             holds.append(hold)
+            dynamics.append(str(sequence["dynamics"][note]))
             stages.append(_stage(step, note, label, float(target_force[frame]), hold,
                                  press_end, release_end, dt))
             times.append(float(step * dt))
             kept_steps.append(step)
     if not xs:
         raise ValueError(f"seed {seed} has no aligned public features and target-key force labels")
+    stage_values = np.asarray(stages)
+    for i in range(1, len(stage_values)):
+        if keys[i] == keys[i - 1] and ys[i - 1] >= 0.1 and ys[i - 1] - ys[i] >= 0.08:
+            stage_values[i] = "release"
     return {
         "seed": seed,
         "x": np.asarray(xs), "y": np.asarray(ys), "key": np.asarray(keys),
-        "hold_s": np.asarray(holds), "stage": np.asarray(stages),
+        "hold_s": np.asarray(holds), "dynamic": np.asarray(dynamics), "stage": stage_values,
         "time_s": np.asarray(times), "step": np.asarray(kept_steps),
         "dt": dt,
     }
@@ -263,10 +333,21 @@ def _evaluate(episodes: list[dict], predictions: list[np.ndarray]) -> dict:
     p = np.concatenate(predictions)
     key = np.concatenate([ep["key"] for ep in episodes])
     hold = np.concatenate([ep["hold_s"] for ep in episodes])
+    dynamic = np.concatenate([ep["dynamic"] for ep in episodes])
     stage = np.concatenate([ep["stage"] for ep in episodes])
     groups = {
+        "contact_only": _metrics(y[y >= 0.1], p[y >= 0.1]),
+        "by_episode": {
+            str(ep["seed"]): _metrics(ep["y"], estimate)
+            for ep, estimate in zip(episodes, predictions, strict=True)
+        },
         "by_key_midi": {str(k): _metrics(y[key == k], p[key == k]) for k in sorted(set(key))},
         "by_hold_seconds": {str(k): _metrics(y[hold == k], p[hold == k]) for k in sorted(set(hold))},
+        "by_dynamic": {str(k): _metrics(y[dynamic == k], p[dynamic == k]) for k in sorted(set(dynamic))},
+        "by_key_color": {
+            "black": _metrics(y[np.isin(key % 12, (1, 3, 6, 8, 10))], p[np.isin(key % 12, (1, 3, 6, 8, 10))]),
+            "white": _metrics(y[~np.isin(key % 12, (1, 3, 6, 8, 10))], p[~np.isin(key % 12, (1, 3, 6, 8, 10))]),
+        },
         "by_stage": {str(k): _metrics(y[stage == k], p[stage == k]) for k in sorted(set(stage))},
         "near_1p5_N": _metrics(y[np.abs(y - 1.5) <= 0.45], p[np.abs(y - 1.5) <= 0.45]),
         "near_3p0_N": _metrics(y[np.abs(y - 3.0) <= 0.45], p[np.abs(y - 3.0) <= 0.45]),
@@ -277,6 +358,12 @@ def _evaluate(episodes: list[dict], predictions: list[np.ndarray]) -> dict:
         "positive_frames": int(overloaded.sum()),
         "missed_frames": int(np.count_nonzero(overloaded & (p <= 6.0))),
         "miss_rate": float(np.mean(p[overloaded] <= 6.0)) if overloaded.any() else None,
+    }
+    above_band = y > 3.45
+    groups["above_heavy_band_3p45N"] = {
+        "positive_frames": int(above_band.sum()),
+        "missed_frames": int(np.count_nonzero(above_band & (p <= 3.45))),
+        "miss_rate": float(np.mean(p[above_band] <= 3.45)) if above_band.any() else None,
     }
     groups["no_contact_false_positive"] = {
         "negative_frames": int(no_contact.sum()),
@@ -331,6 +418,8 @@ def train(episodes: list[Path], far_plane_mm: float, out_dir: Path,
         "held_out_seeds": [d["seed"] for d in test_data],
         "training_sampling": "at most 20 frames per seed per 0.25 N measured-force bin; holdout uses all eligible frames",
         "far_plane_mm": far_plane_mm,
+        "target_label_source": "exact physics-step piano_steps measured_target_force_N where available",
+        "stage_definition": "derived: release is >=0.08N one-frame drop from previous >=0.1N on same requested key; other no_contact <0.1N; hold_approx is near requested band late in press; remaining positive frames are contact",
         "models": {},
     }
     selected = [_balanced_indices(d["y"]) for d in train_data]
@@ -381,9 +470,17 @@ def train(episodes: list[Path], far_plane_mm: float, out_dir: Path,
     if emit_sidecar:
         if max_mae_N is None or max_mae_N <= 0:
             raise ValueError("--emit-sidecar requires positive --max-mae-N")
-        mae = report["models"]["full_26d"]["overall"]["mae_N"]
-        if mae > max_mae_N:
-            raise ValueError(f"holdout MAE {mae:.3f} N exceeds gate {max_mae_N:.3f} N")
+        evaluated = report["models"]["full_26d"]
+        gated = {
+            name: evaluated[name]["mae_N"]
+            for name in ("overall", "contact_only", "near_1p5_N", "near_3p0_N")
+            if evaluated[name]["count"]
+        }
+        exceeded = {name: mae for name, mae in gated.items() if mae > max_mae_N}
+        if exceeded:
+            raise ValueError(
+                f"whole-episode holdout MAE gate {max_mae_N:.3f} N exceeded: {exceeded}"
+            )
         sidecar = out_dir / "play_piano_public_key_top_force.v1.json"
         sidecar.write_text(json.dumps(frozen, indent=2) + "\n", encoding="utf-8")
         report["sidecar"] = str(sidecar)

@@ -1,0 +1,86 @@
+# Independent Shadow visual-key + simulated DIGIT-force engineering smoke.
+# Native piano dynamics, pitch, hold, release, physics and scoring stay enabled.
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    stream_user_code_output: false
+    low_level:
+      _target_: capx.envs.simulators.opentac_shadow.ShadowPianoLowLevelEnv
+      univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/a/ljz/cap/OpenTacBench}
+      piano_notes: [E4, F4, 'C#4', 'D#4', 'D#4', E4, 'C#4', F4]
+      piano_dynamics: [light, heavy, light, heavy, light, heavy, heavy, light]
+      piano_hold_seconds: 0.12
+      piano_require_dynamics: true
+      # CaP-X trial IDs start at 1; reset uses seed_base + trial ID.
+      seed_base: 3149
+      device: cuda:0
+      tactile_image_width: 320
+      digit_piano_config: /mnt/data/ljz/opentacbench/shadow_digit_force_v1/balanced_50seed_v1/config/config_digit_piano_0_2.yml
+      digit_force_sidecar: /mnt/data/ljz/opentacbench/shadow_digit_force_v1/balanced_50seed_v1/shadow_digit_key_top_force_4d.v1.json
+      private_audit_root: /mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1
+      visual_key_mode: true
+      auto_clear_keyboard_for_visual: true
+      snap_visual_key_pixels: true
+      mirror_head_view: true
+      video_frame_stride: 6
+      video_width: 512
+    privileged: false
+    apis: [ShadowPianoVisualForceApi]
+    prompt: |
+      Play exactly eight requested notes with the Franka-mounted Shadow Hand index finger, in order:
+      E4 light, F4 heavy, C#4 light, D#4 heavy, D#4 light, E4 heavy, C#4 heavy, F4 light.
+      Hold and release each note for the native task's required 0.12 seconds. Native pitch, dynamics, hold, release and termination remain strict. A wrong key can terminate immediately. Never read score, reward, success, native key force or other private task fields; never call an expert policy.
+
+      The CaP-X adapter has already moved the open hand away from the keyboard before this initial HEAD image. This is the one clear image for mapping all requested keys. The environment supplies public STATIC centers for the leftmost white A0 and rightmost white C8 in both world metres and the displayed HEAD image; the same values are available from get_keyboard_endpoints(). The image is horizontally mirrored for display: low notes are left, high notes right. It is 960x662 pixels with a 22-pixel label strip and a 960x640 camera picture. Use displayed image pixel (x,y) as u=x/960 and v=(y-22)/640. Read x_A0 and x_C8 from the returned A0/C8 display_image_center_px fields; do not re-estimate these anchors from the image. Confirm that both projected anchors agree with the visible end white keys. If they visibly disagree, stop without pressing. The 52 white-key centers have 51 equal intervals and native center spacing 0.0235 m. Compute step_px=(x_C8-x_A0)/51. For horizontal white-key indices, A0=0, C4=23, D4=24, E4=25 and F4=26; C#4 and D#4 are near half-indices 23.5 and 24.5. Use the image to confirm the calculated target cells against white-key boundaries and the repeating two/three-black-key pattern, to center each black selection on the actual black cap, and to choose a vertical pixel inside each key surface. The local image snap can correct small within-key pixel errors; it cannot correct a wrong note or octave.
+
+      Initialize piano_state = globals().setdefault('piano_state', {'completed': 0, 'keys': None, 'attempts': []}). Here completed means the number of physical note attempts that reached a fresh public in-band contact window and were released; it is NOT the hidden native score. Keep it across regenerated code blocks. Call get_keyboard_endpoints() and store its result, x_A0, x_C8, step_px and the four selected (x,y,color) pixels in piano_state['keyboard_calibration']; print PIANO_ENDPOINT_CALIBRATION. Call locate_visual_keys exactly once with normalized u,v,color for E4, F4, C#4 and D#4. The adapter uses the current HEAD pixels to snap each selected point within the same visible white key or black cap, then checks color, order and generic camera projection. Snapping cannot repair a wrong key identity or octave. If snapping rejects the selection, stop without pressing. After a successful call get_hand_state()['visual_key_map_ready'] becomes 1; save the returned map in piano_state['keys'] and use it for the entire sequence. Do not manually set this flag. Do not request another image or remap during ordinary note execution.
+
+      Generate ONE executable Python program that reads the public endpoints, verifies the image, maps the keys, then immediately executes the complete remaining eight-note chain in a finite loop. Keep piano_state['completed'] across code blocks if recovery is needed. Use only get_keyboard_endpoints, locate_visual_keys, get_hand_state, move_shadow_index, wait_steps, get_index_tactile_rgb and estimate_key_force. move_shadow_index(x,y,z,flexion,steps) sends a native four-dimensional target; 1 action step is eight 240 Hz ticks (about 0.033 s). Native target bounds are x [-0.01,0.09] m, y [-0.32,0.26] m, z [-0.006,0.05] m and index flexion [0,0.50] rad. A target of exactly 0.50 rad is valid. Check native_done after every action and never act again once true.
+
+      The returned visual key map gives PUBLIC wrist_x_offset_m and wrist_y_m targets for each selected note. get_hand_state() gives the ACTUAL measured wrist_x_offset_m and wrist_y_m, not just the last command; wrist_and_index_velocity[0] is actual Y speed in m/s. Before lowering or curling the index for EVERY note, move with the index straight to that note's mapped X/Y at hover_lift_z_m. Then repeatedly advance a few bounded action steps, read get_hand_state(), and compare actual X/Y with the mapped target. Require Euclidean X/Y error <= 0.002 m and absolute Y speed <= 0.015 m/s on three successive checks after advancing steps. Allow at most 180 action steps for this arrival; if it does not settle, print PIANO_STOP with target X/Y, actual X/Y and reason, without descending or pressing. Check native_done each time. Print PIANO_ARRIVAL only after these measured conditions hold. A fixed number of wait_steps(), a sent motion target, or visual_key_map_ready=1 is NOT proof of physical arrival. The adapter also rejects lowering or flexion when measured X/Y is more than 0.002 m from the commanded target or Y speed exceeds 0.015 m/s. Keep using the map inferred from the HEAD image; do not substitute private per-note layout coordinates.
+
+      Use the native expert's shared motion pattern as a numerical PRIOR, not its private policy or hidden key coordinates. Only after measured X/Y arrival, smoothly descend from hover with the index extended; the expert's descent takes about 0.50 s. Use fresh public DIGIT force-estimate quality and value to judge contact and guide bounded Z adjustments during the press. A nominal Z, fixed elapsed time, or expert trim does not prove contact. Its press command follows theta(t)=0.50*(3u*u-2u*u*u) rad with u=clamp(t/0.45 s,0,1): at 0.15/0.30/0.45 s the targets are about 0.13/0.37/0.50 rad. At 30 action steps/s this is about 14 bounded commands, NOT 0.004 rad per action step. It holds the press stage for at least 1.0 s from press start, then extends the index over about 0.30 s and lifts to hover over about 0.50 s. The requested musical hold is 0.12 s; the longer expert press stage is a control reference. Never exceed native action bounds.
+
+      The expert's median wrist-height trim at a scored press, relative to the mapped nominal press_lift_z_m, is about -0.00069 m white/light, -0.00286 m white/heavy, -0.00090 m black/light, -0.00209 m black/heavy across 50 successful episodes. These are four reusable bounded probe references, not per-note positions, contact proof or force labels. The visual map chooses each key and its wrist x/y; use the current HEAD image to select that key, public hand state to confirm arrival, and later WRIST visual feedback to adjust finger-to-key distance and bounded flexion/height if a probe fails. Do not hard-code a world y for any note or call the native demonstration policy. Preserve room for visual corrections instead of blindly replaying an expert trajectory.
+
+      Check a fresh estimate_key_force(note) during the press and hold. The public estimate returns estimated_key_force_N, sample_step, age_steps, quality and calibration_version; use only quality='ok' with age_steps=0 for force control. 'no_contact' is allowed during approach; OOD, invalid or stale estimates mean release and stop. White light/heavy targets are 0.35/0.50 N with 0.07 N tolerance; black light/heavy targets are 0.70/1.00 N with 0.14 N tolerance. Leave a conservative margin below the upper tolerance and release on an overforce estimate. The calibration is not guaranteed under a new contact pose: if an expert-like bounded probe does not reach the estimated force band, do not keep pushing or guess Newtons. DIGIT appearance responds to simulated key contact force; it is not an independent physical force sensor.
+
+      Start the musical hold counter ONLY when a fresh public force estimate is strictly above the corresponding OFFLINE median of measured key-top forces in the scored 0.12 s hold windows of 50 successful expert episodes: white/light 0.311 N, white/heavy 0.473 N, black/light 0.615 N, black/heavy 1.040 N. These four aggregate reference values are public calibration guidance; never read a runtime true force label. Before the estimate exceeds that median, the hold counter remains zero. Once started, require at least five consecutive fresh action-step samples spanning at least 0.12 s, each above the median and below the native upper tolerance; reset the counter on any lower, missing, stale, no_contact or OOD sample. Do not latch hold=True after a single crossing or discard below-median samples before evaluating continuity. The median is a COUNTER GATE, not a force target or permission to lower Z. Once the public estimate reaches the native target band, hold the current bounded pose; never lower Z just because it remains below the median. If the counter cannot start safely within the bounded press window, release and report PIANO_STOP rather than push harder. The native scorer checks every 240 Hz physics tick, which these 30 Hz public samples cannot certify; the final native verdict remains authoritative.
+
+      Separate physical attempt progress from confidence in the musical hold. A fresh public estimate within the native target band for at least 0.12 s followed by a complete release consumes that note attempt: append its public summary to piano_state['attempts'], set piano_state['completed']=index+1, and print PIANO_NOTE with contact, hold confidence, release and latest public estimate. Do this even when the stricter expert-median counter never reaches five; the force estimator has finite error and the native task may already have counted the note. In that uncertain case, print PIANO_STOP with reason public_hold_uncertain_after_in_band_release and the NEXT index, then end this code block for a recovery generation. The recovery must start from piano_state['completed'] and must never press the consumed note again. Do not claim official success from this public evidence. If no fresh in-band contact window occurred, keep completed unchanged, safely release, print PIANO_STOP with the unfinished note and reason, and end this block; the next WRIST image may guide a bounded retry of that same note. OOD, overforce or native_done require a safe stop without another press. Keep the accepted visual key map; do not remap based on an occluded view. Submit capx_stop=True only after exactly eight physical attempts; the native task alone decides success. Normally do not call breakpoint_code_block(). If a fresh alignment view is needed before a failed attempt, print CAPX_VISUAL_CHECKPOINT finger_alignment and call breakpoint_code_block() at top level; the next image is for correcting finger position relative to the accepted key map.
+    multi_turn_prompt: |
+      Previous code:
+      {executed_code}
+      Stdout:
+      {console_stdout}
+      Stderr:
+      {console_stderr}
+      Recover from piano_state['completed'], which counts physical in-band press-and-release attempts, not hidden native scores. If the previous block reported public_hold_uncertain_after_in_band_release, that note was consumed: begin at the NEXT sequence index and do not retry it. The public force estimate can be slightly below the expert median while still accurately identifying the native force band; lack of five above-median samples does not prove that the native scorer rejected the note. Only retry the same note if the previous block had no fresh in-band contact window. When VISUAL_KEY_MAP_READY=1, retain piano_state['keys'] and piano_state['keyboard_calibration']. The newly attached WRIST image shows the current finger-to-key geometry, not a fresh keyboard map. Compare it with the saved mapped X/Y target and actual X/Y from get_hand_state(); wait for three successive position/speed checks before lowering or flexing. Use fresh DIGIT force-estimate quality and value for bounded Z/contact control. Start a note's hold counter only above its offline expert measured-force median (white/light 0.311 N, white/heavy 0.473 N, black/light 0.615 N, black/heavy 1.040 N); require five consecutive fresh samples spanning at least 0.12 s, and reset on a lower or invalid sample. The median is only a counter gate: once inside the native force band, do not lower Z merely to cross it. Revise wrist alignment and the expert-like 0-to-0.50 rad flexion curve and timing for the same unfinished note. Preserve visual judgment and do not infer a force in N from the image. Do not recount keyboard endpoints or call locate_visual_keys again. If VISUAL_KEY_MAP_READY=0, read the public A0/C8 endpoints, verify them against the current clear HEAD image, and generate the complete remaining action chain. Avoid routine breakpoints. Native_done, OOD or an unavailable force estimate requires stopping safely without another press. Submit END only after eight physical attempts.
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: /mnt/data/ljz/opentacbench/capx-runs/shadow_piano_visual_force_smoke
+trial_timeout_seconds: 3600
+code_block_wall_timeout_seconds: 3300
+max_trial_retries: 0
+max_regenerations: 1
+stop_multiturn_when_regeneration_exhausted: true
+multi_turn_on_failure_only: true
+multiturn_requires_checkpoint_or_failure: true
+shadow_piano_recover_on_stop: true
+shadow_piano_wrist_on_failure: true
+split_code_blocks_on_breakpoint: true
+visual_checkpoint_markers: [finger_alignment]
+use_visual_feedback: true
+use_wrist_camera: false
+visual_feedback_raw_camera_views: true
+visual_feedback_context: shadow_piano
+visual_feedback_max_image_side_px: 960
+visual_feedback_jpeg_quality: 92
+visual_feedback_allow_unlisted_model: true
+visual_feedback_require_image_input: true
+save_multiturn_prompts: true
+tactile_memory:
+  trial: {enabled: false, include_in_multiturn: false}
+  persistent: {enabled: false}

@@ -65,3 +65,64 @@ class ShadowPianoControlApi(ApiBase):
         RGB is tactile appearance only; it is not a calibrated force reading.
         """
         return self._env.get_index_tactile_rgb()
+
+
+class ShadowPianoVisualForceApi(ApiBase):
+    """Piano controls using visual key picks and public DIGIT appearance only."""
+
+    def functions(self):
+        return {"get_keyboard_endpoints": self.get_keyboard_endpoints,
+                "locate_visual_keys": self.locate_visual_keys,
+                "get_hand_state": self.get_hand_state,
+                "move_shadow_index": self.move_shadow_index,
+                "wait_steps": self.wait_steps,
+                "get_index_tactile_rgb": self.get_index_tactile_rgb,
+                "estimate_key_force": self.estimate_key_force}
+
+    def get_keyboard_endpoints(self) -> dict:
+        """Return public fixed A0/C8 white-key centers in world metres and HEAD pixels.
+
+        display_image_center_px uses the currently mirrored 960x662 labeled
+        HEAD image. The value is static scene geometry, not a force, score,
+        requested-note target or proof that a pictured key is unobstructed.
+        """
+        return self._env.get_keyboard_endpoints()
+
+    def locate_visual_keys(self, pixels: dict[str, dict]) -> dict[str, dict]:
+        """Project all requested keys from normalized pixels in the HEAD tile.
+
+        Example: {'C4': {'u': .4, 'v': .6, 'color': 'white'}}.
+        The mapping must cover the complete set of distinct requested keys.
+        Returns bounded wrist targets from camera/robot calibration, with no
+        lookup of the task's requested-key layout. After successful private
+        save, get_hand_state()['visual_key_map_ready'] becomes 1 for this episode.
+        """
+        return self._env.locate_visual_keys(pixels)
+
+    def get_hand_state(self) -> dict:
+        """Return measured wrist X/Y/Z, finger and arm state, and map-ready flag.
+
+        wrist_x_offset_m and wrist_y_m are measured positions, not the last
+        commanded target. wrist_and_index_velocity[0] is wrist Y speed in m/s.
+        Compare measured X/Y with locate_visual_keys() targets before pressing.
+        """
+        return self._env.get_observation()["hand_state"]
+
+    def move_shadow_index(self, wrist_x_offset_m: float, wrist_y_m: float,
+                          lift_z_m: float, index_flexion_rad: float,
+                          steps: int = 1) -> dict:
+        """Send one bounded native four-dimensional action for 1..240 steps."""
+        action = np.asarray([wrist_x_offset_m, wrist_y_m, lift_z_m, index_flexion_rad], dtype=np.float32)
+        return self._env.command(action, steps)
+
+    def wait_steps(self, steps: int) -> dict:
+        """Hold the last native action target for a bounded number of steps."""
+        return self._env.wait_steps(steps)
+
+    def get_index_tactile_rgb(self) -> np.ndarray:
+        """Return one public DIGIT RGB image, without native force labels."""
+        return self._env.get_index_tactile_rgb()
+
+    def estimate_key_force(self, note: str | int) -> dict:
+        """Estimate key-top contact force from public simulated DIGIT depth."""
+        return self._env.estimate_key_force(note)

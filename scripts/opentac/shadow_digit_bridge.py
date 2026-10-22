@@ -13,6 +13,19 @@ from pathlib import Path
 import numpy as np
 
 
+def renderer_environment(source: dict[str, str]) -> dict[str, str]:
+    environment = dict(source)
+    for name in ("PYTHONPATH", "PYTHONHOME"):
+        environment.pop(name, None)
+    environment.update(PYTHONNOUSERSITE="1", PYOPENGL_PLATFORM="egl")
+    # CUDA_VISIBLE_DEVICES remaps CUDA ordinals; EGL indices remain physical.
+    device = environment.get("EGL_DEVICE_ID") or environment.get("CAPX_GPU")
+    if device is None or not device.isdecimal():
+        raise RuntimeError("DIGIT EGL renderer needs a numeric EGL_DEVICE_ID or CAPX_GPU")
+    environment["EGL_DEVICE_ID"] = device
+    return environment
+
+
 def make_digit_bridge_class(native_cls, *, opentac_root: Path,
                             piano_config: Path, episode_dir: Path):
     root = Path(opentac_root) / ".cache/piano_tactile/digit"
@@ -29,11 +42,11 @@ def make_digit_bridge_class(native_cls, *, opentac_root: Path,
             self.peak_indentation = 0.
             self.depth_m = None
             self.reference_depth_m = None
-            environment = dict(os.environ)
-            for name in ("PYTHONPATH", "PYTHONHOME"):
-                environment.pop(name, None)
-            environment.update(PYTHONNOUSERSITE="1", PYOPENGL_PLATFORM="egl")
-            self._log = (episode_dir / "renderer.log").open("w")
+            environment = renderer_environment(os.environ)
+            egl_device = environment["EGL_DEVICE_ID"]
+            log_path = episode_dir / "renderer.log"
+            print(f"[capx-shadow] DIGIT EGL_DEVICE_ID={egl_device}", flush=True)
+            self._log = log_path.open("w")
             self._process = subprocess.Popen(
                 [str(python), str(script), str(root), str(piano_config),
                  str(task.cfg.tactile_image_width)],
@@ -46,8 +59,15 @@ def make_digit_bridge_class(native_cls, *, opentac_root: Path,
                 self._mount()
                 self._send(dict(command="setup", keys={str(key.midi): key.size for key in task.layout}))
                 self._receive()
-            except BaseException:
+            except BaseException as exc:
+                print(
+                    f"[capx-shadow] DIGIT renderer failed on EGL device {egl_device}; "
+                    f"exit_code={self._process.poll()} log={log_path}: {exc}",
+                    flush=True,
+                )
                 self.close()
+                if isinstance(exc, Exception):
+                    raise RuntimeError(f"DIGIT renderer initialization failed; see {log_path}") from exc
                 raise
 
         def observation(self):

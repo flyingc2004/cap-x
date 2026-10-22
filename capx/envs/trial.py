@@ -119,6 +119,13 @@ def _visual_checkpoint_marker(
     return None
 
 
+def _shadow_piano_probe_stopped(info_step: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Recognize a generated piano probe that stopped safely before END."""
+    return bool(config.get("shadow_piano_recover_on_stop", False)) and bool(
+        re.search(r"(?:^|[\r\n])\s*PIANO_STOP(?:\s|$)", str(info_step.get("stdout", "") or ""))
+    )
+
+
 def _resize_visual_image(image: Image.Image, max_side: int) -> Image.Image:
     image = image.convert("RGB")
     limit = max(32, int(max_side))
@@ -145,6 +152,8 @@ def _encode_visual_image(
 def _capture_raw_visual_snapshot(
     env: CodeExecutionEnvBase,
     config: dict[str, Any],
+    *,
+    include_wrist: bool | None = None,
 ) -> dict[str, Image.Image]:
     """Capture raw public cameras without the task-native diagnostic renderer."""
     head_renderer = getattr(env, "render_head", None)
@@ -154,7 +163,8 @@ def _capture_raw_visual_snapshot(
     if head is None:
         raise RuntimeError("CAPX_VISUAL_INPUT_ERROR: head camera frame is unavailable")
     snapshot = {"head": Image.fromarray(np.asarray(head)).convert("RGB")}
-    if bool(config.get("use_wrist_camera", False)):
+    want_wrist = bool(config.get("use_wrist_camera", False)) if include_wrist is None else include_wrist
+    if want_wrist:
         wrist_renderer = getattr(env, "render_wrist", None)
         wrist = wrist_renderer() if callable(wrist_renderer) else None
         if wrist is None:
@@ -211,6 +221,28 @@ def _compose_visual_transition(
     return canvas
 
 
+def _compose_checkpoint_image(
+    previous: dict[str, Image.Image],
+    current: dict[str, Image.Image],
+    context: str | None,
+) -> Image.Image:
+    """Use one current camera row for piano key coordinates."""
+    if context == "shadow_piano":
+        return _compose_visual_snapshot(current)
+    return _compose_visual_transition(previous, current)
+
+
+def _shadow_single_image_decision_obs(obs: dict[str, Any]) -> dict[str, Any]:
+    """Remove older image inputs before appending one current checkpoint image."""
+    decision_obs = dict(obs)
+    decision_obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
+    for message in decision_obs["full_prompt"]:
+        if isinstance(message.get("content"), list):
+            message["content"] = [part for part in message["content"]
+                                  if not isinstance(part, dict) or part.get("type") != "image_url"]
+    return decision_obs
+
+
 def _save_visual_checkpoint_artifacts(
     code_path: str | None,
     checkpoints: list[dict[str, Any]],
@@ -233,7 +265,7 @@ def _save_visual_checkpoint_artifacts(
             }
             | {"file": filename}
         )
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 # ---------------------------------------------------------------------------
 # Shared formatting helpers
@@ -615,6 +647,8 @@ def _should_query_multiturn_after_block(
     # ordinary successful intermediate blocks continue without another query.
     if _visual_checkpoint_marker(info_step, config) is not None:
         return True
+    if _shadow_piano_probe_stopped(info_step, config):
+        return True
     if not config.get("multi_turn_on_failure_only", False):
         return True
 
@@ -659,6 +693,15 @@ def _should_query_multiturn_after_block(
         # block that simply did not finish must not create an unbounded extra
         # planning turn.
         return False
+
+    if (
+        config.get("visual_feedback_context") == "shadow_piano"
+        and code_block_idx >= total_code_blocks
+        and not bool(info_step.get("task_completed", False))
+    ):
+        # Preserve the older Shadow continuation behavior only for configs
+        # that allow implicit model turns after a clean unfinished block.
+        return True
 
     # If the generated program ran out of blocks without task completion, give
     # the agent one chance to decide whether to repair, continue, or finish.
@@ -1028,11 +1071,30 @@ def _capture_initial_visual_feedback(
         visual_feedback_base64_history.append(image_base64)
         raw_visual_snapshots.append(snapshot)
         task_description = copy.deepcopy(obs["full_prompt"][-1]["content"][0]["text"])
-        obs["full_prompt"][-1]["content"][0]["text"] += (
-            "\n\nIncluded below are raw public head and wrist RGB views. "
-            "They may be used only to assess grasp/strap state and visual anomalies; "
-            "they are not a source of Newton-valued tension or stage completion."
-        )
+        if config.get("visual_feedback_context") == "shadow_piano":
+            endpoint_reader = getattr(
+                getattr(env, "low_level_env", None), "get_keyboard_endpoints", None
+            )
+            if not callable(endpoint_reader):
+                raise RuntimeError("CAPX_VISUAL_INPUT_ERROR: public keyboard endpoints are unavailable")
+            endpoints = endpoint_reader()
+            obs["full_prompt"][-1]["content"][0]["text"] += (
+                "\n\nOne current HEAD RGB image shows the fixed overhead keyboard view. "
+                "The camera picture is 960x640 pixels below a 22-pixel label strip. "
+                "For a pixel (x, y) in this 960x662 image, pass u=x/960 and "
+                "v=(y-22)/640 to locate_visual_keys. "
+                "The environment supplies the two static white-key endpoints "
+                "in world metres and in this displayed HEAD image: "
+                f"{json.dumps(endpoints, ensure_ascii=False)}. "
+                "Check their correspondence to the picture before mapping notes. "
+                "Do not infer a Newton-valued force from scene RGB."
+            )
+        else:
+            obs["full_prompt"][-1]["content"][0]["text"] += (
+                "\n\nIncluded below are raw public head and wrist RGB views. "
+                "They may be used only to assess grasp/strap state and visual anomalies; "
+                "they are not a source of Newton-valued tension or stage completion."
+            )
         obs["full_prompt"][-1]["content"].append(
             {"type": "image_url", "image_url": {"url": image_base64}}
         )
@@ -1448,6 +1510,18 @@ def _handle_multi_turn_step(
             "For REGENERATE, output only a short recovery/continuation block; do "
             "not replay the whole task or repeat completed object stages."
         )
+    if (
+        config.get("visual_feedback_context") == "shadow_piano"
+        and not remaining_code.strip()
+        and not static_code_rejected
+    ):
+        complete_multi_turn_prompt += (
+            "\n\nThere are no prepared code blocks left. If you choose REGENERATE, "
+            "generate executable code for the complete unfinished piano action "
+            "sequence from the current state. Printing only a map or hand state "
+            "does not attempt a note. Preserve completed notes and submit END "
+            "only after all requested attempts."
+        )
     if remaining_code.strip() and not static_code_rejected:
         complete_multi_turn_prompt = (
             f"{complete_multi_turn_prompt}\n\n"
@@ -1482,6 +1556,22 @@ def _handle_multi_turn_step(
     # deliberately observes only at explicit program checkpoints or failures,
     # never after every local control delta.
     visual_feedback_base64 = None
+    shadow_piano = config.get("visual_feedback_context") == "shadow_piano"
+    low_level = getattr(env, "low_level_env", None)
+    key_map_ready = bool(getattr(low_level, "visual_key_map_ready", False)) if shadow_piano else False
+    probe_stopped = shadow_piano and _shadow_piano_probe_stopped(info_step, config)
+    try:
+        sandbox_failed = int(info_step.get("sandbox_rc", 0) or 0) != 0
+    except (TypeError, ValueError):
+        sandbox_failed = True
+    execution_failed = sandbox_failed or "CAPX_FAILURE" in str(info_step.get("stderr", "") or "")
+    mapped_alignment_checkpoint = bool(
+        shadow_piano and key_map_ready
+        and (checkpoint_marker == "finger_alignment" or probe_stopped or execution_failed)
+    )
+    wrist_recovery = bool(
+        mapped_alignment_checkpoint and config.get("shadow_piano_wrist_on_failure", False)
+    )
     direct_raw_visual = _visual_feedback_enabled(config, args) and bool(
         config.get("visual_feedback_raw_camera_views", False)
     )
@@ -1490,9 +1580,14 @@ def _handle_multi_turn_step(
         or (config["use_img_differencing"] and visual_differencing_args.model in VLM_MODELS)
     )
     if direct_raw_visual:
-        snapshot = _capture_raw_visual_snapshot(env, config)
+        snapshot = _capture_raw_visual_snapshot(env, config, include_wrist=wrist_recovery or use_wrist)
         previous = raw_visual_snapshots[-1] if raw_visual_snapshots else snapshot
-        prompt_image = _compose_visual_transition(previous, snapshot)
+        prompt_image = (
+            _labeled_visual_tile(snapshot["wrist"], "Current Wrist RGB")
+            if wrist_recovery else _compose_checkpoint_image(
+                previous, snapshot, config.get("visual_feedback_context")
+            )
+        )
         visual_feedback_base64, saved_image = _encode_visual_image(
             prompt_image,
             max_side=int(config.get("visual_feedback_max_image_side_px", 512)),
@@ -1512,16 +1607,55 @@ def _handle_multi_turn_step(
                     "image_width": saved_image.width,
                     "image_height": saved_image.height,
                     "image_bytes": len(visual_feedback_base64),
+                    "camera": "wrist" if wrist_recovery else "head",
                 }
             )
         checkpoint_label = checkpoint_marker or "failure recovery"
-        complete_multi_turn_prompt += (
-            f"\n\nRaw public head/wrist RGB checkpoint: {checkpoint_label}. "
-            "The attached image shows previous (top) and current (bottom) views. "
-            "Use vision only to inspect grasp retention, strap slackness, displacement, "
-            "or anomalies. estimated_tension_N and continuous numerical hold logic are "
-            "authoritative: an image must never complete, reset, or override a force stage."
-        )
+        if shadow_piano:
+            complete_multi_turn_prompt += (
+                f"\n\nShadow piano visual checkpoint: {checkpoint_label}. "
+                f"VISUAL_KEY_MAP_READY={int(key_map_ready)}. "
+                "This flag means the visual selection passed the adapter's "
+                "geometric checks; it does not prove the native pitch is correct. "
+            )
+            if mapped_alignment_checkpoint:
+                complete_multi_turn_prompt += (
+                    f"The attached current {'WRIST' if wrist_recovery else 'HEAD'} image is for locating the finger "
+                    "relative to the already mapped target key. Keep the accepted "
+                    "piano_state key map; wrist or finger occlusion does not clear it. "
+                    "Use this image and public hand state to correct finger-to-key "
+                    "distance and the next bounded wrist/flexion trajectory. "
+                    "Do not recount keyboard endpoints or remap the keys. "
+                    "Never replay completed notes."
+                )
+            else:
+                complete_multi_turn_prompt += (
+                    "The single attached image shows only the current HEAD camera. "
+                    "It is 960x662 pixels, with a 22-pixel label strip above the "
+                    "960x640 camera picture. For a pixel (x, y) in this image, "
+                    "use u=x/960 and v=(y-22)/640. "
+                )
+            if not key_map_ready:
+                complete_multi_turn_prompt += (
+                    "No visual key map has been accepted in this episode. "
+                    "Do not press or claim key positions until locate_visual_keys "
+                    "returns successfully from a clear view."
+                )
+            elif not mapped_alignment_checkpoint:
+                complete_multi_turn_prompt += (
+                    "Use the attached HEAD image only to assess hand/fingertip "
+                    "alignment with the accepted key map and recover unfinished "
+                    "actions. Do not recount endpoints or call locate_visual_keys "
+                    "again. Never replay completed notes."
+                )
+        else:
+            complete_multi_turn_prompt += (
+                f"\n\nRaw public head/wrist RGB checkpoint: {checkpoint_label}. "
+                "The attached image shows previous (top) and current (bottom) views. "
+                "Use vision only to inspect grasp retention, strap slackness, displacement, "
+                "or anomalies. estimated_tension_N and continuous numerical hold logic are "
+                "authoritative: an image must never complete, reset, or override a force stage."
+            )
     elif needs_visual and hasattr(env, "render"):
         vf_base64, vf_img = _get_visual_feedback(env)
         visual_feedback_imgs.append(vf_img)
@@ -1560,16 +1694,22 @@ def _handle_multi_turn_step(
     elif needs_visual and hasattr(env, "render"):
         visual_feedback_base64 = visual_feedback_base64_history[-1] if visual_feedback_base64_history else None
 
+    # Remove older Shadow images from prompt history. An unmapped checkpoint
+    # receives the current HEAD image; later images assist finger alignment.
+    decision_obs = obs
+    if shadow_piano:
+        decision_obs = _shadow_single_image_decision_obs(obs)
+
     # Build decision prompt
     if args.use_legacy_multi_turn_decision_prompt:
         print("Using legacy multi-turn decision prompt")
         decision_prompt = _build_multi_turn_decision_prompt_legacy(
-            obs, complete_multi_turn_prompt, visual_feedback_base64, differencing_feedback,
+            decision_obs, complete_multi_turn_prompt, visual_feedback_base64, differencing_feedback,
             is_video_feedback=is_video_feedback,
         )
     else:
         decision_prompt = _build_multi_turn_decision_prompt(
-            obs, complete_multi_turn_prompt, visual_feedback_base64, differencing_feedback,
+            decision_obs, complete_multi_turn_prompt, visual_feedback_base64, differencing_feedback,
             is_video_feedback=is_video_feedback,
         )
 
@@ -1747,7 +1887,7 @@ def _run_single_trial(
     # --- 3. Initial code generation ---
     if config["use_oracle_code"]:
         raw_code = env.oracle_code
-        with open(os.path.join(config["output_dir"], "oracle_code.py"), "w") as f:
+        with open(os.path.join(config["output_dir"], "oracle_code.py"), "w", encoding="utf-8") as f:
             f.write(raw_code)
         reasoning = None
         ensemble_data = None

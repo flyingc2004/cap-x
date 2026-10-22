@@ -207,6 +207,7 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "visual_feedback_raw_camera_views": bool(
             configs_dict.get("visual_feedback_raw_camera_views", False)
         ),
+        "visual_feedback_context": str(configs_dict.get("visual_feedback_context", "tension_strap")),
         "visual_feedback_max_image_side_px": int(
             configs_dict.get("visual_feedback_max_image_side_px", 512)
         ),
@@ -236,6 +237,12 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         ),
         "multiturn_requires_checkpoint_or_failure": bool(
             configs_dict.get("multiturn_requires_checkpoint_or_failure", False)
+        ),
+        "shadow_piano_recover_on_stop": bool(
+            configs_dict.get("shadow_piano_recover_on_stop", False)
+        ),
+        "shadow_piano_wrist_on_failure": bool(
+            configs_dict.get("shadow_piano_wrist_on_failure", False)
         ),
         "stop_multiturn_when_regeneration_exhausted": bool(
             configs_dict.get("stop_multiturn_when_regeneration_exhausted", False)
@@ -719,20 +726,20 @@ def _save_trial_artifacts(
     trial_dir.mkdir(parents=True, exist_ok=True)
 
     code_path_obj = trial_dir / "code.py"
-    code_path_obj.write_text(final_code)
+    code_path_obj.write_text(final_code, encoding="utf-8")
     code_path = str(code_path_obj)
 
     if raw_code:
-        (trial_dir / "raw_response.sh").write_text(raw_code)
+        (trial_dir / "raw_response.sh").write_text(raw_code, encoding="utf-8")
 
-    (trial_dir / "all_responses.json").write_text(json.dumps(all_responses, indent=2))
+    (trial_dir / "all_responses.json").write_text(json.dumps(all_responses, indent=2), encoding="utf-8")
     if llm_usage_events is not None:
         from capx.llm.client import summarize_llm_usage
 
         (trial_dir / "llm_usage.json").write_text(
-            json.dumps(summarize_llm_usage(llm_usage_events), indent=2)
+            json.dumps(summarize_llm_usage(llm_usage_events), indent=2), encoding="utf-8"
         )
-    (trial_dir / "summary.txt").write_text("\n".join(log_lines))
+    (trial_dir / "summary.txt").write_text("\n".join(log_lines), encoding="utf-8")
     if all_responses:
         try:
             initial_prompt_content = all_responses[0].get("initial_prompt")
@@ -745,9 +752,9 @@ def _save_trial_artifacts(
     # Save initial ensemble data if provided
     if ensemble_data:
         if ensemble_data.get("ensemble_candidates_txt"):
-            (trial_dir / "ensemble_candidates.txt").write_text(ensemble_data["ensemble_candidates_txt"])
+            (trial_dir / "ensemble_candidates.txt").write_text(ensemble_data["ensemble_candidates_txt"], encoding="utf-8")
         if ensemble_data.get("ensemble_synthesis_txt"):
-            (trial_dir / "ensemble_synthesis.txt").write_text(ensemble_data["ensemble_synthesis_txt"])
+            (trial_dir / "ensemble_synthesis.txt").write_text(ensemble_data["ensemble_synthesis_txt"], encoding="utf-8")
 
     # Save multi-turn ensemble data (one file per regeneration)
     if multiturn_ensemble_data:
@@ -755,20 +762,20 @@ def _save_trial_artifacts(
             regen_num = entry.get("regeneration", 0)
             if entry.get("ensemble_candidates_txt"):
                 (trial_dir / f"ensemble_candidates_regen_{regen_num:02d}.txt").write_text(
-                    entry["ensemble_candidates_txt"]
+                    entry["ensemble_candidates_txt"], encoding="utf-8"
                 )
             if entry.get("ensemble_synthesis_txt"):
                 (trial_dir / f"ensemble_synthesis_regen_{regen_num:02d}.txt").write_text(
-                    entry["ensemble_synthesis_txt"]
+                    entry["ensemble_synthesis_txt"], encoding="utf-8"
                 )
 
     i = 0
     (trial_dir / "prompts_and_responses").mkdir(parents=True, exist_ok=True)
     for response in all_responses:
         if "task_seg_description" in response:
-            (trial_dir / "prompts_and_responses" / "task_seg_description.txt").write_text(response["task_seg_description"])
+            (trial_dir / "prompts_and_responses" / "task_seg_description.txt").write_text(response["task_seg_description"], encoding="utf-8")
         if "task_seg_prompt" in response:
-            (trial_dir / "prompts_and_responses" / "task_seg_prompt.txt").write_text(str(response["task_seg_prompt"]))
+            (trial_dir / "prompts_and_responses" / "task_seg_prompt.txt").write_text(str(response["task_seg_prompt"]), encoding="utf-8")
         if "initial_prompt" in response:
             try:
                 initial_prompt_content = response["initial_prompt"][-1]["content"][0]["text"]
@@ -818,14 +825,14 @@ def _save_in_progress_trial_artifacts(
         f"[capx-trial] in-progress save code.py bytes={len(final_code.encode('utf-8'))}",
         flush=True,
     )
-    code_path.write_text(final_code)
+    code_path.write_text(final_code, encoding="utf-8")
     print("[capx-trial] in-progress save code.py done", flush=True)
     if raw_code:
         print(
             f"[capx-trial] in-progress save raw_response bytes={len(raw_code.encode('utf-8'))}",
             flush=True,
         )
-        (trial_dir / "raw_response.sh").write_text(raw_code)
+        (trial_dir / "raw_response.sh").write_text(raw_code, encoding="utf-8")
         print("[capx-trial] in-progress save raw_response done", flush=True)
     print("[capx-trial] in-progress save all_responses serialize", flush=True)
     serialized_responses = json.dumps(all_responses, indent=2)
@@ -833,13 +840,13 @@ def _save_in_progress_trial_artifacts(
         f"[capx-trial] in-progress save all_responses bytes={len(serialized_responses.encode('utf-8'))}",
         flush=True,
     )
-    (trial_dir / "all_responses.json").write_text(serialized_responses)
+    (trial_dir / "all_responses.json").write_text(serialized_responses, encoding="utf-8")
     print("[capx-trial] in-progress save all_responses done", flush=True)
     if llm_usage_events is not None:
         from capx.llm.client import summarize_llm_usage
 
         (trial_dir / "llm_usage.json").write_text(
-            json.dumps(summarize_llm_usage(llm_usage_events), indent=2)
+            json.dumps(summarize_llm_usage(llm_usage_events), indent=2), encoding="utf-8"
         )
 
     if all_responses:
@@ -957,7 +964,7 @@ def _print_and_save_summary(
 
     # Write summaries to a txt file
     if config["output_dir"]:
-        with open(Path(config["output_dir"]) / "summaries.txt", "w") as f:
+        with open(Path(config["output_dir"]) / "summaries.txt", "w", encoding="utf-8") as f:
             f.write(f"Model: {args.model}\n")
             f.write(f"Visual Differencing Model: {args.visual_differencing_model}\n") if config[
                 "use_img_differencing"
