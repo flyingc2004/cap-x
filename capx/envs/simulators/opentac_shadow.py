@@ -31,6 +31,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         piano_dynamics: list[str],
         piano_hold_seconds: float | list[float] = 0.12,
         piano_require_dynamics: bool = True,
+        piano_continue_on_note_failure: bool = False,
         seed_base: int = 0,
         device: str = "cuda:0",
         tactile_image_width: int = 320,
@@ -52,6 +53,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self.piano_dynamics = list(piano_dynamics)
         self.piano_hold_seconds = piano_hold_seconds
         self.piano_require_dynamics = bool(piano_require_dynamics)
+        self.piano_continue_on_note_failure = bool(piano_continue_on_note_failure)
         self.seed_base = int(seed_base)
         self.device = device
         self.tactile_image_width = int(tactile_image_width)
@@ -87,7 +89,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self._policy_end_submitted = False
         self._policy_end_verdict = False
         self._sim_step_count = 0
-        self._last_native_notes_completed = 0
+        self._public_attempts_finalized = 0
+        self._last_native_notes_attempted = 0
         self._last_private_piano_record = 0
         self._last_private_score_event = 0
         self._record_frames = False
@@ -111,6 +114,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             piano_dynamics=self.piano_dynamics,
             piano_hold_seconds=self.piano_hold_seconds,
             piano_require_dynamics=self.piano_require_dynamics,
+            piano_continue_on_note_failure=self.piano_continue_on_note_failure,
             piano_seed=self.seed_base,
             record_video=True,
         )
@@ -232,7 +236,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self._policy_end_submitted = False
         self._policy_end_verdict = False
         self._sim_step_count = 0
-        self._last_native_notes_completed = 0
+        self._public_attempts_finalized = 0
+        self._last_native_notes_attempted = 0
         self._last_private_piano_record = 0
         self._last_private_score_event = 0
         self._action = np.zeros(4, dtype=np.float32)
@@ -315,11 +320,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         if self.visual_key_mode:
             self._write_private_force_audit("action")
             self._write_private_piano_timeline()
-        completed = int(self._native_info.get("notes_completed", 0))
-        if completed > self._last_native_notes_completed:
-            for index in range(self._last_native_notes_completed + 1, completed + 1):
-                self._save_tactile_snapshot(f"shadow_digit_note_{index:02d}.png")
-            self._last_native_notes_completed = completed
+        self._save_attempt_snapshots()
         if self._native_done:
             self._save_tactile_snapshot("shadow_digit_terminal.png")
         if self._record_frames and self._sim_step_count % self.video_frame_stride == 0:
@@ -341,6 +342,34 @@ class ShadowPianoLowLevelEnv(BaseEnv):
 
     def wait_steps(self, steps: int) -> dict[str, Any]:
         return self.command(self._action, steps)
+
+    def _save_attempt_snapshots(self) -> None:
+        attempted = int(self._native_info.get("notes_attempted",
+                                              self._native_info.get("notes_completed", 0)))
+        for index in range(self._last_native_notes_attempted + 1, attempted + 1):
+            self._save_tactile_snapshot(f"shadow_digit_note_{index:02d}.png")
+        self._last_native_notes_attempted = attempted
+
+    def finish_piano_note_attempt(self, index: int) -> dict[str, Any]:
+        """Advance a released attempt without exposing native scoring to code."""
+        if not self.piano_continue_on_note_failure or not self.visual_key_mode:
+            raise RuntimeError("Per-note continuation is disabled")
+        if self._policy_end_submitted:
+            raise RuntimeError("END has already been submitted")
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(self.piano_notes):
+            raise ValueError("Invalid piano attempt index")
+        if index != self._public_attempts_finalized:
+            raise ValueError("Piano attempts must be finalized once in sequence")
+        self._native_info = self._task.finish_piano_note_attempt(index)
+        self._public_attempts_finalized += 1
+        self._observation = self._task._observation()
+        self._native_done = bool(self._task._done)
+        self._write_native_event("attempt_end")
+        self._write_private_piano_timeline()
+        self._save_attempt_snapshots()
+        if self._native_done:
+            self._save_tactile_snapshot("shadow_digit_terminal.png")
+        return {"ok": True, "native_done": self._native_done}
 
     def get_observation(self) -> dict[str, Any]:
         if self._observation is None:
@@ -605,6 +634,15 @@ class ShadowPianoLowLevelEnv(BaseEnv):
                     summary = save_native_piano_summary(self._private_audit_dir)
                     if summary is not None:
                         print(f"[capx-shadow] native piano audit={summary}", flush=True)
+                        report = json.loads(summary.read_text(encoding="utf-8"))
+                        print(
+                            "[capx-shadow] piano score "
+                            f"correct={report['native_notes_completed']}/{len(report['notes'])} "
+                            f"attempted={report['native_notes_attempted']} "
+                            f"failed={report['native_notes_failed']} "
+                            f"END={report['end_submitted']}",
+                            flush=True,
+                        )
                     result = save_force_alignment(self._private_audit_dir)
                     if result is not None:
                         print(f"[capx-shadow] force alignment plot={result}", flush=True)

@@ -172,6 +172,7 @@ def test_smoke_uses_current_head_until_map_is_latched_and_strict_score():
     cfg = yaml.safe_load(path.read_text())
     low = cfg["env"]["cfg"]["low_level"]
     assert low["piano_require_dynamics"] is True
+    assert low["piano_continue_on_note_failure"] is True
     assert low["mirror_head_view"] is True
     assert low["auto_clear_keyboard_for_visual"] is True
     assert low["snap_visual_key_pixels"] is True
@@ -183,10 +184,13 @@ def test_smoke_uses_current_head_until_map_is_latched_and_strict_score():
     assert cfg["shadow_piano_recover_on_stop"]
     assert cfg["shadow_piano_wrist_on_failure"]
     assert "Generate ONE executable Python program" in cfg["env"]["cfg"]["prompt"]
+    assert "finish_piano_note_attempt(index)" in cfg["env"]["cfg"]["prompt"]
+    assert "after eight finalized attempts" in cfg["env"]["cfg"]["multi_turn_prompt"]
     assert "get_keyboard_endpoints()" in cfg["env"]["cfg"]["prompt"]
     assert cfg["max_regenerations"] == 1
     assert cfg["trials"] == cfg["num_workers"] == 1
     assert cfg["env"]["cfg"]["apis"] == ["ShadowPianoVisualForceApi"]
+    assert "finish_piano_note_attempt" in ShadowPianoVisualForceApi(None).functions()
 
     from capx.envs.launch import LaunchArgs
     from capx.utils.launch_utils import _load_config
@@ -471,3 +475,58 @@ def test_native_audit_requires_press_release_pitch_and_dynamic(tmp_path):
     assert result["physics_trace_missing_steps"] == 0
     assert result["notes"][0]["native_scored_note"]
     assert result["notes"][0]["observed_dynamic_matches"]
+
+
+def test_partial_score_audit_keeps_later_notes_aligned(tmp_path):
+    info = {"success": False, "failure": "partial_score", "notes_completed": 1,
+            "notes_attempted": 2, "notes_failed": 1, "require_dynamics": True,
+            "piano_sequence": {"midi": [60, 62], "dynamics": ["light", "heavy"]}}
+    (tmp_path / "shadow_native_events.jsonl").write_text(
+        json.dumps({"kind": "END", "native_info": info}) + "\n")
+    (tmp_path / "shadow_piano_physics_trace.jsonl").write_text(json.dumps({
+        "physics_step": 20, "target_midi": 62, "actual_midi": 62,
+        "target_dynamic": 2, "actual_dynamic": 2, "actual_force_N": .5,
+    }) + "\n")
+    events = [
+        {"kind": "miss", "attempt_index": 0, "step": 10, "midi": 60,
+         "reason": "wrong_key"},
+        {"kind": "press", "attempt_index": 1, "step": 20, "midi": 62,
+         "force_N": .5},
+        {"kind": "release", "attempt_index": 1, "step": 45, "midi": 62,
+         "repetition": 2},
+    ]
+    (tmp_path / "shadow_piano_score_events.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in events))
+    result = json.loads(save_native_piano_summary(tmp_path).read_text())
+    assert result["native_notes_completed"] == 1
+    assert result["native_notes_attempted"] == 2
+    assert result["native_notes_failed"] == 1
+    assert result["notes"][0]["native_failed_reason"] == "wrong_key"
+    assert not result["notes"][0]["native_scored_note"]
+    assert result["notes"][1]["native_scored_note"]
+
+
+def test_finish_note_attempt_exposes_only_terminal_flag(monkeypatch):
+    from types import SimpleNamespace
+
+    env = ShadowPianoLowLevelEnv.__new__(ShadowPianoLowLevelEnv)
+    env.piano_continue_on_note_failure = True
+    env.visual_key_mode = True
+    env._policy_end_submitted = False
+    env._public_attempts_finalized = 0
+    env.piano_notes = ["C4", "D4"]
+    env._task = SimpleNamespace(
+        finish_piano_note_attempt=lambda index: {"success": False,
+            "notes_completed": 0, "notes_attempted": index + 1,
+            "actual_force_N": 1.2},
+        _observation=lambda: {"state": "private"}, _done=False,
+    )
+    for name in ("_write_native_event", "_write_private_piano_timeline",
+                 "_save_attempt_snapshots", "_save_tactile_snapshot"):
+        monkeypatch.setattr(env, name, lambda *args: None)
+    public = ShadowPianoVisualForceApi(env).finish_piano_note_attempt(0)
+    assert public == {"ok": True, "native_done": False}
+    assert env._native_info["actual_force_N"] == 1.2
+    assert "actual_force_N" not in repr(public)
+    with pytest.raises(ValueError, match="once in sequence"):
+        ShadowPianoVisualForceApi(env).finish_piano_note_attempt(0)

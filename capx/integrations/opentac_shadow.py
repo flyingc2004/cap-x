@@ -77,7 +77,8 @@ class ShadowPianoVisualForceApi(ApiBase):
                 "move_shadow_index": self.move_shadow_index,
                 "wait_steps": self.wait_steps,
                 "get_index_tactile_rgb": self.get_index_tactile_rgb,
-                "estimate_key_force": self.estimate_key_force}
+                "estimate_key_force": self.estimate_key_force,
+                "finish_piano_note_attempt": self.finish_piano_note_attempt}
 
     def get_keyboard_endpoints(self) -> dict:
         """Return public fixed A0/C8 white-key centers in world metres and HEAD pixels.
@@ -126,3 +127,11 @@ class ShadowPianoVisualForceApi(ApiBase):
     def estimate_key_force(self, note: str | int) -> dict:
         """Estimate key-top contact force from public simulated DIGIT depth."""
         return self._env.estimate_key_force(note)
+
+    def finish_piano_note_attempt(self, index: int) -> dict:
+        """After safely releasing note index (zero based), consume that attempt.
+
+        Returns only whether the native episode has ended. Native per-note
+        success, failure and measured force remain private.
+        """
+        return self._env.finish_piano_note_attempt(index)

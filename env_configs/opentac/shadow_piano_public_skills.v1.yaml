@@ -14,10 +14,10 @@ skills:
     practice: Use the requested note's published force target, not the offline hold median, for bounded Z feedback. Log sample step, estimate and commanded Z. Maintain the press window long enough for the native hold. DIGIT is sampled once per eight physics ticks; unseen ticks can differ.
   - id: unavailable_force
     trigger: A public force estimate is stale, OOD, nonfinite or unavailable, or a fresh estimate crosses the published upper tolerance.
-    practice: Safely release and report the public quality and sample step. Never turn OOD into a plausible force value, silently continue pressing, or use a private label to decide the action.
+    practice: Abort this note's press, safely release, and report public quality and sample step. In partial-score mode finalize this attempt before continuing to the next note. Never turn OOD into a plausible force value, silently continue pressing, or use a private label to decide the action.
   - id: note_progress
-    trigger: A note has a fresh in-band public contact window followed by release, but the stricter confidence counter is uncertain.
-    practice: Record the physical attempt in persistent piano_state and continue from the next requested note on regeneration. Do not replay a consumed note or claim that public confidence proves the native score. Submit END only after the requested number of attempts.
+    trigger: A note was attempted and the index has been safely released, regardless of public hold confidence.
+    practice: Call finish_piano_note_attempt with its zero-based index once, then record that attempt in persistent piano_state and continue with the next note. The call returns no per-note verdict. Do not replay a finalized note or claim public confidence proves the native score. Submit END after all requested attempts.
   - id: executable_chain
     trigger: Generating or regenerating a piano program.
     practice: Produce executable Python that attempts the remaining sequence, not prose or a mapping-only script. Check native_done after each action and stop issuing actions when it becomes true.

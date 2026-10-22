@@ -12,6 +12,8 @@
 
 以下 19 条是截至 2026-10-22 在 `/mnt/data/ljz/opentacbench/capx-runs/shadow_*/run.log` 中找到的运行。除特别注明，审计中的任务参数为 seed 3150、8 音 `E4 F4 C#4 D#4 D#4 E4 C#4 F4`，力度 `light heavy light heavy light heavy heavy light`，每音持音 0.12 s，严格力度判分开启；动作步为 8 个 240 Hz 物理步。日志中的 GPU 为 6、模型为 `gpt-6-sol`；首条 clear-view v2 使用 GPU 2。历史配置内容随时间变化，不能当成同一次固定参数实验。
 
+这 19 条运行均早于 `piano_continue_on_note_failure` 试验开关。新模式保留单音音高、力度、持音与释放判据；失败尝试消耗一个序列位置，最后私有审计分别报告尝试数与成功音数。因此后续运行的“完成音数”须读取 `native_notes_completed`，不能用尝试数代替，也不能把旧严格模式的提前终止率与新模式直接比较。
+
 | 运行 UTC（`run.log`） | 退出码；原生完成音数 / 8；END | 失败位置、可核对参数与原因 |
 | --- | --- | --- |
 | [10-20 09:49](/mnt/data/ljz/opentacbench/capx-runs/shadow_visual_force_seed3150_smoke_rep1_20261020T094936Z/run.log) | 0；0；否 | 日志在 `in-progress save code.py` 附近中断；无试验完成记录。原因未确定，退出码 0 不代表任务成功。 |

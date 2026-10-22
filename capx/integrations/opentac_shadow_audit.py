@@ -27,10 +27,17 @@ def save_native_piano_summary(output_dir: str | Path) -> Path | None:
     by_step = {int(row["physics_step"]): row for row in trace}
     presses = [row for row in events if row.get("kind") == "press"]
     releases = [row for row in events if row.get("kind") == "release"]
+    misses = [row for row in events if row.get("kind") == "miss"]
+    press_by_attempt = {int(row.get("attempt_index", index)): row
+                        for index, row in enumerate(presses)}
+    release_by_attempt = {int(row.get("attempt_index", index)): row
+                          for index, row in enumerate(releases)}
+    miss_by_attempt = {int(row["attempt_index"]): row for row in misses}
     notes = []
     for index, (midi, dynamic) in enumerate(zip(requested_midi, requested_dynamics)):
-        press = presses[index] if index < len(presses) else None
-        release = releases[index] if index < len(releases) else None
+        press = press_by_attempt.get(index)
+        release = release_by_attempt.get(index)
+        miss = miss_by_attempt.get(index)
         press_trace = by_step.get(int(press["step"])) if press is not None else None
         native_press_matches = bool(press is not None and int(press["midi"]) == int(midi))
         native_release_matches = bool(release is not None and int(release["midi"]) == int(midi)
@@ -44,6 +51,7 @@ def save_native_piano_summary(output_dir: str | Path) -> Path | None:
                       "native_press_midi_matches": native_press_matches,
                       "native_release_midi_matches": native_release_matches,
                       "native_scored_note": native_press_matches and native_release_matches,
+                      "native_failed_reason": miss.get("reason") if miss else None,
                       "observed_dynamic_at_press": dynamic_at_press,
                       "observed_dynamic_matches": dynamic_at_press == dynamic if press_trace is not None else None,
                       "measured_key_top_force_at_press_N": float(press["force_N"]) if press is not None else None,
@@ -53,6 +61,8 @@ def save_native_piano_summary(output_dir: str | Path) -> Path | None:
     report = {"native_success": bool(info.get("success", False)),
               "native_failure": info.get("failure", ""),
               "native_notes_completed": int(info.get("notes_completed", 0)),
+              "native_notes_attempted": int(info.get("notes_attempted", info.get("notes_completed", 0))),
+              "native_notes_failed": int(info.get("notes_failed", 0)),
               "end_submitted": any(row.get("kind") == "END" for row in native),
               "require_dynamics": bool(info.get("require_dynamics", False)),
               "physics_trace_rows": len(trace), "physics_trace_missing_steps": gaps,
