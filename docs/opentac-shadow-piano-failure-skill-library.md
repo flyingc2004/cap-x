@@ -10,7 +10,7 @@
 
 每条记录应包含：`run.log` 路径、运行时间、t-cap 与 cap-x commit、配置与其运行时快照、模型、GPU、seed、音序与力度、DIGIT 配置校验值和估计器版本；失败音符的视觉映射 X/Y、实际到位状态、探针 Z、弯曲目标、动作频率、力反馈增益及限幅、公开估计力与质量、退出码、是否提交 END；另列私有审计路径和原生计分。没有证据的字段写“未记录”，原因用“已证实”或“待验证”标识。**不能用当前 YAML 推断旧运行的实际提示词**；旧运行以各自 `initial_prompt.txt` 和生成的 `code.py` 为准。
 
-以下 18 条是截至 2026-10-22 在 `/mnt/data/ljz/opentacbench/capx-runs/shadow_*/run.log` 中找到的运行。除特别注明，审计中的任务参数为 seed 3150、8 音 `E4 F4 C#4 D#4 D#4 E4 C#4 F4`，力度 `light heavy light heavy light heavy heavy light`，每音持音 0.12 s，严格力度判分开启；动作步为 8 个 240 Hz 物理步。日志中的 GPU 为 6、模型为 `gpt-6-sol`；首条 clear-view v2 使用 GPU 2。历史配置内容随时间变化，不能当成同一次固定参数实验。
+以下 19 条是截至 2026-10-22 在 `/mnt/data/ljz/opentacbench/capx-runs/shadow_*/run.log` 中找到的运行。除特别注明，审计中的任务参数为 seed 3150、8 音 `E4 F4 C#4 D#4 D#4 E4 C#4 F4`，力度 `light heavy light heavy light heavy heavy light`，每音持音 0.12 s，严格力度判分开启；动作步为 8 个 240 Hz 物理步。日志中的 GPU 为 6、模型为 `gpt-6-sol`；首条 clear-view v2 使用 GPU 2。历史配置内容随时间变化，不能当成同一次固定参数实验。
 
 | 运行 UTC（`run.log`） | 退出码；原生完成音数 / 8；END | 失败位置、可核对参数与原因 |
 | --- | --- | --- |
@@ -32,6 +32,14 @@
 | [10-22 03:22](/mnt/data/ljz/opentacbench/capx-runs/shadow_clear_view_seed3150_v3_smoke_rep1_20261022T032237Z/run.log) | 1；未记录；未记录 | Kit/Isaac 后端抛出 `Failed to get DOF velocities from backend`；缺完整原生审计，**已证实后端调用错误**，不可推断按键策略。 |
 | [10-22 14:44](/mnt/data/ljz/opentacbench/capx-runs/shadow_clear_view_seed3150_v3_smoke_rep1_20261022T144424Z/run.log) | 1；1；否 | E4 light 原生计分；F4 heavy 键角已到位，真实力却在动作采样间跌到 `0.41856 N`，合格最长 3 个物理步，未计 F4；生成代码随后弹 C#4，触发 `wrong_key`。详见[逐物理步审计](/mnt/a/ljz/cap/audits/shadow_piano_hold_20261023/README.md)。 |
 | [10-22 18:52](/mnt/data/ljz/opentacbench/capx-runs/shadow_clear_view_seed3150_v3_smoke_rep1_20261022T185237Z/run.log) | 1；7；否 | 第 7 音 C#4 heavy 出现 sample 766 的 `quality=ood`；安全停止后仍完成该音释放，第 8 音 F4 light 未尝试。具体参数和证据见下。 |
+| [10-22 19:30](/mnt/data/ljz/opentacbench/capx-runs/shadow_clear_view_seed3150_v3_smoke_rep1_20261022T193056Z/run.log) | 1；4；否 | 第 4 音 D#4 heavy 在 sample 488 出现 `quality=ood`，释放后被原生计分，但公开进度停在 3。恢复决策选 `finish`，后四音未尝试。具体参数和证据见下。 |
+
+## 案例：2026-10-22 19:30，第四音 OOD 后停止
+
+- **运行参数**：GPU 6、`gpt-6-sol`、seed 3150、单 trial、无重试；配置 `env_configs/opentac/play_piano_shadow_digit_visual_force_smoke.yaml`。CaP-X `a79d88f` 和 t-cap `f8393a7` 均在此次启动前提交；`run.log` 汇总另显示 `Git Commit: 3266266 (Dirty: True)`，以运行中的[初始提示词](/mnt/data/ljz/opentacbench/capx-runs/shadow_clear_view_seed3150_v3_smoke_rep1_20261022T193056Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/initial_prompt.txt)和库 SHA256 `5b9b38de75fc64bf898a41eb96ec44d658d461e648cd09fc9f0eddf8bd447187` 为准。TACTO 配置 SHA256 `2c4e762965a06d1b38fbd6a54d638087ba2fa057dace69bdb77c741cb82f4208`、范围 `[0,2] N`；估计器 `shadow_digit_key_top_force_4d.v1`。
+- **生成控制参数与公开证据**：第 4 音 D#4 heavy，映射 X `0.07000 m`、Y `-0.056619 m`，探针 Z `0.013410 m`，目标 `1.00 ± 0.14 N`，中位数计数门槛 `1.040 N`；食指从 sample 479 起为 `0.50 rad`。生成代码沿用 `0.012 m/(N·s)` 增益、`±0.003 m/s` 速率限幅，动作步为 8 个物理步。[生成代码](/mnt/data/ljz/opentacbench/capx-runs/shadow_clear_view_seed3150_v3_smoke_rep1_20261022T193056Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/code.py)仅用 `flex>=0.49` 和两个接触样本置 `stable_contact=True`，**没有检验估计力趋势**，虽然运行时 skill library 已要求等待稳定。sample 478–487 公开估计从 `0.613` 升至 `0.950 N`，控制仍将 Z 从 `0.013410` 下调到 `0.012836 m`，约 `0.574 mm`。sample 488 返回 `ood` 和空估计；代码释放并打印 `PIANO_STOP unavailable_or_stale_force`，公开 `piano_state['completed']` 留在 3。
+- **私有审计，仅供离线核对**：sample 488 对应物理步 3904，目标琴键实测力瞬时 `1.5561 N`，高于本音上限 `1.14 N`、低于 TACTO 渲染量程 `2 N`；下一物理步回到 `0.9232 N`。[逐步估计与真值](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_clear_view_seed3150_v3_smoke_rep1_20261022T193056Z_5704e82f2b23417fb40f0e82f878eb85/shadow_force_estimates_private_audit.jsonl)和[原生摘要](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_clear_view_seed3150_v3_smoke_rep1_20261022T193056Z_5704e82f2b23417fb40f0e82f878eb85/shadow_piano_native_audit_summary.json)显示第四音于物理步 3885 按下、3949 释放并计分，最终 `native_notes_completed=4`、`native_failure=""`、`end_submitted=false`。OOD 由 4D 深度特征超出训练范围触发；此次没有保存该步各特征值，不能判定具体哪一维越界，也不能证明 Z 微调是瞬时峰值的唯一成因。
+- **退出原因与下一轮检验**：日志明确记录第二次 LLM 查询的决策为 `finish`，因此没有恢复代码；安全停止是合理的，但剩余四音未试，退出码 1。[视频](/mnt/data/ljz/opentacbench/capx-runs/shadow_clear_view_seed3150_v3_smoke_rep1_20261022T193056Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/videos/video_combined.mp4)。后续应验证生成代码是否**实际执行**稳定趋势门槛；不能只看提示词里有没有这句，也不能在 OOD 后以私有计分指导重试。
 
 ## 案例：2026-10-22 18:52，七音计分后停止
 

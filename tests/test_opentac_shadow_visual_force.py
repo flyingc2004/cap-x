@@ -194,9 +194,10 @@ def test_smoke_uses_current_head_until_map_is_latched_and_strict_score():
     loaded_prompt = factory["cfg"]["prompt"]
     assert loaded_prompt.count("Public Shadow piano skill library.") == 1
     assert "delayed_force_response" in loaded_prompt
-    assert "0.52 mm" in loaded_prompt
+    assert "Near-full flexion and two contact samples alone do not establish stable contact" in loaded_prompt
     assert "native_failure" not in loaded_prompt
     assert "1.3704" not in loaded_prompt
+    assert "1.5561" not in loaded_prompt
 
     from capx.utils.launch_utils import _build_multi_turn_decision_prompt
     inherited = _build_multi_turn_decision_prompt(

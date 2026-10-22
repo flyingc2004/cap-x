@@ -8,7 +8,7 @@ skills:
     practice: At hover with the index extended, compare measured X/Y and Y speed against that target on repeated checks before descending. A sent action or visual_key_map_ready flag does not prove the hand arrived.
   - id: delayed_force_response
     trigger: The index is still curling, or successive fresh DIGIT force estimates are rising toward the note target.
-    practice: Keep the bounded probe height while the motion settles. Start a small Z correction only after near-full flexion and a stable contact trend; do not repeatedly lower Z during a rising-force transient. In one prior run the public estimate rose from 0.719 to 0.924 N as Z was lowered by 0.52 mm, followed by OOD. This is a warning about delayed response, not proof of causation or a reusable Z target. Continue observing after each action.
+    practice: Keep the bounded probe height while motion settles. Near-full flexion and two contact samples alone do not establish stable contact; explicitly compare successive fresh force estimates at fixed Z before the first trim. While they rise, hold Z instead of repeatedly lowering it. Prior runs saw rising public estimates during 0.52–0.57 mm downward trims followed by OOD; this is correlation, not proof of causation or a reusable Z target. Continue observing after each action.
   - id: bounded_force_feedback
     trigger: Fresh public DIGIT estimates have quality ok during stable contact.
     practice: Use the requested note's published force target, not the offline hold median, for bounded Z feedback. Log sample step, estimate and commanded Z. Maintain the press window long enough for the native hold. DIGIT is sampled once per eight physics ticks; unseen ticks can differ.
