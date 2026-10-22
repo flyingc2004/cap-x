@@ -1,0 +1,23 @@
+schema: shadow_piano_public_skills.v1
+skills:
+  - id: visual_key_map
+    trigger: The HEAD image is available before the first press.
+    practice: Use the public keyboard endpoints and visible key pattern to map all requested notes once. Save the accepted map across code blocks. A later WRIST image helps check finger alignment; it does not replace an accepted keyboard map.
+  - id: measured_arrival
+    trigger: A note has a mapped wrist target.
+    practice: At hover with the index extended, compare measured X/Y and Y speed against that target on repeated checks before descending. A sent action or visual_key_map_ready flag does not prove the hand arrived.
+  - id: delayed_force_response
+    trigger: The index is still curling, or successive fresh DIGIT force estimates are rising toward the note target.
+    practice: Keep the bounded probe height while the motion settles. Start a small Z correction only after near-full flexion and a stable contact trend; do not repeatedly lower Z during a rising-force transient. In one prior run the public estimate rose from 0.719 to 0.924 N as Z was lowered by 0.52 mm, followed by OOD. This is a warning about delayed response, not proof of causation or a reusable Z target. Continue observing after each action.
+  - id: bounded_force_feedback
+    trigger: Fresh public DIGIT estimates have quality ok during stable contact.
+    practice: Use the requested note's published force target, not the offline hold median, for bounded Z feedback. Log sample step, estimate and commanded Z. Maintain the press window long enough for the native hold. DIGIT is sampled once per eight physics ticks; unseen ticks can differ.
+  - id: unavailable_force
+    trigger: A public force estimate is stale, OOD, nonfinite or unavailable, or a fresh estimate crosses the published upper tolerance.
+    practice: Safely release and report the public quality and sample step. Never turn OOD into a plausible force value, silently continue pressing, or use a private label to decide the action.
+  - id: note_progress
+    trigger: A note has a fresh in-band public contact window followed by release, but the stricter confidence counter is uncertain.
+    practice: Record the physical attempt in persistent piano_state and continue from the next requested note on regeneration. Do not replay a consumed note or claim that public confidence proves the native score. Submit END only after the requested number of attempts.
+  - id: executable_chain
+    trigger: Generating or regenerating a piano program.
+    practice: Produce executable Python that attempts the remaining sequence, not prose or a mapping-only script. Check native_done after each action and stop issuing actions when it becomes true.

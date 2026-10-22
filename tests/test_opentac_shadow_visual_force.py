@@ -188,6 +188,23 @@ def test_smoke_uses_current_head_until_map_is_latched_and_strict_score():
     assert cfg["trials"] == cfg["num_workers"] == 1
     assert cfg["env"]["cfg"]["apis"] == ["ShadowPianoVisualForceApi"]
 
+    from capx.envs.launch import LaunchArgs
+    from capx.utils.launch_utils import _load_config
+    factory, _, _ = _load_config(LaunchArgs(config_path=str(path)))
+    loaded_prompt = factory["cfg"]["prompt"]
+    assert loaded_prompt.count("Public Shadow piano skill library.") == 1
+    assert "delayed_force_response" in loaded_prompt
+    assert "0.52 mm" in loaded_prompt
+    assert "native_failure" not in loaded_prompt
+    assert "1.3704" not in loaded_prompt
+
+    from capx.utils.launch_utils import _build_multi_turn_decision_prompt
+    inherited = _build_multi_turn_decision_prompt(
+        {"full_prompt": [{"role": "user", "content": [{"type": "text", "text": loaded_prompt}]}]},
+        "Recover from the current state", None,
+    )
+    assert inherited[0]["content"][0]["text"].count("Public Shadow piano skill library.") == 1
+
     from capx.envs.trial import _shadow_single_image_decision_obs, _should_query_multiturn_after_block
     from capx.utils.launch_utils import _build_multi_turn_decision_prompt
     previous = {"full_prompt": [
@@ -218,14 +235,32 @@ def test_smoke_uses_current_head_until_map_is_latched_and_strict_score():
         config={**cfg, "shadow_piano_recover_on_stop": False},
     )
 
-    from capx.envs.launch import LaunchArgs
-    from capx.utils.launch_utils import _load_config
     _, runtime_cfg, _ = _load_config(LaunchArgs(config_path=str(path)))
     assert runtime_cfg["shadow_piano_recover_on_stop"]
     assert runtime_cfg["shadow_piano_wrist_on_failure"]
     assert _should_query_multiturn_after_block(
         stopped_probe, code_block_idx=1, total_code_blocks=1, config=runtime_cfg,
     )
+
+
+def test_shadow_public_skill_loader_rejects_private_audit(tmp_path):
+    from capx.integrations.opentac_shadow_skills import inject_shadow_piano_public_skills
+
+    factory = {"cfg": {
+        "low_level": {"_target_": "capx.envs.simulators.opentac_shadow.ShadowPianoLowLevelEnv"},
+        "apis": ["ShadowPianoVisualForceApi"], "prompt": "Play the sequence.",
+    }}
+    bad = tmp_path / "private.yaml"
+    bad.write_text(yaml.safe_dump({
+        "schema": "shadow_piano_public_skills.v1",
+        "skills": [{"id": "unsafe", "trigger": "After contact.",
+                    "practice": "Read native_failure from the audit."}],
+    }))
+    with pytest.raises(ValueError, match="private audit markers"):
+        inject_shadow_piano_public_skills(
+            factory, config_path=tmp_path / "smoke.yaml", library_path=bad,
+        )
+    assert factory["cfg"]["prompt"] == "Play the sequence."
 
 
 def test_shadow_checkpoint_uses_only_current_head_camera():

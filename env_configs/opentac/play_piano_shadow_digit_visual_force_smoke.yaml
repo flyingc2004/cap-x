@@ -1,5 +1,6 @@
 # Independent Shadow visual-key + simulated DIGIT-force engineering smoke.
 # Native piano dynamics, pitch, hold, release, physics and scoring stay enabled.
+shadow_piano_public_skill_library: shadow_piano_public_skills.v1.yaml
 env:
   _target_: capx.envs.tasks.base.CodeExecutionEnvBase
   cfg:

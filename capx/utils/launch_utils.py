@@ -99,6 +99,18 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         )
     env_factory = configs_dict["env"]
 
+    # A curated public Shadow piano library is loaded afresh for each run.
+    # Its offline failure audit contains native scores and force labels and is
+    # never accepted as a runtime prompt source.
+    shadow_skill_path = configs_dict.get("shadow_piano_public_skill_library")
+    if shadow_skill_path:
+        from capx.integrations.opentac_shadow_skills import inject_shadow_piano_public_skills
+
+        resolved, digest = inject_shadow_piano_public_skills(
+            env_factory, config_path=config_path, library_path=shadow_skill_path,
+        )
+        print(f"[capx-shadow] public skill library={resolved} sha256={digest}", flush=True)
+
     api_servers = configs_dict.get("api_servers", None)
 
     # Merge server URLs and VDM model settings from YAML into args
