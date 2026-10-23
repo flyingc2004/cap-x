@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -137,6 +138,9 @@ def test_shadow_head_and_video_mirror(monkeypatch):
     env.mirror_head_view = True
     env.video_width = 16
     env._frame_buffer = []
+    env._video_physics_steps = []
+    env._sim_step_count = 0
+    env.action_repeat = 8
     monkeypatch.setattr(env, "_configure_camera", lambda: None)
     np.testing.assert_array_equal(env.render_head(), source[:, ::-1])
     env._capture_frame()
@@ -166,6 +170,71 @@ def test_force_estimate_quality_and_no_hidden_api(tmp_path):
     assert "get_key_angles" not in ShadowPianoVisualForceApi(None).functions()
 
 
+def test_ood_depth_diagnostics_preserve_unavailable_force():
+    estimator = PublicDigitKeyForce.__new__(PublicDigitKeyForce)
+    estimator.sidecar = {"sensor_sha256": "test", "models": {"white": {
+        "feature_min": [0, 0, 0, 0], "feature_max": [1, .5, 1, 1],
+    }}}
+    reference = np.ones((20, 20), np.float32)
+    depth = reference - .0002
+    plain = estimator.predict(depth, reference, color="white", sample_step=7, current_step=7)
+    diagnostic = {"stale": "discard me"}
+    audited = estimator.predict(depth, reference, color="white", sample_step=7, current_step=7,
+                                diagnostics_out=diagnostic)
+    assert audited == plain
+    assert plain["quality"] == "ood" and plain["estimated_key_force_N"] is None
+    assert "stale" not in diagnostic
+    assert diagnostic["valid_depth_fraction"] == 1
+    assert diagnostic["features"][0] == pytest.approx(.2, abs=1e-4)
+    assert diagnostic["exceeded_bounds"] == [
+        {"feature": "area_gt_0p01mm", "value": 1., "lower": 0., "upper": .5, "direction": "above"},
+    ]
+    assert "features" not in audited and "exceeded_bounds" not in audited
+    estimator.predict(np.zeros((20, 20)), reference, color="white", sample_step=8, current_step=8,
+                      diagnostics_out=diagnostic)
+    assert diagnostic["quality"] == "invalid_depth"
+    assert diagnostic["features"] is None and "exceeded_bounds" not in diagnostic
+
+
+def test_ood_frame_and_feature_audit_stay_outside_public_result(tmp_path):
+    from types import SimpleNamespace
+    env = ShadowPianoLowLevelEnv.__new__(ShadowPianoLowLevelEnv)
+    env.private_audit_root = tmp_path / "private"
+    env._output_dir = tmp_path / "public"
+    env._private_audit_dir, env._private_audit_streams = None, {}
+    env.visual_key_mode = True
+    env._sim_step_count, env._action = 7, np.array([0, -.04, -.00286, .455])
+    reference = np.ones((20, 20), np.float32)
+    depth = reference - .0002
+    forces = np.zeros(88)
+    forces[64 - 21] = .172
+    env._task = SimpleNamespace(step_count=28, tactile=SimpleNamespace(
+        depth_m=depth, reference_depth_m=reference, key_forces=lambda: forces))
+    env.get_observation = lambda: {"hand_state": {"index_flexion_rad": .455}}
+    estimator = PublicDigitKeyForce.__new__(PublicDigitKeyForce)
+    estimator.sidecar = {"schema": SCHEMA, "sensor_sha256": "test", "models": {"white": {
+        "feature_min": [0, 0, 0, 0], "feature_max": [1, .5, 1, 1],
+    }}}
+    env._force_estimator = estimator
+    result = env.estimate_key_force("E4")
+    assert env.estimate_key_force("E4") == result
+    assert set(result) == {"estimated_key_force_N", "quality", "sample_step", "age_steps", "calibration_version"}
+    assert result["quality"] == "ood" and result["estimated_key_force_N"] is None
+    private_file = env._private_audit_dir / "shadow_digit_ood_depth_7_64.npz"
+    assert stat.S_IMODE(private_file.stat().st_mode) == 0o200
+    assert not env._output_dir.exists()
+    env._close_private_audit()
+    with np.load(private_file) as snapshot:
+        np.testing.assert_array_equal(snapshot["depth_m"], depth)
+        np.testing.assert_array_equal(snapshot["reference_depth_m"], reference)
+    rows = [json.loads(line) for line in (env._private_audit_dir / "shadow_force_estimates_private_audit.jsonl").read_text().splitlines()]
+    assert len(rows) == 2
+    assert rows[0]["depth_diagnostics"]["exceeded_bounds"][0]["feature"] == "area_gt_0p01mm"
+    assert rows[0]["public_hand_state"]["index_flexion_rad"] == .455
+    assert rows[0]["private_key_top_force_N"] == .172
+    assert rows[0]["depth_sample_file"] == private_file.name
+
+
 def test_smoke_uses_current_head_until_map_is_latched_and_strict_score():
     from pathlib import Path
     path = Path(__file__).resolve().parents[1] / "env_configs/opentac/play_piano_shadow_digit_visual_force_smoke.yaml"
@@ -182,7 +251,7 @@ def test_smoke_uses_current_head_until_map_is_latched_and_strict_score():
     assert cfg["visual_feedback_context"] == "shadow_piano"
     assert cfg["visual_checkpoint_markers"] == ["finger_alignment"]
     assert cfg["shadow_piano_recover_on_stop"]
-    assert cfg["shadow_piano_wrist_on_failure"]
+    assert not cfg["shadow_piano_wrist_on_failure"]
     assert "Generate ONE executable Python program" in cfg["env"]["cfg"]["prompt"]
     assert "finish_piano_note_attempt(index)" in cfg["env"]["cfg"]["prompt"]
     assert "after eight finalized attempts" in cfg["env"]["cfg"]["multi_turn_prompt"]
@@ -210,7 +279,11 @@ def test_smoke_uses_current_head_until_map_is_latched_and_strict_score():
     )
     assert inherited[0]["content"][0]["text"].count("Public Shadow piano skill library.") == 1
 
-    from capx.envs.trial import _shadow_single_image_decision_obs, _should_query_multiturn_after_block
+
+    from capx.envs.trial import (
+        _shadow_saved_public_key_map_context, _shadow_single_image_decision_obs,
+        _shadow_text_only_after_key_map, _should_query_multiturn_after_block,
+    )
     from capx.utils.launch_utils import _build_multi_turn_decision_prompt
     previous = {"full_prompt": [
         {"role": "system", "content": "Generate code"},
@@ -220,8 +293,22 @@ def test_smoke_uses_current_head_until_map_is_latched_and_strict_score():
     cleaned = _shadow_single_image_decision_obs(previous)
     decision = _build_multi_turn_decision_prompt(cleaned, "Check alignment", "new")
     assert sum(part.get("type") == "image_url" for part in decision[-1]["content"] if isinstance(part, dict)) == 1
-    mapped_decision = _build_multi_turn_decision_prompt(cleaned, "Align finger using accepted key map", "current")
-    assert sum(part.get("type") == "image_url" for part in mapped_decision[-1]["content"] if isinstance(part, dict)) == 1
+    from types import SimpleNamespace
+    assert not _shadow_text_only_after_key_map(cfg, SimpleNamespace(visual_key_map_ready=False))
+    assert _shadow_text_only_after_key_map(cfg, SimpleNamespace(visual_key_map_ready=True))
+    saved = SimpleNamespace(_exec_globals={"piano_state": {"keys": {
+        "E4": {"color": "white", "wrist_x_offset_m": 0.0,
+               "wrist_y_m": -0.045542, "press_lift_z_m": 0.0,
+               "hover_lift_z_m": 0.04},
+    }}})
+    key_context = _shadow_saved_public_key_map_context(saved)
+    assert '"E4"' in key_context and "-0.045542" in key_context
+    mapped_decision = _build_multi_turn_decision_prompt(
+        cleaned, "VISUAL_KEY_MAP_READY=1. No image attached. " + key_context, None,
+    )
+    assert not any(part.get("type") == "image_url"
+                   for message in mapped_decision for part in message["content"]
+                   if isinstance(part, dict))
     assert previous["full_prompt"][-1]["content"][-1]["image_url"]["url"] == "old"
     terminal = {"sandbox_rc": 0, "stdout": "", "stderr": "", "task_completed": False}
     assert not _should_query_multiturn_after_block(
@@ -242,10 +329,43 @@ def test_smoke_uses_current_head_until_map_is_latched_and_strict_score():
 
     _, runtime_cfg, _ = _load_config(LaunchArgs(config_path=str(path)))
     assert runtime_cfg["shadow_piano_recover_on_stop"]
-    assert runtime_cfg["shadow_piano_wrist_on_failure"]
+    assert not runtime_cfg["shadow_piano_wrist_on_failure"]
     assert _should_query_multiturn_after_block(
         stopped_probe, code_block_idx=1, total_code_blocks=1, config=runtime_cfg,
     )
+
+
+def test_shadow_60hz_smoke_preserves_physical_timing_and_native_scoring():
+    path = Path(__file__).resolve().parents[1] / "env_configs/opentac/play_piano_shadow_digit_visual_force_60hz_smoke.yaml"
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    low = cfg["env"]["cfg"]["low_level"]
+    prompt = cfg["env"]["cfg"]["prompt"]
+    assert low["action_repeat"] == 4
+    assert low["video_frame_stride"] == 12
+    assert low["piano_hold_seconds"] == 0.12
+    assert low["piano_require_dynamics"] is True
+    assert "four 240 Hz ticks" in prompt
+    assert "current streak >= 9" in prompt
+    assert "(latest sample_step - first sample_step)*4/240 >= 0.12" in prompt
+    assert "60 press actions" in prompt and "90 press actions" in prompt
+    assert "*(4/240) metres" in prompt
+    assert "8/240" not in prompt and "30 Hz public samples" not in prompt
+    assert cfg["max_regenerations"] == 8
+    assert cfg["shadow_piano_recover_on_stop"] and not cfg["shadow_piano_wrist_on_failure"]
+    assert "all later LLM requests are text-only" in prompt
+    assert "No image is attached after the key map is accepted" in cfg["env"]["cfg"]["multi_turn_prompt"]
+    assert "PIANO_STOP OOD_REPROBE" in prompt
+    assert "do NOT call finish_piano_note_attempt" in prompt
+    assert "answer REGENERATE" in cfg["env"]["cfg"]["multi_turn_prompt"]
+    from capx.envs.trial import _should_query_multiturn_after_block
+    stopped = {"sandbox_rc": 0, "stdout": "PIANO_STOP OOD_REPROBE {'index': 1}",
+               "stderr": "", "task_completed": False}
+    assert _should_query_multiturn_after_block(
+        stopped, code_block_idx=1, total_code_blocks=1, config=cfg,
+    )
+    skills = yaml.safe_load((path.parent / cfg["shadow_piano_public_skill_library"]).read_text(encoding="utf-8"))
+    assert skills["schema"] == "shadow_piano_public_skills.v1"
+    assert "once per four physics ticks" in str(skills)
 
 
 def test_shadow_public_skill_loader_rejects_private_audit(tmp_path):
@@ -328,10 +448,15 @@ def test_initial_shadow_image_prompt_includes_public_endpoints():
     assert sum(part.get("type") == "image_url" for part in content) == 1
 
 
-def test_visual_keyboard_clear_uses_bounded_native_actions():
+@pytest.mark.parametrize("action_repeat, expected_steps", [
+    (8, [30, 40, 40]),
+    (4, [60, 80, 80]),
+])
+def test_visual_keyboard_clear_uses_bounded_native_actions(action_repeat, expected_steps):
     env = ShadowPianoLowLevelEnv.__new__(ShadowPianoLowLevelEnv)
     current_y = [-.09175]
     actions = []
+    env.action_repeat = action_repeat
     env._sim_step_count = 0
     env.get_observation = lambda: {"hand_state": {"wrist_y_m": current_y[0]}}
 
@@ -344,9 +469,9 @@ def test_visual_keyboard_clear_uses_bounded_native_actions():
     env.command = command
     env._clear_keyboard_for_visual()
     assert actions == [
-        ([0., -.09175, .05, 0.], 30),
-        ([0., .24, .05, 0.], 40),
-        ([0., .24, .05, 0.], 40),
+        ([0., -.09175, .05, 0.], expected_steps[0]),
+        ([0., .24, .05, 0.], expected_steps[1]),
+        ([0., .24, .05, 0.], expected_steps[2]),
     ]
 
 
@@ -416,6 +541,7 @@ def test_visual_key_map_flag_latches_only_after_private_save(tmp_path):
     assert not (env._output_dir / "shadow_visual_key_maps.jsonl").exists()
     env.seed_base = 3149
     env._frame_buffer = []
+    env._video_physics_steps = []
     env._task.reset = lambda seed: (env._observation, {})
     env._task.sim = SimpleNamespace(render=lambda: None)
     env._task.camera.update = lambda *args, **kwargs: None

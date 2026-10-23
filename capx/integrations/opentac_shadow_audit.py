@@ -93,7 +93,7 @@ def save_force_alignment(output_dir: str | Path) -> Path | None:
     for row in rows:
         if row["estimate"]["quality"] != "ok":
             ax.axvline(row["action_step"], color="orange", alpha=.04)
-    ax.set(xlabel="Native action step (30 Hz)", ylabel="Key-top contact force (N)",
+    ax.set(xlabel="Native action step", ylabel="Key-top contact force (N)",
            title="Shadow piano: estimate vs native force; private labels are not sent to the agent")
     ax.grid(alpha=.2)
     ax.legend()

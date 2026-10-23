@@ -1,0 +1,23 @@
+schema: shadow_piano_public_skills.v1
+skills:
+  - id: visual_key_map
+    trigger: The HEAD image is available before the first press.
+    practice: Use the public keyboard endpoints and visible key pattern to map all requested notes once. Save the accepted coordinates in persistent piano_state['keys'] across code blocks. After visual_key_map_ready becomes 1, all later LLM requests are text-only, without HEAD or WRIST images. Reuse the map and compare its targets with fresh public get_hand_state() X/Y, speed and DIGIT readings; do not remap or infer unseen pixels.
+  - id: measured_arrival
+    trigger: A note has a mapped wrist target.
+    practice: At hover with the index extended, compare measured X/Y and Y speed against that target on repeated checks before descending. A sent action or visual_key_map_ready flag does not prove the hand arrived.
+  - id: delayed_force_response
+    trigger: The index is still curling, or successive fresh DIGIT force estimates are rising toward the note target.
+    practice: Keep the bounded probe height while motion settles. Near-full flexion and two contact samples alone do not establish stable contact; explicitly compare successive fresh force estimates at fixed Z before the first trim. While they rise, hold Z instead of repeatedly lowering it. Prior runs saw rising public estimates during 0.52–0.57 mm downward trims followed by OOD; this is correlation, not proof of causation or a reusable Z target. Continue observing after each action.
+  - id: bounded_force_feedback
+    trigger: Fresh public DIGIT estimates have quality ok during stable contact.
+    practice: Use the requested note's published force target, not the offline hold median, for bounded Z feedback. Log sample step, estimate and commanded Z. Maintain the press window long enough for the native hold. DIGIT is sampled once per four physics ticks; unseen ticks can differ.
+  - id: unavailable_force
+    trigger: A public force estimate is stale, OOD, nonfinite or unavailable, or a fresh estimate crosses the published upper tolerance.
+    practice: Abort this note's press, safely release, and report public quality and sample step. On the first early OOD for this note before any valid contact estimate while the finger is still curling, leave the current note unfinalized, print PIANO_STOP OOD_REPROBE and return so CaP-X can regenerate using the saved key map and public state text; re-probe that same note once. If OOD recurs for that note or valid contact had already begun, finalize after release and continue. Never turn OOD into a plausible force value, silently continue pressing, or use a private label to decide the action.
+  - id: note_progress
+    trigger: A note was attempted and the index has been safely released, except at the first early OOD re-probe checkpoint for that note.
+    practice: Call finish_piano_note_attempt with its zero-based index once after the final probe, then record that attempt in persistent piano_state and continue with the next note. Leave the index and completed count unchanged at a first early OOD checkpoint; retry it after regeneration. The call returns no per-note verdict. Do not replay a finalized note or claim public confidence proves the native score. Submit END after all requested attempts.
+  - id: executable_chain
+    trigger: Generating or regenerating a piano program.
+    practice: Produce executable Python that attempts the remaining sequence, not prose or a mapping-only script. Check native_done after each action and stop issuing actions when it becomes true.

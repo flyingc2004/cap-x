@@ -1,8 +1,9 @@
 """GPU-free checks for the Shadow piano bridge's public/private boundary."""
 
 import json
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import gymnasium as gym
 import numpy as np
@@ -176,3 +177,70 @@ def test_shadow_video_writer_receives_decimated_frame_rate(tmp_path, monkeypatch
         1, {"sandbox_rc": 0, "task_completed": False}, 0.0, [(1, 7)],
     )
     assert calls == [("turn_00", 6, 10.0), ("combined", 7, 10.0)]
+
+
+def test_shadow_60hz_video_timestamps_and_private_contact_audio(tmp_path, monkeypatch):
+    fake = FakeShadowTask(stop_after=10)
+    fake.step_count = 0
+    native_step = fake.step
+
+    def step(action):
+        result = native_step(action)
+        fake.step_count += 4
+        return result
+
+    fake.step = step
+    fake.audio_contacts = SimpleNamespace(
+        events=[{"midi": 60, "start_step": 4, "end_step": 8, "peak_force_N": 0.5}],
+        finish=lambda step: None,
+    )
+    env = ShadowPianoLowLevelEnv(
+        univtac_root="/mnt/a/ljz/cap/OpenTacBench",
+        piano_notes=["C4"], piano_dynamics=["light"],
+        action_repeat=4, video_frame_stride=2,
+        task_factory=lambda _: fake, output_dir=str(tmp_path),
+    )
+    assert env.video_fps == 30.0
+    env.reset()
+    env.enable_video_capture()
+    env.command([0, -.09, .03, 0], steps=2)
+    assert len(env.get_video_frames(clear=True)) == 2
+    assert env._video_physics_steps == [0, 8]
+
+    calls = []
+    audio_module = ModuleType("envs._piano_audio")
+    audio_module.add_piano_audio = lambda path, events, steps, *, fps: (
+        calls.append((Path(path), events, steps, fps))
+        or {"wav_path": str(Path(path).with_suffix(".wav")), "events": events}
+    )
+    monkeypatch.setitem(sys.modules, "envs._piano_audio", audio_module)
+    assert env.add_audio_to_video(tmp_path / "video.mp4")
+    assert calls == [(tmp_path / "video.mp4", fake.audio_contacts.events, [0, 8], 30.0)]
+    assert "peak_force_N" not in repr(env.get_observation())
+    env.close()
+
+
+def test_shadow_video_writer_muxes_contact_audio_by_turn(tmp_path, monkeypatch):
+    videos = []
+    audio = []
+    monkeypatch.setattr(trial_module, "_write_video", lambda frames, path, *, suffix, fps: videos.append((suffix, len(frames), fps)))
+
+    class RecordedEnv:
+        low_level_env = SimpleNamespace(
+            video_fps=5.0,
+            add_audio_to_video=lambda path, start, end: audio.append((Path(path).name, start, end)),
+        )
+
+        def get_video_frames(self, *, clear=False):
+            return [np.zeros((16, 16, 3), dtype=np.uint8) for _ in range(5)]
+
+    trial_module._save_turn_and_combined_videos(
+        RecordedEnv(), {"record_video": True, "output_dir": str(tmp_path)},
+        1, {"sandbox_rc": 0, "task_completed": False}, 0.0, [(0, 2), (2, 5)],
+    )
+    assert [name for name, _, _ in videos] == ["turn_00", "turn_01", "combined"]
+    assert audio == [
+        ("video_turn_00.mp4", 0, 2),
+        ("video_turn_01.mp4", 2, 5),
+        ("video_combined.mp4", 0, 5),
+    ]

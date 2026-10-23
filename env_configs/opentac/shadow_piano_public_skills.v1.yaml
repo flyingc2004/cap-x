@@ -2,7 +2,7 @@ schema: shadow_piano_public_skills.v1
 skills:
   - id: visual_key_map
     trigger: The HEAD image is available before the first press.
-    practice: Use the public keyboard endpoints and visible key pattern to map all requested notes once. Save the accepted map across code blocks. A later WRIST image helps check finger alignment; it does not replace an accepted keyboard map.
+    practice: Use the public keyboard endpoints and visible key pattern to map all requested notes once. Save the accepted coordinates in persistent piano_state['keys'] across code blocks. After visual_key_map_ready becomes 1, all later LLM requests are text-only, without HEAD or WRIST images. Reuse the map and compare its targets with fresh public get_hand_state() X/Y, speed and DIGIT readings; do not remap or infer unseen pixels.
   - id: measured_arrival
     trigger: A note has a mapped wrist target.
     practice: At hover with the index extended, compare measured X/Y and Y speed against that target on repeated checks before descending. A sent action or visual_key_map_ready flag does not prove the hand arrived.

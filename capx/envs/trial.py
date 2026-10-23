@@ -233,7 +233,7 @@ def _compose_checkpoint_image(
 
 
 def _shadow_single_image_decision_obs(obs: dict[str, Any]) -> dict[str, Any]:
-    """Remove older image inputs before appending one current checkpoint image."""
+    """Remove inherited images before a Shadow piano continuation request."""
     decision_obs = dict(obs)
     decision_obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
     for message in decision_obs["full_prompt"]:
@@ -241,6 +241,40 @@ def _shadow_single_image_decision_obs(obs: dict[str, Any]) -> dict[str, Any]:
             message["content"] = [part for part in message["content"]
                                   if not isinstance(part, dict) or part.get("type") != "image_url"]
     return decision_obs
+
+
+def _shadow_text_only_after_key_map(config: dict[str, Any], low_level: Any) -> bool:
+    """An accepted key map replaces camera input for later Shadow LLM calls."""
+    return bool(
+        config.get("visual_feedback_context") == "shadow_piano"
+        and getattr(low_level, "visual_key_map_ready", False)
+    )
+
+
+def _shadow_saved_public_key_map_context(env: CodeExecutionEnvBase) -> str:
+    """Summarize only the public targets saved by generated code this trial."""
+    globals_dict = getattr(env, "_exec_globals", {})
+    state = globals_dict.get("piano_state") if isinstance(globals_dict, dict) else None
+    keys = state.get("keys") if isinstance(state, dict) else None
+    if not isinstance(keys, dict) or not keys or len(keys) > 88:
+        return "No saved public piano_state['keys'] map is available; do not guess coordinates."
+    selected = {}
+    for note, row in keys.items():
+        if not isinstance(note, str) or not re.fullmatch(r"[A-G]#?[0-8]", note):
+            return "Saved public key map is invalid; do not guess coordinates."
+        if not isinstance(row, dict):
+            return "Saved public key map is invalid; do not guess coordinates."
+        target = {}
+        for name in ("wrist_x_offset_m", "wrist_y_m", "press_lift_z_m", "hover_lift_z_m"):
+            value = row.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float, np.number)) or not np.isfinite(value):
+                return "Saved public key map is invalid; do not guess coordinates."
+            target[name] = round(float(value), 6)
+        if row.get("color") not in ("white", "black"):
+            return "Saved public key map is invalid; do not guess coordinates."
+        target["color"] = row["color"]
+        selected[note] = target
+    return "Saved public key targets from piano_state['keys']: " + json.dumps(selected, ensure_ascii=False)
 
 
 def _save_visual_checkpoint_artifacts(
@@ -773,9 +807,24 @@ def _save_trial_video(
 
     if isinstance(frames, list):
         _write_video(frames, base_dir, suffix=suffix, fps=fps)
+        _add_piano_contact_audio(env, base_dir, suffix, 0, len(frames))
     elif isinstance(frames, dict):
         for key, frame in frames.items():
             _write_video(frame, base_dir, suffix=f"{suffix}_{key}", fps=fps)
+
+
+def _add_piano_contact_audio(
+    env: CodeExecutionEnvBase, base_dir: str, suffix: str, start: int, end: int,
+) -> None:
+    """Mux native contact audio after saving a Shadow piano RGB video."""
+    add_audio = getattr(getattr(env, "low_level_env", None), "add_audio_to_video", None)
+    if not callable(add_audio):
+        return
+    video_path = Path(base_dir) / "videos" / f"video_{suffix}.mp4"
+    try:
+        add_audio(video_path, start, end)
+    except Exception as exc:
+        print(f"[capx-shadow] piano audio unavailable for {video_path}: {exc}", flush=True)
 
 
 def _save_turn_and_combined_videos(
@@ -822,9 +871,11 @@ def _save_turn_and_combined_videos(
         turn_frames = all_frames[start:end]
         if turn_frames:
             _write_video(turn_frames, base_dir, suffix=f"turn_{i:02d}", fps=fps)
+            _add_piano_contact_audio(env, base_dir, f"turn_{i:02d}", start, end)
 
     # Combined video
     _write_video(all_frames, base_dir, suffix="combined", fps=fps)
+    _add_piano_contact_audio(env, base_dir, "combined", 0, len(all_frames))
 
     # Wrist camera videos
     if config.get("use_wrist_camera") and hasattr(env, "get_wrist_video_frames"):
@@ -1559,6 +1610,19 @@ def _handle_multi_turn_step(
     shadow_piano = config.get("visual_feedback_context") == "shadow_piano"
     low_level = getattr(env, "low_level_env", None)
     key_map_ready = bool(getattr(low_level, "visual_key_map_ready", False)) if shadow_piano else False
+    text_only_after_map = _shadow_text_only_after_key_map(config, low_level)
+    if text_only_after_map:
+        complete_multi_turn_prompt += (
+            "\n\nVISUAL_KEY_MAP_READY=1. The visual key selection was accepted; "
+            "no camera image is attached to this or later continuation requests. "
+            "Reuse coordinates saved in persistent piano_state['keys'] if present; "
+            "read current public X/Y and velocity with get_hand_state(), and "
+            "use fresh DIGIT quality/force estimates for bounded control. "
+            "Do not recount endpoints, call locate_visual_keys again, or "
+            "assume an image is present."
+        )
+        complete_multi_turn_prompt += "\n" + _shadow_saved_public_key_map_context(env)
+        print("[capx-shadow] visual_key_map_ready=1 multi-turn image_input=0", flush=True)
     probe_stopped = shadow_piano and _shadow_piano_probe_stopped(info_step, config)
     try:
         sandbox_failed = int(info_step.get("sandbox_rc", 0) or 0) != 0
@@ -1572,10 +1636,10 @@ def _handle_multi_turn_step(
     wrist_recovery = bool(
         mapped_alignment_checkpoint and config.get("shadow_piano_wrist_on_failure", False)
     )
-    direct_raw_visual = _visual_feedback_enabled(config, args) and bool(
+    direct_raw_visual = not text_only_after_map and _visual_feedback_enabled(config, args) and bool(
         config.get("visual_feedback_raw_camera_views", False)
     )
-    needs_visual = (
+    needs_visual = not text_only_after_map and (
         _visual_feedback_enabled(config, args)
         or (config["use_img_differencing"] and visual_differencing_args.model in VLM_MODELS)
     )
@@ -1671,13 +1735,13 @@ def _handle_multi_turn_step(
     differencing_feedback = None
     is_video_feedback = False
 
-    if config.get("use_video_differencing") and turn_frames:
+    if not text_only_after_map and config.get("use_video_differencing") and turn_frames:
         # Video-based differencing: pass video of this turn to VDM
         differencing_feedback = _get_video_differencing_feedback(
             visual_differencing_args, task_description, turn_frames, wrist_turn_frames,
         )
         is_video_feedback = True
-    elif config["use_img_differencing"] and len(visual_feedback_base64_history) >= 2:
+    elif not text_only_after_map and config["use_img_differencing"] and len(visual_feedback_base64_history) >= 2:
         # Image-based differencing: pass before/after images to VDM
         differencing_feedback = _get_visual_differencing_feedback(
             visual_differencing_args, task_description, visual_feedback_base64_history,
@@ -1695,7 +1759,7 @@ def _handle_multi_turn_step(
         visual_feedback_base64 = visual_feedback_base64_history[-1] if visual_feedback_base64_history else None
 
     # Remove older Shadow images from prompt history. An unmapped checkpoint
-    # receives the current HEAD image; later images assist finger alignment.
+    # can receive a current HEAD image; mapped continuations remain text-only.
     decision_obs = obs
     if shadow_piano:
         decision_obs = _shadow_single_image_decision_obs(obs)

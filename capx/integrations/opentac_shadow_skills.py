@@ -52,7 +52,7 @@ def inject_shadow_piano_public_skills(
         raise ValueError("Public Shadow piano skill library needs 1 to 16 skills")
     lines = [
         "Public Shadow piano skill library. These are reusable lessons from prior PUBLIC observations,",
-        "not observations from this trial. Check the current HEAD/WRIST and DIGIT readings before acting.",
+        "not observations from this trial. Use the initial HEAD image for key mapping; after mapping, use saved coordinates and fresh public hand/DIGIT readings.",
     ]
     ids: set[str] = set()
     for skill in skills:

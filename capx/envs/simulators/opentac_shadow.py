@@ -35,6 +35,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         seed_base: int = 0,
         device: str = "cuda:0",
         tactile_image_width: int = 320,
+        action_repeat: int = 8,
         video_frame_stride: int = 3,
         video_width: int = 640,
         task_factory: Callable[["ShadowPianoLowLevelEnv"], Any] | None = None,
@@ -57,6 +58,9 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self.seed_base = int(seed_base)
         self.device = device
         self.tactile_image_width = int(tactile_image_width)
+        if isinstance(action_repeat, bool) or not isinstance(action_repeat, int) or action_repeat < 1:
+            raise ValueError("action_repeat must be a positive integer")
+        self.action_repeat = action_repeat
         self.video_frame_stride = max(1, int(video_frame_stride))
         self.video_width = int(video_width)
         self.visual_key_mode = bool(visual_key_mode)
@@ -82,7 +86,17 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             from capx.integrations.opentac_shadow_force import PublicDigitKeyForce
             self._force_estimator = PublicDigitKeyForce(self.digit_force_sidecar, self.digit_piano_config)
         self._configure_camera()
-        self.video_fps = float(getattr(self._task, "metadata", {}).get("render_fps", 30)) / self.video_frame_stride
+        native_cfg = getattr(self._task, "cfg", None)
+        physics_dt = float(getattr(native_cfg, "physics_dt", 1 / 240))
+        native_repeat = int(getattr(native_cfg, "action_repeat", self.action_repeat))
+        if self._force_estimator is not None and self._force_estimator.uses_area_rate:
+            from capx.integrations.opentac_shadow_force import AREA_RATE_HISTORY
+            if (not np.isclose(physics_dt, AREA_RATE_HISTORY["physics_dt_seconds"]) or
+                    AREA_RATE_HISTORY["window_physics_steps"] % native_repeat):
+                raise ValueError("DIGIT area-rate calibration needs 240 Hz physics and an action repeat dividing 8")
+            print(f"[capx-shadow] force calibration={self._force_estimator.sidecar['schema']} "
+                  "features=5 area_rate_window_physics_steps=8", flush=True)
+        self.video_fps = 1.0 / (physics_dt * native_repeat * self.video_frame_stride)
         self._observation: dict[str, Any] | None = None
         self._native_info: dict[str, Any] = {}
         self._native_done = False
@@ -95,6 +109,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self._last_private_score_event = 0
         self._record_frames = False
         self._frame_buffer: list[np.ndarray] = []
+        self._video_physics_steps: list[int] = []
         self._private_audit_dir: Path | None = None
         self._private_audit_streams: dict[str, Any] = {}
         self._action = np.zeros(4, dtype=np.float32)
@@ -110,6 +125,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             tactile=True,
             tactile_sensor="digit",
             tactile_image_width=self.tactile_image_width,
+            action_repeat=self.action_repeat,
             piano_notes=self.piano_notes,
             piano_dynamics=self.piano_dynamics,
             piano_hold_seconds=self.piano_hold_seconds,
@@ -231,6 +247,9 @@ class ShadowPianoLowLevelEnv(BaseEnv):
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         actual_seed = self.seed_base if seed is None else self.seed_base + int(seed)
         self._visual_key_map_ready = False
+        estimator = getattr(self, "_force_estimator", None)
+        if estimator is not None:
+            estimator.reset_history()
         self._observation, self._native_info = self._task.reset(seed=actual_seed)
         self._native_done = False
         self._policy_end_submitted = False
@@ -242,6 +261,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self._last_private_score_event = 0
         self._action = np.zeros(4, dtype=np.float32)
         self._frame_buffer.clear()
+        self._video_physics_steps.clear()
+        self._sample_public_force_depth()
         if hasattr(self._task, "camera"):
             # Match the official piano CLI's RTX camera warmup before capture.
             for _ in range(16):
@@ -264,10 +285,17 @@ class ShadowPianoLowLevelEnv(BaseEnv):
     def _clear_keyboard_for_visual(self) -> None:
         """Move the open index away from the keyboard before the sole initial image."""
         current_y = float(self.get_observation()["hand_state"]["wrist_y_m"])
-        for y, steps in ((current_y, 30), (.24, 40), (.24, 40), (.24, 40)):
-            result = self.command([0., y, .05, 0.], steps)
-            if result["native_done"]:
-                raise RuntimeError("Native Shadow episode ended while clearing the keyboard view")
+        # Preserve the old 8-tick clear-view motion duration at other action
+        # frequencies. The arm responds in physical time, not action count.
+        repeat = int(getattr(self, "action_repeat", 8))
+        for y, old_action_steps in ((current_y, 30), (.24, 40), (.24, 40), (.24, 40)):
+            remaining = (old_action_steps * 8 + repeat - 1) // repeat
+            while remaining:
+                batch = min(remaining, 240)
+                result = self.command([0., y, .05, 0.], batch)
+                if result["native_done"]:
+                    raise RuntimeError("Native Shadow episode ended while clearing the keyboard view")
+                remaining -= batch
             if y == .24 and abs(
                 float(self.get_observation()["hand_state"]["wrist_y_m"]) - .24
             ) <= .025:
@@ -316,6 +344,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self._action = value.copy()
         self._sim_step_count += 1
         self._native_done = bool(terminated or truncated)
+        self._sample_public_force_depth()
         self._write_native_event("action")
         if self.visual_key_mode:
             self._write_private_force_audit("action")
@@ -459,6 +488,13 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         print(f"[capx-shadow] visual_key_map_ready=1 action_step={self._sim_step_count}", flush=True)
         return targets
 
+    def _sample_public_force_depth(self) -> None:
+        estimator = getattr(self, "_force_estimator", None)
+        if estimator is not None and estimator.uses_area_rate:
+            tactile = self._task.tactile
+            estimator.observe_frame(tactile.depth_m, tactile.reference_depth_m,
+                                    physics_step=self._task.step_count)
+
     def estimate_key_force(self, note: str | int) -> dict[str, Any]:
         if not self.visual_key_mode or self._force_estimator is None:
             raise RuntimeError("DIGIT key-force calibration is not enabled")
@@ -469,19 +505,39 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             return {"estimated_key_force_N": None, "sample_step": None,
                     "age_steps": None, "quality": "unavailable",
                     "calibration_version": self._force_estimator.sidecar["schema"]}
+        diagnostics = {} if self._output_dir is not None else None
         estimate = self._force_estimator.predict(
             tactile.depth_m, tactile.reference_depth_m,
             color="black" if black else "white",
             sample_step=self._sim_step_count, current_step=self._sim_step_count,
+            diagnostics_out=diagnostics,
+            physics_step=int(getattr(self._task, "step_count", 0)),
         )
         if self._output_dir is not None:
             truth = float(np.asarray(tactile.key_forces())[midi - 21])
+            snapshot = (f"shadow_digit_ood_depth_{self._sim_step_count}_{midi}.npz"
+                        if estimate["quality"] == "ood" else None)
             self._append_private_audit(
                 "shadow_force_estimates_private_audit.jsonl",
                 {"note": str(note), "action_step": self._sim_step_count,
                  "physics_step": int(getattr(self._task, "step_count", 0)),
-                 "estimate": estimate, "private_key_top_force_N": truth},
+                 "estimate": estimate, "depth_diagnostics": diagnostics,
+                 "public_hand_state": self.get_observation().get("hand_state", {}),
+                 "action_target": self._action.tolist(), "depth_sample_file": snapshot,
+                 "private_key_top_force_N": truth},
             )
+            if snapshot is not None:
+                # Save only OOD frames, using the same write-only permissions as
+                # private labels. Never return this path or arrays to agent code.
+                try:
+                    fd = os.open(self._private_audit_dir / snapshot,
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o200)
+                except FileExistsError:
+                    pass  # Repeated estimate calls at one step reuse its frame.
+                else:
+                    with os.fdopen(fd, "wb") as stream:
+                        np.savez_compressed(stream, depth_m=tactile.depth_m,
+                                            reference_depth_m=tactile.reference_depth_m)
         return estimate
 
     def _append_private_audit(self, filename: str, row: dict) -> None:
@@ -575,12 +631,14 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             frame = np.pad(frame, ((pad_h // 2, pad_h - pad_h // 2),
                                    (pad_w // 2, pad_w - pad_w // 2), (0, 0)))
         self._frame_buffer.append(frame.copy())
+        self._video_physics_steps.append(int(getattr(self._task, "step_count", self._sim_step_count * self.action_repeat)))
 
     def enable_video_capture(self, enabled: bool = True, *, clear: bool = True,
                              capture_initial_frame: bool = True) -> None:
         self._record_frames = bool(enabled)
         if clear:
             self._frame_buffer.clear()
+            self._video_physics_steps.clear()
         if enabled and capture_initial_frame and self._observation is not None:
             self._capture_frame()
 
@@ -588,6 +646,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         frames = [frame.copy() for frame in self._frame_buffer]
         if clear:
             self._frame_buffer.clear()
+            # The trial writer still needs frame timestamps for audio muxing.
         return frames
 
     def get_video_frame_count(self) -> int:
@@ -595,6 +654,26 @@ class ShadowPianoLowLevelEnv(BaseEnv):
 
     def get_video_frames_range(self, start: int, end: int) -> list[np.ndarray]:
         return [frame.copy() for frame in self._frame_buffer[start:end]]
+
+    def add_audio_to_video(self, video_path: str | Path, start: int = 0, end: int | None = None) -> bool:
+        """Postprocess a saved video using private, physics-timed contact events."""
+        contacts = getattr(self._task, "audio_contacts", None)
+        if contacts is None:
+            return False
+        steps = self._video_physics_steps[start:end]
+        expected_frames = (len(self._video_physics_steps) if end is None else end) - start
+        if not steps or len(steps) != expected_frames:
+            raise ValueError("Piano video frames and physics timestamps are not aligned")
+        contacts.finish(int(getattr(self._task, "step_count", steps[-1])))
+        from envs._piano_audio import add_piano_audio
+
+        result = add_piano_audio(video_path, contacts.events, steps, fps=self.video_fps)
+        print(
+            f"[capx-shadow] piano audio video={video_path} wav={result['wav_path']} "
+            f"events={len(result['events'])}",
+            flush=True,
+        )
+        return True
 
     def render(self, mode: str = "rgb_array") -> np.ndarray:
         if mode != "rgb_array":
