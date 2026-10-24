@@ -1,0 +1,95 @@
+{
+  "schema": "shadow_digit_5d_migration_bundle.v1",
+  "calibration_schema": "shadow_digit_key_top_force_5d_area_rate.v1",
+  "feature_names": [
+    "mean_mm",
+    "area_gt_0p01mm",
+    "area_gt_0p05mm",
+    "area_gt_0p2mm",
+    "area_gt_0p05mm_rate_per_s"
+  ],
+  "training_seeds": [
+    3100,
+    3101,
+    3102,
+    3103,
+    3104,
+    3105,
+    3106,
+    3107,
+    3108,
+    3109,
+    3110,
+    3111,
+    3112,
+    3113,
+    3114,
+    3115,
+    3116,
+    3117,
+    3118,
+    3119,
+    3120,
+    3121,
+    3122,
+    3123,
+    3124,
+    3125,
+    3126,
+    3127,
+    3128,
+    3129,
+    3130,
+    3131,
+    3132,
+    3133,
+    3134,
+    3135,
+    3136,
+    3137,
+    3138,
+    3139
+  ],
+  "held_out_seeds": [
+    3140,
+    3141,
+    3142,
+    3143,
+    3144,
+    3145,
+    3146,
+    3147,
+    3148,
+    3149
+  ],
+  "sensor_sha256": "2c4e762965a06d1b38fbd6a54d638087ba2fa057dace69bdb77c741cb82f4208",
+  "contains_per_frame_force_labels": false,
+  "original_trajectory_hdf5_required_for_smoke": false,
+  "scope": "Frozen model, byte-identical sensor config, aggregate evaluation, and offline audit plots. CaP-X 60 Hz GPU evaluation pending.",
+  "files": {
+    "docs/results/shadow_digit_area_rate_20261024/comparison_report.json": {
+      "sha256": "eab7290eb28007e68240a815a2aa4777733e6ae61ab2b5aa5178bd39c1787754",
+      "bytes": 42458
+    },
+    "docs/results/shadow_digit_area_rate_20261024/heldout_alignment.png": {
+      "sha256": "e7dd1df165654a17bc707d51fe02414745b765524fd5800968c9f6f4f9e8fd99",
+      "bytes": 199728
+    },
+    "docs/results/shadow_digit_area_rate_20261024/initial_contact_scatter.png": {
+      "sha256": "e71922c3e07d289871c8707593b472497ad1ba544811405c69147246093985c3",
+      "bytes": 71744
+    },
+    "docs/results/shadow_digit_area_rate_20261024/models_offline_only.json": {
+      "sha256": "d7a6660ecccf8f1942fe7b9cfd01b901090f18cbf5175d121fc4f388f537f9f2",
+      "bytes": 4476
+    },
+    "env_configs/opentac/config_digit_piano_0_2.v1.yml": {
+      "sha256": "2c4e762965a06d1b38fbd6a54d638087ba2fa057dace69bdb77c741cb82f4208",
+      "bytes": 2429
+    },
+    "env_configs/opentac/shadow_digit_key_top_force_5d_area_rate.v1.json": {
+      "sha256": "073d6cc173a5d827d102bc2cfe67f965819d9a2e857fc6ea1ce9df2295c95264",
+      "bytes": 3531
+    }
+  }
+}

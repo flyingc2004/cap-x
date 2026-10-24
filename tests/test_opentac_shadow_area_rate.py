@@ -131,18 +131,25 @@ def test_adapter_samples_unqueried_actions_and_reset_clears_history(tmp_path):
         env.close()
 
 
-def test_5d_smoke_keeps_control_and_scoring_and_matches_the_sensor():
+def test_5d_smoke_keeps_control_and_scoring_and_matches_the_sensor(monkeypatch, tmp_path):
+    from omegaconf import OmegaConf
     root = Path(__file__).resolve().parents[1]
     config_dir = root / 'env_configs/opentac'
+    monkeypatch.setenv('CAPX_DIR', str(root))
+    monkeypatch.setenv('CAPX_SHADOW_PRIVATE_AUDIT_ROOT', str(tmp_path / 'private'))
     base = yaml.safe_load((config_dir / 'play_piano_shadow_digit_visual_force_60hz_smoke.yaml').read_text())
     new = yaml.safe_load((config_dir / 'play_piano_shadow_digit_visual_force_5d_60hz_smoke.yaml').read_text())
     base_low, new_low = base['env']['cfg']['low_level'], new['env']['cfg']['low_level']
     assert new['env']['cfg']['prompt'] == base['env']['cfg']['prompt']
     assert new['env']['cfg']['multi_turn_prompt'] == base['env']['cfg']['multi_turn_prompt']
-    assert {k: v for k, v in new_low.items() if k != 'digit_force_sidecar'} == {
-        k: v for k, v in base_low.items() if k != 'digit_force_sidecar'}
+    portable_paths = {'digit_force_sidecar', 'digit_piano_config', 'private_audit_root'}
+    assert {k: v for k, v in new_low.items() if k not in portable_paths} == {
+        k: v for k, v in base_low.items() if k not in portable_paths}
+    resolved = OmegaConf.to_container(OmegaConf.create(new), resolve=True)['env']['cfg']['low_level']
+    assert resolved['digit_piano_config'] == str(config_dir / 'config_digit_piano_0_2.v1.yml')
+    assert resolved['private_audit_root'] == str(tmp_path / 'private')
     sidecar = config_dir / 'shadow_digit_key_top_force_5d_area_rate.v1.json'
-    estimator = PublicDigitKeyForce(sidecar, new_low['digit_piano_config'])
+    estimator = PublicDigitKeyForce(sidecar, resolved['digit_piano_config'])
     assert estimator.uses_area_rate
     assert estimator.sidecar['frame_labels_included'] is False
     assert new_low['action_repeat'] == 4 and new_low['piano_require_dynamics']

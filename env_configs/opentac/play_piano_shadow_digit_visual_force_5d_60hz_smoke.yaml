@@ -19,9 +19,9 @@ env:
       device: cuda:0
       tactile_image_width: 320
       action_repeat: 4
-      digit_piano_config: /mnt/data/ljz/opentacbench/shadow_digit_force_v1/balanced_50seed_v1/config/config_digit_piano_0_2.yml
+      digit_piano_config: ${oc.env:CAPX_DIR,/mnt/a/ljz/cap/t-cap/cap-x}/env_configs/opentac/config_digit_piano_0_2.v1.yml
       digit_force_sidecar: ${oc.env:CAPX_DIR,/mnt/a/ljz/cap/t-cap/cap-x}/env_configs/opentac/shadow_digit_key_top_force_5d_area_rate.v1.json
-      private_audit_root: /mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1
+      private_audit_root: ${oc.env:CAPX_SHADOW_PRIVATE_AUDIT_ROOT,/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1}
       visual_key_mode: true
       auto_clear_keyboard_for_visual: true
       snap_visual_key_pixels: true
@@ -65,7 +65,7 @@ env:
 trials: 1
 num_workers: 1
 record_video: true
-output_dir: /mnt/data/ljz/opentacbench/capx-runs/shadow_piano_visual_force_5d_60hz_smoke
+output_dir: ${oc.env:CAPX_OUTPUT_DIR,/mnt/data/ljz/opentacbench/capx-runs/shadow_piano_visual_force_5d_60hz_smoke}
 trial_timeout_seconds: 7200
 code_block_wall_timeout_seconds: 3300
 max_trial_retries: 0

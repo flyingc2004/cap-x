@@ -4,7 +4,11 @@
 
 在现有成功专家轨迹上，加入接触面积变化率改善了力回归，尤其是初触阶段。
 10 个留出 seed 的接触帧 MAE 均下降。当前证据支持继续验证这一特征；尚未验证
-CaP-X 的不同初触姿态和 60 Hz 运行，也没有替换运行时模型。
+CaP-X 的不同初触姿态和 60 Hz 运行。
+
+迁移更新：已将五维模型接入独立 `play_piano_shadow_digit_visual_force_5d_60hz_smoke.yaml`，
+原四维配置保留。运行时通过 33 项 CPU 检查和 946 帧回放；首次 GPU 运行在 CUDA
+初始化阶段失败，没有得到五维钢琴任务结果。完整结果和匹配传感器配置现已随 Git 保存。
 
 ## 数据与方法
 
@@ -80,12 +84,16 @@ rate(t) = [A(t) - A(t - 1/30 s)] / (1/30 s)
 
 ## 产物与复现
 
-- [完整指标](/mnt/data/ljz/opentacbench/shadow_digit_force_v2/area_rate_ablation_20261024_v1/comparison_report.json)
-- [按键过程对齐图](/mnt/data/ljz/opentacbench/shadow_digit_force_v2/area_rate_ablation_20261024_v1/heldout_alignment.png)
-- [初触散点图](/mnt/data/ljz/opentacbench/shadow_digit_force_v2/area_rate_ablation_20261024_v1/initial_contact_scatter.png)
-- 私有特征缓存：同目录 `private-feature-cache/*.private.npz`。
-- 私有逐帧预测：同目录 `predictions.private.npz`；不得放进 prompt 或运行时记忆。
-- 离线参数：同目录 `models_offline_only.json`；不是已接入的运行时 sidecar。
+- [完整指标](results/shadow_digit_area_rate_20261024/comparison_report.json)
+- [按键过程对齐图](results/shadow_digit_area_rate_20261024/heldout_alignment.png)
+- [初触散点图](results/shadow_digit_area_rate_20261024/initial_contact_scatter.png)
+- [离线 4D/5D 参数](results/shadow_digit_area_rate_20261024/models_offline_only.json)。
+- [运行时五维模型](../env_configs/opentac/shadow_digit_key_top_force_5d_area_rate.v1.json)。
+- [匹配传感器配置](../env_configs/opentac/config_digit_piano_0_2.v1.yml)。
+- [文件校验清单](results/shadow_digit_area_rate_20261024/manifest.json)。
+- 私有特征缓存和逐帧预测仍位于原数据盘：
+  `/mnt/data/ljz/opentacbench/shadow_digit_force_v2/area_rate_ablation_20261024_v1/`，
+  不随运行时包分发，不得放进 prompt 或运行时记忆。
 - 脚本：`scripts/opentac/evaluate_shadow_digit_area_rate.py`；处理进程退出码 0。
 
 ```bash
@@ -96,5 +104,5 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
   --output /mnt/data/ljz/opentacbench/shadow_digit_force_v2/area_rate_ablation_20261024_repro01
 ```
 
-输出目录必须是新目录，脚本拒绝覆盖已有目录。此次仅新增离线对照脚本和文档；
-OpenTacBench、运行时模型、质量阈值、控制提示词和任务判分均未修改。
+输出目录必须是新目录，脚本拒绝覆盖已有目录。该离线对照不修改 OpenTacBench、
+质量阈值、控制提示词或任务判分。后续运行时接入使用独立五维配置。
