@@ -104,7 +104,7 @@ class PublicDigitKeyForce:
         """Estimate force; optional diagnostics are for a separate audit stream."""
         result = {"estimated_key_force_N": None, "sample_step": int(sample_step),
                   "age_steps": int(current_step - sample_step), "quality": "unavailable",
-                  "calibration_version": self.sidecar.get("schema", SCHEMA)}
+                  "calibration_version": self.sidecar.get("calibration_version", self.sidecar.get("schema", SCHEMA))}
         names = AREA_RATE_FEATURE_NAMES if self.uses_area_rate else FEATURE_NAMES
         if diagnostics_out is not None:
             diagnostics_out.clear()

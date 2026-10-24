@@ -34,6 +34,14 @@ if [[ -z "${GPU:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   exit 2
 fi
 if [[ -n "${GPU:-}" ]]; then export CUDA_VISIBLE_DEVICES="${GPU}"; fi
+# CUDA uses a remapped ordinal; the isolated EGL renderer needs the physical ID.
+PILOT_GPU="${GPU:-${CUDA_VISIBLE_DEVICES}}"
+if [[ ! "${PILOT_GPU}" =~ ^[0-9]+$ ]]; then
+  echo 'The single-episode collector requires one numeric GPU index' >&2
+  exit 2
+fi
+export CAPX_GPU="${PILOT_GPU}" EGL_DEVICE_ID="${PILOT_GPU}"
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 export UNIVTAC_ROOT PYTHONUNBUFFERED=1 HEADLESS=1 LIVESTREAM=0 OMNI_KIT_ACCEPT_EULA=YES
 export PYOPENGL_PLATFORM=egl
 export HOME="${UNIVTAC_HOME:-/mnt/data/ljz/opentacbench/kit-home}"

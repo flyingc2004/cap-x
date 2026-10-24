@@ -1,0 +1,126 @@
+{
+  "schema": "shadow_digit_key_top_force_5d_area_rate.v1",
+  "feature_names": [
+    "mean_mm",
+    "area_gt_0p01mm",
+    "area_gt_0p05mm",
+    "area_gt_0p2mm",
+    "area_gt_0p05mm_rate_per_s"
+  ],
+  "label": "private PhysX specified-key top contact force N",
+  "sensor_sha256": "2c4e762965a06d1b38fbd6a54d638087ba2fa057dace69bdb77c741cb82f4208",
+  "sensor_range_force_N": [
+    0,
+    2
+  ],
+  "history_contract": {
+    "physics_dt_seconds": 0.004166666666666667,
+    "window_physics_steps": 8,
+    "window_seconds": 0.03333333333333333,
+    "area_threshold_mm": 0.05
+  },
+  "calibration_version": "shadow_digit_key_top_force_5d_matched60hz_8episode.v1",
+  "training_seeds": [
+    3200,
+    3201,
+    3202,
+    3203
+  ],
+  "training_episode_count": 8,
+  "held_out_seeds": [],
+  "evaluation": "Four-fold leave-one-paired-seed-out development CV; no final independent holdout",
+  "runtime_validation": "Experimental frozen candidate; online evaluation required",
+  "frame_labels_included": false,
+  "force_features_include_robot_state": false,
+  "ridge_alpha": 0.01,
+  "models": {
+    "white": {
+      "median": [
+        0.03589869290590286,
+        0.16349590912701564,
+        0.14743029629041227,
+        0.08869846691556121,
+        0.008340614822463788
+      ],
+      "iqr": [
+        0.024943995289504528,
+        0.057907697195964725,
+        0.05702398919691795,
+        0.05425867821113668,
+        0.07342719834776378
+      ],
+      "coef": [
+        -0.39359133243531624,
+        0.5377730505516327,
+        0.24296239265121156,
+        -0.2588209412360146,
+        3.081873244590532e-05,
+        0.05127630337754809,
+        -0.0012210064995946048,
+        0.1914050714762571,
+        -0.20026355441122617,
+        -4.2959490840654674e-05
+      ],
+      "intercept": 0.3186355717585498,
+      "feature_min": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -4.54149455874176
+      ],
+      "feature_max": [
+        0.1374492441221605,
+        0.34596870283580905,
+        0.3271189133370403,
+        0.2581003256811502,
+        10.007576058463739
+      ],
+      "training_frames": 822
+    },
+    "black": {
+      "median": [
+        0.37938010692596436,
+        0.39989276352371117,
+        0.39524584955119546,
+        0.37280562395742317,
+        0.058015632893972935
+      ],
+      "iqr": [
+        0.25395865738391876,
+        0.0780210280619485,
+        0.08241977945150869,
+        0.09892663096857812,
+        0.4705209187617235
+      ],
+      "coef": [
+        0.3733796213012503,
+        0.08946026119232517,
+        -0.045424130738041045,
+        -0.09506372739059529,
+        -0.0013894803256716162,
+        -0.03834008548668529,
+        -0.10252274123723708,
+        0.15085992733626477,
+        -0.0730515400483015,
+        -8.865242279134042e-05
+      ],
+      "intercept": 0.7868590906304225,
+      "feature_min": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -7.356462379280435
+      ],
+      "feature_max": [
+        0.6980937091400449,
+        0.47227584152517127,
+        0.4695650878760798,
+        0.45945189156985405,
+        10.497374899828504
+      ],
+      "training_frames": 1335
+    }
+  }
+}

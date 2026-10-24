@@ -125,7 +125,16 @@ class ShadowPianoVisualForceApi(ApiBase):
         return self._env.get_index_tactile_rgb()
 
     def estimate_key_force(self, note: str | int) -> dict:
-        """Estimate key-top contact force from public simulated DIGIT depth."""
+        """Estimate key-top contact force from public simulated DIGIT depth.
+
+        quality values are lowercase and case-sensitive: 'ok', 'no_contact',
+        'ood', 'insufficient_history', or another unavailable/invalid state.
+        Only fresh 'ok' has a usable estimated_key_force_N. Branch on 'ood',
+        never 'OOD'; release and use the configured re-probe policy.
+        'no_contact' intentionally has None force and is normal before contact.
+        Handle it before checking for a finite force: keep the bounded initial
+        curl and reset hold counters; it is not an invalid estimate by itself.
+        """
         return self._env.estimate_key_force(note)
 
     def finish_piano_note_attempt(self, index: int) -> dict:

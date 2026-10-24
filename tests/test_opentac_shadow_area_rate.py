@@ -75,6 +75,19 @@ def test_invalid_history_and_rate_ood_do_not_fabricate_force(tmp_path):
     assert diagnostics['exceeded_bounds'][0]['feature'] == AREA_RATE_FEATURE_NAMES[-1]
 
 
+def test_refitted_weights_report_their_version_without_changing_api(tmp_path):
+    _, sidecar, config = make_model(tmp_path)
+    frozen = json.loads(sidecar.read_text(encoding='utf-8'))
+    frozen['calibration_version'] = 'shadow_digit_matched60hz.test.v1'
+    sidecar.write_text(json.dumps(frozen), encoding='utf-8')
+    model = PublicDigitKeyForce(sidecar, config)
+    model.observe_frame(*depth_with_area(.1), physics_step=0)
+    reading = model.predict(*depth_with_area(.2), color='white', sample_step=2,
+                            current_step=2, physics_step=8)
+    assert reading['calibration_version'] == frozen['calibration_version']
+    assert reading['quality'] == 'ok'
+
+
 def test_adapter_samples_unqueried_actions_and_reset_clears_history(tmp_path):
     _, sidecar, config = make_model(tmp_path)
 

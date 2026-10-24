@@ -14,6 +14,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts/opentac"))
 from shadow_digit_pilot_core import PilotRecorder, audit_episode, prepare_piano_config, sha256
 from collect_shadow_digit_pilot import _expert_request
+from shadow_digit_matched_probe import PROFILES, matched_probe_actions, probe_plan
 
 
 ROOT = Path(__file__).resolve().parents[3] / "OpenTacBench"
@@ -115,3 +116,38 @@ def test_private_gap_or_missing_exact_step_rejected(tmp_path):
                                key_angles_rad=values, action_target=np.zeros(4, np.float32),
                                requested_midi=60, phase="hover")
     recorder.close()
+
+
+def test_matched_probe_balances_profiles_without_private_feedback():
+    from types import SimpleNamespace
+
+    notes = ["E4", "F4", "C#4", "D#4"] * 2
+    dynamics = ["light", "heavy", "light", "heavy", "heavy", "light", "heavy", "light"]
+    plan = probe_plan(notes, dynamics, seed=3200, profile="varied")
+    assert {r["profile"] for r in plan["notes"]} == set(PROFILES)
+    assert plan["uses_private_force_for_control"] is False
+    assert plan["stops_on_old_estimator_ood"] is False
+    for first, second in zip(plan["notes"][:4], plan["notes"][4:]):
+        assert first["profile"] == second["profile"]
+    # The fake task exposes no force, score, annotations or expert policy.
+    task = SimpleNamespace(cfg=SimpleNamespace(physics_dt=1/240, action_repeat=4,
+                                              melody=[64, 65, 61, 63] * 2),
+                           action_space=SimpleNamespace(low=np.array([-.01, -.32, -.006, 0.]),
+                                                        high=np.array([.09, .26, .05, .5])),
+                           layout=[SimpleNamespace(position=[0., 0., 0.]) for _ in range(88)])
+    actual = np.array([0., 0., .03, -.0001])
+    task._action_state = lambda: actual.copy()
+    finished, phases = [], set()
+    for phase, command, midi, index, finish in matched_probe_actions(task, plan):
+        if finish:
+            assert command[2] == pytest.approx(.04)
+            assert command[3] == 0
+            finished.append(index)
+            continue
+        assert command.shape == (4,) and np.isfinite(command).all()
+        assert np.all(command >= [-.01, -.32, -.006, 0.])
+        assert np.all(command <= [.09, .26, .05, .500001])
+        actual = command.copy()
+        phases.add(phase)
+    assert finished == list(range(8))
+    assert phases == {"lift", "hover", "descend", "flex", "hold", "release"}

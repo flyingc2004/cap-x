@@ -1,6 +1,6 @@
 # Shadow Hand 钢琴实验：成功音数与动作步数
 
-当前索引：40 次运行；34 次有可读原生计分和动作审计。其余保留在表中，缺失值用“—”表示，不按 0 处理。
+当前索引：45 次运行；39 次有可读原生计分和动作审计。其余保留在表中，缺失值用“—”表示，不按 0 处理。
 
 ## 统计口径
 
@@ -54,6 +54,11 @@
 | 2026-10-23 09:17:00 | `4phys_gpu0_smoke` | 3150 | 1/8 | 1 | 408 | 628 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_4phys_seed3150_gpu0_smoke_rep1_20261023T091700Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_4phys_seed3150_gpu0_smoke_rep1_20261023T091700Z_19cb148d613c496a847aa0fa0bd4b0f6/shadow_piano_native_audit_summary.json) |
 | 2026-10-23 09:33:50 | `4phys_gpu0_smoke` | 3150 | 6/8 | 8 | 1674 | 1894 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_4phys_seed3150_gpu0_smoke_rep1_20261023T093350Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_4phys_seed3150_gpu0_smoke_rep1_20261023T093350Z_bbd181b46e4e403ebc7cdfb23399804c/shadow_piano_native_audit_summary.json) |
 | 2026-10-23 18:37:39 | `5d_area_rate_4phys_gpu0_smoke` | 3150 | — | — | — | — | — | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_5d_area_rate_4phys_seed3150_gpu0_smoke_rep1_20261023T183739Z/run.log) · —（原生审计缺失） |
+| 2026-10-24 08:26:05 | `5d_area_rate_4phys_gpu0_smoke` | 3150 | 0/8 | 8 | 1234 | 1454 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_5d_area_rate_4phys_seed3150_gpu0_smoke_rep1_20261024T082605Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_5d_area_rate_4phys_seed3150_gpu0_smoke_rep1_20261024T082605Z_1a2d6f5593804d15a3d5c2d6addcb52f/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 09:34:16 | `5d_quality_fix_4phys_gpu0_smoke` | 3150 | 0/8 | 8 | 1287 | 1507 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_5d_quality_fix_4phys_seed3150_gpu0_smoke_rep1_20261024T093416Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_5d_quality_fix_4phys_seed3150_gpu0_smoke_rep1_20261024T093416Z_b08794b4d509457a9bc37ba2daa0b406/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 09:49:30 | `5d_quality_nocontact_fix_4phys_gpu7_smoke` | 3150 | 0/8 | 8 | 1770 | 1990 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_5d_quality_nocontact_fix_4phys_seed3150_gpu7_smoke_rep1_20261024T094930Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_5d_quality_nocontact_fix_4phys_seed3150_gpu7_smoke_rep1_20261024T094930Z_d7985ae4e67a4b7ba9a646564d8e16e0/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 16:22:18 | `5d_matched8_4phys_gpu7_smoke` | 3150 | 7/8 | 8 | 1615 | 1835 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_5d_matched8_4phys_seed3150_gpu7_smoke_rep1_20261024T162218Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_5d_matched8_4phys_seed3150_gpu7_smoke_rep1_20261024T162218Z_277d90e009d642189c3e12d3f09dbf5c/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 17:05:12 | `5d_matched8_repeat_4phys_gpu1_smoke` | 3150 | 6/8 | 8 | 1381 | 1601 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_5d_matched8_repeat_4phys_seed3150_gpu1_smoke_rep1_20261024T170512Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_5d_matched8_repeat_4phys_seed3150_gpu1_smoke_rep1_20261024T170512Z_41d0cd8c4b4d49458c4a457e5f024776/shadow_piano_native_audit_summary.json) |
 
 ## 更新方式
 

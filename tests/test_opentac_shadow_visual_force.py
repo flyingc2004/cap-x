@@ -164,6 +164,9 @@ def test_force_estimate_quality_and_no_hidden_api(tmp_path):
     assert quality == "ok" and features[0] == pytest.approx(.2, abs=1e-4)
     reading = estimator.predict(depth, reference, color="white", sample_step=4, current_step=4)
     assert reading["quality"] == "ok" and reading["estimated_key_force_N"] == pytest.approx(.2, abs=1e-4)
+    idle = estimator.predict(reference, reference, color="white", sample_step=4, current_step=4)
+    assert idle["quality"] == "no_contact" and idle["estimated_key_force_N"] is None
+    assert idle["age_steps"] == 0  # Missing Newtons here do not mean stale/invalid.
     assert estimator.predict(depth, reference, color="white", sample_step=3, current_step=4)["quality"] == "invalid_color_or_stale"
     assert estimator.predict(np.zeros((20, 20)), reference, color="white", sample_step=4, current_step=4)["quality"] == "invalid_depth"
     assert "get_note_target" not in ShadowPianoVisualForceApi(None).functions()

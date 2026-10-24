@@ -118,7 +118,8 @@ class PilotRecorder:
     def append_public(self, *, physics_step: int, rgb: np.ndarray,
                       depth_m: np.ndarray, reference_depth_m: np.ndarray,
                       hand_state: np.ndarray, key_angles_rad: np.ndarray,
-                      action_target: np.ndarray, requested_midi: int, phase: str):
+                      action_target: np.ndarray, requested_midi: int, phase: str,
+                      requested_note_index: int = 0):
         if physics_step != self.last_private_step:
             raise ValueError("Public frame has no exact-step private force label")
         if phase not in PHASES:
@@ -141,6 +142,7 @@ class PilotRecorder:
         values = {"physics_step": np.int64(physics_step),
                   "time_s": np.float64(physics_step * self.metadata["physics_dt_s"]),
                   "requested_midi": np.int16(requested_midi),
+                  "requested_note_index": np.int16(requested_note_index),
                   "controller_phase": np.uint8(PHASES[phase]),
                   "action_target": action_target, "hand_state": hand_state,
                   "key_angles_rad": key_angles_rad,

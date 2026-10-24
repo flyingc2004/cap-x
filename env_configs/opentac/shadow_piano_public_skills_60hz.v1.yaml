@@ -12,9 +12,12 @@ skills:
   - id: bounded_force_feedback
     trigger: Fresh public DIGIT estimates have quality ok during stable contact.
     practice: Use the requested note's published force target, not the offline hold median, for bounded Z feedback. Log sample step, estimate and commanded Z. Maintain the press window long enough for the native hold. DIGIT is sampled once per four physics ticks; unseen ticks can differ.
+  - id: approaching_contact
+    trigger: A fresh force reading has lowercase quality no_contact during initial finger curl.
+    practice: no_contact intentionally returns None Newtons. Handle it before generic finite-value checks. Reset hold and stability, keep bounded probe Z, and continue the same note's next bounded press action, up to the press cap. Do not trim force, finalize the note or regenerate merely because this reading has no numeric force.
   - id: unavailable_force
-    trigger: A public force estimate is stale, OOD, nonfinite or unavailable, or a fresh estimate crosses the published upper tolerance.
-    practice: Abort this note's press, safely release, and report public quality and sample step. On the first early OOD for this note before any valid contact estimate while the finger is still curling, leave the current note unfinalized, print PIANO_STOP OOD_REPROBE and return so CaP-X can regenerate using the saved key map and public state text; re-probe that same note once. If OOD recurs for that note or valid contact had already begun, finalize after release and continue. Never turn OOD into a plausible force value, silently continue pressing, or use a private label to decide the action.
+    trigger: A public force estimate is stale, quality=ood, nonfinite or unavailable, or a fresh estimate crosses the published upper tolerance.
+    practice: Compare normalized lowercase quality to ood, never OOD. Abort on ood, stale, invalid or overforce estimates and release safely. On the first early ood before any valid contact while still curling, leave this note unfinalized, print PIANO_STOP OOD_REPROBE and return for text-only regeneration using the saved map and public state. Re-probe the same note once. If ood recurs or valid contact had already begun, release, finalize and continue. Never guess Newtons or use private labels.
   - id: note_progress
     trigger: A note was attempted and the index has been safely released, except at the first early OOD re-probe checkpoint for that note.
     practice: Call finish_piano_note_attempt with its zero-based index once after the final probe, then record that attempt in persistent piano_state and continue with the next note. Leave the index and completed count unchanged at a first early OOD checkpoint; retry it after regeneration. The call returns no per-note verdict. Do not replay a finalized note or claim public confidence proves the native score. Submit END after all requested attempts.
