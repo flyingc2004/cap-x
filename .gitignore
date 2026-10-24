@@ -43,6 +43,8 @@ wandb/
 
 *.jpg
 *.png
+!docs/results/shadow_digit_area_rate_20261024/heldout_alignment.png
+!docs/results/shadow_digit_area_rate_20261024/initial_contact_scatter.png
 *.jpeg
 *.gif
 *.bmp

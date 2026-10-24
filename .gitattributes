@@ -1,0 +1,2 @@
+# Preserve the frozen sensor config byte-for-byte, including upstream spaces.
+env_configs/opentac/config_digit_piano_0_2.v1.yml -text -whitespace
