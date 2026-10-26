@@ -48,12 +48,16 @@ def inject_shadow_piano_public_skills(
     if not isinstance(data, dict) or set(data) != {"schema", "skills"} or data["schema"] != SCHEMA:
         raise ValueError("Unsupported public Shadow piano skill library schema")
     skills = data["skills"]
-    if not isinstance(skills, list) or not 1 <= len(skills) <= MAX_SKILLS:
-        raise ValueError("Public Shadow piano skill library needs 1 to 16 skills")
+    if not isinstance(skills, list) or not 0 <= len(skills) <= MAX_SKILLS:
+        raise ValueError("Public Shadow piano skill library needs 0 to 16 skills")
     lines = [
         "Public Shadow piano skill library. These are reusable lessons from prior PUBLIC observations,",
-        "not observations from this trial. Use the initial HEAD image for key mapping; after mapping, use saved coordinates and fresh public hand/DIGIT readings.",
+        ("not observations from this trial. Reuse a validated cached endpoint calibration without images when available; otherwise confirm the initial HEAD endpoints. Use fresh public hand/DIGIT feedback."
+         if cfg["low_level"].get("endpoint_calibration", False) else
+         "not observations from this trial. Use the initial HEAD image for key mapping; after mapping, use saved coordinates and fresh public hand/DIGIT readings."),
     ]
+    if not skills:
+        lines.append("No skill entries have been recorded yet; the library starts empty.")
     ids: set[str] = set()
     for skill in skills:
         if not isinstance(skill, dict) or set(skill) != {"id", "trigger", "practice"}:

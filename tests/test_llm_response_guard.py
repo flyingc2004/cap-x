@@ -292,11 +292,13 @@ def test_responses_protocol_sends_opted_in_nested_reasoning_effort(monkeypatch) 
         max_tokens=2048,
     )
 
-    client.query_model(args, [{"role": "user", "content": "Write code."}])
+    result = client.query_model(args, [{"role": "user", "content": "Write code."}])
 
     payload = observed["payload"]
     assert payload["max_output_tokens"] == 2048
     assert payload["reasoning"] == {"effort": "low"}
+    assert result['usage']['request']['reasoning_effort_requested'] == 'low'
+    assert len(result['usage']['request']['payload_sha256']) == 64
 
 
 def test_usage_collector_summarizes_chat_and_responses_tokens(monkeypatch) -> None:
@@ -375,3 +377,48 @@ def test_trial_artifact_persists_provider_usage(tmp_path) -> None:
     usage = json.loads(usage_path.read_text())
     assert usage["totals"]["total_tokens"] == 20
     assert usage["queries"][0]["phase"] == "initial_code"
+
+
+def test_usage_audit_records_request_hash_and_response_metadata_without_prompt():
+    import hashlib
+    args = client.ModelQueryArgs(model='gpt-6.1-sol', max_tokens=8192,
+                                 server_url='https://example.test/v1/responses')
+    payload = {'model': args.model, 'input': 'PRIVATE_PROMPT_TEXT',
+               'max_output_tokens': 8192, 'reasoning': {'effort': 'low'}}
+    body = {'id': 'resp-test', 'model': 'returned-model', 'status': 'completed',
+            'max_output_tokens': 8192, 'reasoning': {'effort': 'high'},
+            'instructions': 'PRIVATE_PROMPT_TEXT', 'output': 'PRIVATE_RETURNED_SOURCE',
+            'usage': {'input_tokens': 9146, 'output_tokens': 40984,
+                      'output_tokens_details': {'reasoning_tokens': 32947},
+                      'total_tokens': 50130}}
+    events = []
+    with client.collect_llm_usage(events, 'initial_code'):
+        event = client._record_llm_usage(args=args, protocol='responses',
+            payload_stats=client._payload_stats(payload), body=body,
+            latency_seconds=1, payload=payload)
+    expected = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                                         separators=(',', ':')).encode()).hexdigest()
+    assert event['request']['payload_sha256'] == expected
+    assert event['request']['reasoning_effort_requested'] == 'low'
+    assert event['response_metadata'] == {'id': 'resp-test', 'model': 'returned-model',
+        'status': 'completed', 'max_output_tokens': 8192, 'reasoning_effort': 'high'}
+    assert event['usage_anomalies'] == ['reported_output_tokens_exceed_requested_limit']
+    assert 'PRIVATE_' not in json.dumps(event)
+    # Reasoning is already part of output_tokens; do not add it a second time
+    # or silently clamp the provider's number to the requested budget.
+    assert client.summarize_llm_usage(events)['totals']['total_tokens'] == 50130
+    assert event['usage']['provider_usage'] == body['usage']
+
+
+def test_usage_audit_preserves_unknown_and_flags_inconsistent_total():
+    args = client.ModelQueryArgs(model='test-model', max_tokens=10,
+                                 server_url='https://example.test/v1/responses')
+    missing = client._record_llm_usage(args=args, protocol='responses',
+        payload_stats={}, body={}, latency_seconds=0)
+    assert missing['usage']['total_tokens'] is None
+    assert missing['response_metadata'] == {} and missing['usage_anomalies'] == []
+    wrong = client._record_llm_usage(args=args, protocol='responses',
+        payload_stats={}, body={'usage': {'input_tokens': 3, 'output_tokens': 5,
+                                         'total_tokens': 99}}, latency_seconds=0)
+    assert wrong['usage_anomalies'] == ['reported_total_tokens_mismatch']
+    assert wrong['usage']['total_tokens'] == 99

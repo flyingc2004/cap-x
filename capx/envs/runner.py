@@ -22,6 +22,7 @@ from capx.envs.configs.instantiate import instantiate
 from capx.envs.agent_progress import save_progress_artifact
 from capx.envs.tasks.base import CodeExecutionEnvBase
 from capx.llm.client import LLMQueryError, summarize_llm_usage
+from capx.llm.deadline import LLMRequestTimeout
 from capx.envs.trial import (
     _annotate_code_blocks,
     _build_log_lines,
@@ -388,6 +389,12 @@ def _run_single_trial_with_timeout(
         finally:
             signal.signal(signal.SIGINT, previous_sigint_handler)
         raise
+    except LLMRequestTimeout as exc:
+        print(f'[capx-runner] trial={trial} {exc}; saving partial artifacts', flush=True)
+        return _build_aborted_summary(env, trial, partial_artifacts, config, exc,
+            sandbox_rc=1, truncated=False,
+            prefix=f'Trial {trial} stopped by model request timeout ({exc.source}, {exc.phase}).',
+            error_label='LLM Request Timeout', video_suffix='llm_timeout')
     except LLMQueryError as exc:
         print(
             f"[capx-runner] trial={trial} model request failed; "

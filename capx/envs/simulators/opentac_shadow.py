@@ -27,8 +27,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
     def __init__(
         self,
         univtac_root: str,
-        piano_notes: list[str | int],
-        piano_dynamics: list[str],
+        piano_notes: list[str | int] | None = None,
+        piano_dynamics: list[str] | None = None,
         piano_hold_seconds: float | list[float] = 0.12,
         piano_require_dynamics: bool = True,
         piano_continue_on_note_failure: bool = False,
@@ -47,11 +47,30 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         digit_piano_config: str | None = None,
         digit_force_sidecar: str | None = None,
         private_audit_root: str | None = None,
+        piano_note_count: int = 6,
+        task_seed: int | None = None,
+        endpoint_calibration: bool = False,
+        keyboard_calibration_path: str | None = None,
+        public_episode_recording: bool = False,
+        require_public_release: bool = False,
+        third_party_video: bool = False,
     ) -> None:
         super().__init__()
         self.univtac_root = Path(univtac_root).expanduser().resolve()
-        self.piano_notes = list(piano_notes)
-        self.piano_dynamics = list(piano_dynamics)
+        self.piano_notes = list(piano_notes) if piano_notes is not None else None
+        self.piano_dynamics = list(piano_dynamics) if piano_dynamics is not None else None
+        self.piano_note_count = int(piano_note_count)
+        self.task_seed = int(task_seed) if task_seed is not None else None
+        self.endpoint_calibration = bool(endpoint_calibration)
+        self.keyboard_calibration_path = Path(keyboard_calibration_path).expanduser().resolve() if keyboard_calibration_path else None
+        self.public_episode_recording = bool(public_episode_recording)
+        self.require_public_release = bool(require_public_release)
+        self.third_party_video = bool(third_party_video)
+        self._release_ready_since = None
+        self._keyboard_calibration = None
+        self._cached_key_targets = {}
+        self._keyboard_cache_hit = False
+        self._clear_action_steps = 0
         self.piano_hold_seconds = piano_hold_seconds
         self.piano_require_dynamics = bool(piano_require_dynamics)
         self.piano_continue_on_note_failure = bool(piano_continue_on_note_failure)
@@ -81,6 +100,12 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             raise ValueError("Visual Shadow smoke requires the matched DIGIT config and force sidecar")
         self._output_dir = Path(output_dir or os.environ.get("CAPX_OUTPUT_DIR", "")) if (output_dir or os.environ.get("CAPX_OUTPUT_DIR")) else None
         self._task = task_factory(self) if task_factory else self._create_native_task()
+        self._third_camera = getattr(self._task, 'capx_third_camera', None)
+        if self._third_camera is not None:
+            import torch
+            self._third_camera.set_world_poses_from_view(
+                torch.tensor([[-.58, .85, .66]],device=self._task.sim.device),
+                torch.tensor([[.12, 0., .095]],device=self._task.sim.device))
         self._force_estimator = None
         if self.visual_key_mode:
             from capx.integrations.opentac_shadow_force import PublicDigitKeyForce
@@ -109,6 +134,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self._last_private_score_event = 0
         self._record_frames = False
         self._frame_buffer: list[np.ndarray] = []
+        self._third_frame_buffer: list[np.ndarray] = []
         self._video_physics_steps: list[int] = []
         self._private_audit_dir: Path | None = None
         self._private_audit_streams: dict[str, Any] = {}
@@ -120,6 +146,19 @@ class ShadowPianoLowLevelEnv(BaseEnv):
     def _create_native_task(self):
         from env.tasks.arm_shadow_piano import Task, TaskCfg
 
+        if self.third_party_video:
+            class RecordedTask(Task):
+                def _create_keyboard(task):
+                    super()._create_keyboard()
+                    # Add a rendering-only sensor before the native first reset.
+                    from isaaclab.sensors import Camera, CameraCfg
+                    from isaaclab import sim as sim_utils
+                    task.capx_third_camera = Camera(CameraCfg(
+                        prim_path='/World/CapXThirdPartyCamera', width=960, height=640,
+                        data_types=['rgb'],spawn=sim_utils.PinholeCameraCfg(
+                            focal_length=24.,horizontal_aperture=36.,clipping_range=(.01,10.))))
+            Task = RecordedTask
+
         cfg = TaskCfg(
             device=self.device,
             tactile=True,
@@ -128,10 +167,11 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             action_repeat=self.action_repeat,
             piano_notes=self.piano_notes,
             piano_dynamics=self.piano_dynamics,
+            piano_note_count=self.piano_note_count,
             piano_hold_seconds=self.piano_hold_seconds,
             piano_require_dynamics=self.piano_require_dynamics,
             piano_continue_on_note_failure=self.piano_continue_on_note_failure,
-            piano_seed=self.seed_base,
+            piano_seed=self.task_seed if self.task_seed is not None else self.seed_base,
             record_video=True,
         )
         if not self.visual_key_mode:
@@ -188,7 +228,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             }
         white_count = sum(not key.black for key in layout)
         intervals = white_count - 1
-        return {
+        result = {
             "frame": "fixed_HEAD_display_image",
             "mirrored": self.mirror_head_view,
             "display_image_size_px": [960, 662],
@@ -202,6 +242,23 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             "A0": anchors["A0"],
             "C8": anchors["C8"],
         }
+        if getattr(self, "endpoint_calibration", False):
+            camera = self._task.camera
+            intrinsics = camera.data.intrinsic_matrices[0].detach().cpu().numpy()
+            from capx.integrations.opentac_shadow_vision import HEAD_FOCAL_PX, HEAD_WIDTH, HEAD_HEIGHT
+            expected_intrinsics = np.array([[HEAD_FOCAL_PX, 0, HEAD_WIDTH / 2], [0, HEAD_FOCAL_PX, HEAD_HEIGHT / 2], [0, 0, 1.]])
+            if camera.cfg.width != HEAD_WIDTH or camera.cfg.height != HEAD_HEIGHT or not np.allclose(intrinsics, expected_intrinsics, atol=2.):
+                raise ValueError("HEAD camera differs from endpoint-calibration geometry")
+            result["observed_camera_intrinsics"] = np.round(intrinsics, 7).tolist()
+            for field in ("pos_w", "quat_w_world"):
+                value = getattr(camera.data, field, None)
+                if value is not None:
+                    result["camera_" + field] = np.round(value[0].detach().cpu().numpy(), 7).tolist()
+            result.update(calibration_ready=self._visual_key_map_ready,
+                          calibration_id=self._keyboard_calibration.get("calibration_id") if self._keyboard_calibration else None,
+                          mapped_keys=self._cached_key_targets,
+                          localization_mode="public_endpoint_geometry")
+        return result
 
     def _configure_camera(self) -> None:
         if not hasattr(self._task, "camera"):
@@ -245,22 +302,35 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         Image.fromarray(self.get_index_tactile_rgb()).save(self._output_dir / filename)
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
-        actual_seed = self.seed_base if seed is None else self.seed_base + int(seed)
+        explicit_seed = getattr(self, "task_seed", None)
+        actual_seed = explicit_seed if explicit_seed is not None else (self.seed_base if seed is None else self.seed_base + int(seed))
         self._visual_key_map_ready = False
+        self._keyboard_calibration = None
+        self._cached_key_targets = {}
+        self._keyboard_cache_hit = False
+        self._clear_action_steps = 0
         estimator = getattr(self, "_force_estimator", None)
         if estimator is not None:
             estimator.reset_history()
         self._observation, self._native_info = self._task.reset(seed=actual_seed)
+        sequence = self._native_info.get("piano_sequence", {})
+        if sequence:
+            self.piano_notes = list(sequence["notes"])
+            self.piano_dynamics = list(sequence["dynamics"])
+            self._public_sequence = {k: sequence[k] for k in ("midi", "notes", "dynamics", "hold_seconds")}
         self._native_done = False
         self._policy_end_submitted = False
         self._policy_end_verdict = False
         self._sim_step_count = 0
         self._public_attempts_finalized = 0
+        self._release_ready_since = None
         self._last_native_notes_attempted = 0
         self._last_private_piano_record = 0
         self._last_private_score_event = 0
         self._action = np.zeros(4, dtype=np.float32)
         self._frame_buffer.clear()
+        if hasattr(self, '_third_frame_buffer'):
+            self._third_frame_buffer.clear()
         self._video_physics_steps.clear()
         self._sample_public_force_depth()
         if hasattr(self._task, "camera"):
@@ -278,9 +348,63 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             self._write_private_force_audit("reset")
             self._write_private_piano_timeline()
         self._save_tactile_snapshot("shadow_digit_initial.png")
-        if self.auto_clear_keyboard_for_visual:
+        if getattr(self, "endpoint_calibration", False) and self.keyboard_calibration_path and self.keyboard_calibration_path.is_file():
+            try:
+                from capx.integrations.opentac_shadow_keyboard import validate_calibration, targets_from_calibration
+                record = json.loads(self.keyboard_calibration_path.read_text(encoding="utf-8"))
+                endpoints = self.get_keyboard_endpoints()
+                validate_calibration(record, endpoints)
+                self._cached_key_targets = targets_from_calibration(record, endpoints, self.piano_notes)
+                self._keyboard_calibration = record
+                self._visual_key_map_ready = True
+                self._keyboard_cache_hit = True
+                print(f"[capx-shadow] keyboard cache hit id={record['calibration_id']} initial image_input=0", flush=True)
+            except (ValueError, KeyError, TypeError, OSError) as exc:
+                print(f"[capx-shadow] keyboard cache invalid; HEAD required: {exc}", flush=True)
+        if self.auto_clear_keyboard_for_visual and not self._keyboard_cache_hit:
             self._clear_keyboard_for_visual()
+            self._clear_action_steps = self._sim_step_count
+        self._save_public_episode(actual_seed)
         return self.get_observation(), {}
+
+    def public_task_context(self) -> str:
+        if not self.endpoint_calibration:
+            return ""
+        return ("\n\nCURRENT PUBLIC REQUEST (authoritative for this episode): "
+                + json.dumps(self._public_sequence) + ". Attempt exactly len(notes) entries in order.\n"
+                + "PUBLIC KEYBOARD CALIBRATION: " + json.dumps(self.get_keyboard_endpoints()))
+
+    def _save_public_episode(self, seed: int | None = None) -> None:
+        if not getattr(self, "public_episode_recording", False) or self._output_dir is None:
+            return
+        from capx.integrations.opentac_shadow_keyboard import atomic_json
+        if seed is not None:
+            self._actual_task_seed = seed
+        atomic_json(self._output_dir / "shadow_public_episode.json", {
+            "schema": "shadow_piano_public_episode.v1", "seed": self._actual_task_seed,
+            "sequence": self._public_sequence, "keyboard_cache_hit": self._keyboard_cache_hit,
+            "calibration_id": self._keyboard_calibration.get("calibration_id") if self._keyboard_calibration else None,
+            "clear_action_steps": self._clear_action_steps,
+            "action_repeat": self.action_repeat, "localization_mode": "public_endpoint_geometry"})
+
+    def _write_public_event(self, kind: str, **fields) -> None:
+        if not getattr(self, "public_episode_recording", False) or self._output_dir is None:
+            return
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        row = {"kind": kind, "action_step": self._sim_step_count,
+               "physics_step": int(self._task.step_count), **fields}
+        with (self._output_dir / "shadow_public_observations.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row, allow_nan=False) + "\n")
+
+    def record_public_code_result(self, stdout: str, stderr: str) -> None:
+        import re
+        from capx.integrations.opentac_shadow_skills import _PRIVATE_MARKERS
+        lines = [line[:8192] if line.startswith('PIANO_POLICY_STATE ') else line[:1200] for line in stdout.splitlines()
+                 if line.startswith(("PIANO_NOTE", "PIANO_STOP", "PIANO_ARRIVAL", "PIANO_POLICY_STATE", "CAPX_VISUAL_CHECKPOINT"))]
+        errors = [line[:800] for line in stderr.splitlines()
+                  if re.match(r"^[A-Za-z]+(?:Error|Exception):", line)]
+        safe = [line for line in lines + errors if not any(m in line.lower() for m in _PRIVATE_MARKERS)]
+        self._write_public_event("code_execution", public_messages=safe[-24:])
 
     def _clear_keyboard_for_visual(self) -> None:
         """Move the open index away from the keyboard before the sole initial image."""
@@ -344,12 +468,21 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self._action = value.copy()
         self._sim_step_count += 1
         self._native_done = bool(terminated or truncated)
+        if getattr(self, 'require_public_release', False):
+            hand = self.get_observation()['hand_state']
+            ready = abs(hand['index_flexion_rad']) <= .02 and abs(hand['wrist_z_m']-.04) <= .002
+            if ready:
+                if self._release_ready_since is None:
+                    self._release_ready_since = int(self._task.step_count)
+            else:
+                self._release_ready_since = None
         self._sample_public_force_depth()
         self._write_native_event("action")
         if self.visual_key_mode:
             self._write_private_force_audit("action")
             self._write_private_piano_timeline()
         self._save_attempt_snapshots()
+        self._write_public_event("action", target=self._action.tolist(), hand_state=self.get_observation()["hand_state"], native_done=self._native_done)
         if self._native_done:
             self._save_tactile_snapshot("shadow_digit_terminal.png")
         if self._record_frames and self._sim_step_count % self.video_frame_stride == 0:
@@ -389,8 +522,19 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             raise ValueError("Invalid piano attempt index")
         if index != self._public_attempts_finalized:
             raise ValueError("Piano attempts must be finalized once in sequence")
+        if getattr(self, 'require_public_release', False) and not self._native_done:
+            since = self._release_ready_since
+            elapsed = (int(self._task.step_count)-since)/240 if since is not None else 0.
+            if elapsed < .12:
+                self._write_public_event('release_rejected', index=index,
+                    hand_state=self.get_observation()['hand_state'],continuous_release_seconds=elapsed)
+                raise ValueError('Public release has not completed: actual index must be <=0.02 rad '
+                    'and wrist Z within 0.002 m of 0.04 m continuously for >=0.12 s; keep advancing bounded release actions')
         self._native_info = self._task.finish_piano_note_attempt(index)
         self._public_attempts_finalized += 1
+        self._write_public_event("attempt_finalized", index=index,
+            release_verified=bool(getattr(self, 'require_public_release', False)))
+        self._release_ready_since = None
         self._observation = self._task._observation()
         self._native_done = bool(self._task._done)
         self._write_native_event("attempt_end")
@@ -446,6 +590,20 @@ class ShadowPianoLowLevelEnv(BaseEnv):
     def locate_visual_keys(self, pixels: dict[str, dict]) -> dict[str, dict]:
         if not self.visual_key_mode:
             raise RuntimeError("Visual key location is not enabled")
+        if getattr(self, "endpoint_calibration", False) and isinstance(pixels, dict) and set(pixels) == {"A0", "C8"}:
+            from capx.integrations.opentac_shadow_keyboard import make_calibration, targets_from_calibration, atomic_json
+            endpoints = self.get_keyboard_endpoints()
+            record = make_calibration(pixels, endpoints, self._output_dir.name if self._output_dir else "shadow")
+            targets = targets_from_calibration(record, endpoints, self.piano_notes)
+            if self.keyboard_calibration_path:
+                atomic_json(self.keyboard_calibration_path, record)
+            self._keyboard_calibration = record
+            self._cached_key_targets = targets
+            self._visual_key_map_ready = True
+            self._write_public_event("endpoint_calibration", calibration_id=record["calibration_id"])
+            self._save_public_episode()
+            print(f"[capx-shadow] visual_key_map_ready=1 endpoint calibration id={record['calibration_id']}", flush=True)
+            return targets
         from capx.integrations.opentac_shadow_vision import (
             HEAD_FOCAL_PX, HEAD_HEIGHT, HEAD_WIDTH, locate_key_pixels,
             snap_key_pixels_to_visible_centers,
@@ -513,6 +671,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             diagnostics_out=diagnostics,
             physics_step=int(getattr(self._task, "step_count", 0)),
         )
+        self._write_public_event("force_estimate", note=str(note), estimate=estimate,
+                                 target=self._action.tolist(), hand_state=self.get_observation()["hand_state"])
         if self._output_dir is not None:
             truth = float(np.asarray(tactile.key_forces())[midi - 21])
             snapshot = (f"shadow_digit_ood_depth_{self._sim_step_count}_{midi}.npz"
@@ -631,6 +791,12 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             frame = np.pad(frame, ((pad_h // 2, pad_h - pad_h // 2),
                                    (pad_w // 2, pad_w - pad_w // 2), (0, 0)))
         self._frame_buffer.append(frame.copy())
+        if getattr(self, '_third_camera', None) is not None:
+            self._third_camera.update(self._task.cfg.physics_dt, force_recompute=True)
+            third = self._third_camera.data.output['rgb'][0].detach().cpu().numpy()[:,:,:3]
+            from PIL import Image
+            third = np.asarray(Image.fromarray(third.astype(np.uint8)).resize((frame.shape[1],frame.shape[0])))
+            self._third_frame_buffer.append(third.copy())
         self._video_physics_steps.append(int(getattr(self._task, "step_count", self._sim_step_count * self.action_repeat)))
 
     def enable_video_capture(self, enabled: bool = True, *, clear: bool = True,
@@ -638,6 +804,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self._record_frames = bool(enabled)
         if clear:
             self._frame_buffer.clear()
+            if hasattr(self, '_third_frame_buffer'):
+                self._third_frame_buffer.clear()
             self._video_physics_steps.clear()
         if enabled and capture_initial_frame and self._observation is not None:
             self._capture_frame()
@@ -651,6 +819,12 @@ class ShadowPianoLowLevelEnv(BaseEnv):
 
     def get_video_frame_count(self) -> int:
         return len(self._frame_buffer)
+
+    def get_third_party_video_frames(self, *, clear: bool = False) -> list[np.ndarray]:
+        frames = [f.copy() for f in self._third_frame_buffer]
+        if clear:
+            self._third_frame_buffer.clear()
+        return frames
 
     def get_video_frames_range(self, start: int, end: int) -> list[np.ndarray]:
         return [frame.copy() for frame in self._frame_buffer[start:end]]

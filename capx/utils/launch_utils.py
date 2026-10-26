@@ -98,6 +98,10 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
             f"YAML config {config_path} must contain 'env' key with environment configuration"
         )
     env_factory = configs_dict["env"]
+    shadow_memory_policy = configs_dict.get("shadow_piano_memory_policy")
+    if shadow_memory_policy is not None:
+        from capx.integrations.opentac_shadow_code_memory import memory_policy
+        shadow_memory_policy = memory_policy(configs_dict)
 
     # A curated public Shadow piano library is loaded afresh for each run.
     # Its offline failure audit contains native scores and force labels and is
@@ -192,6 +196,11 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         if args.use_oracle_code is not None
         else configs_dict.get("use_oracle_code", False),
         "resume_idx": configs_dict.get("resume_idx", None),
+        "shadow_piano_code_memory": configs_dict.get("shadow_piano_code_memory"),
+        "shadow_piano_action_memory": configs_dict.get("shadow_piano_action_memory", False),
+        "shadow_piano_memory_policy": shadow_memory_policy,
+        "shadow_piano_code_memory_read_only": bool(configs_dict.get("shadow_piano_code_memory_read_only", False))
+        or os.environ.get('CAPX_SHADOW_CODE_MEMORY_READ_ONLY','').lower() in ('1','true','yes'),
         "use_visual_feedback": args.use_visual_feedback
         if args.use_visual_feedback is not None
         else configs_dict.get("use_visual_feedback", False),

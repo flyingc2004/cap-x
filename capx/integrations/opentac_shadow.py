@@ -86,6 +86,8 @@ class ShadowPianoVisualForceApi(ApiBase):
         display_image_center_px uses the currently mirrored 960x662 labeled
         HEAD image. The value is static scene geometry, not a force, score,
         requested-note target or proof that a pictured key is unobstructed.
+        In endpoint-calibration mode, mapped_keys contains the current requested
+        wrist targets when calibration_ready is true. Reuse these without images.
         """
         return self._env.get_keyboard_endpoints()
 
@@ -97,6 +99,11 @@ class ShadowPianoVisualForceApi(ApiBase):
         Returns bounded wrist targets from camera/robot calibration, with no
         lookup of the task's requested-key layout. After successful private
         save, get_hand_state()['visual_key_map_ready'] becomes 1 for this episode.
+        In endpoint-calibration mode you may instead pass exactly A0 and C8,
+        both color='white', after checking the supplied anchors in the image.
+        This returns all current requested targets computed from public endpoints,
+        musical white-key intervals and generic black/white geometry. It saves
+        the reusable endpoint calibration for subsequent episodes.
         """
         return self._env.locate_visual_keys(pixels)
 

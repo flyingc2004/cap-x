@@ -212,6 +212,9 @@ class CodeExecutionEnvBase(Env):
                 "Use only documented APIs or define helpers before calling them.",
                 file=tee_err,
             )
+            recorder = getattr(self.low_level_env, "record_public_code_result", None)
+            if callable(recorder):
+                recorder(stdout_buffer.getvalue(), stderr_buffer.getvalue())
             return {
                 "ok": ok,
                 "stdout": stdout_buffer.getvalue(),
@@ -265,6 +268,9 @@ class CodeExecutionEnvBase(Env):
             # Always print full traceback to the redirected stderr (tee -> console and buffer)
             traceback.print_exc(file=tee_err)
 
+        recorder = getattr(self.low_level_env, "record_public_code_result", None)
+        if callable(recorder):
+            recorder(stdout_buffer.getvalue(), stderr_buffer.getvalue())
         return {
             "ok": ok,
             "completed_normally": completed_normally,
@@ -452,6 +458,16 @@ class CodeExecutionEnvBase(Env):
         """
         self._step_count = 0
         obs, info = self.low_level_env.reset(seed=seed, options=options)
+        context_reader = getattr(self.low_level_env, "public_task_context", None)
+        context = context_reader() if callable(context_reader) else ""
+        if context:
+            if not hasattr(self, "_episode_prompt_template"):
+                self._episode_prompt_template = self._task_prompt
+            self._task_prompt = self._episode_prompt_template + context
+            self._full_prompt = [
+                {"role": "system", "content": self._system_prompt},
+                {"role": "user", "content": [{"type": "text", "text": self._get_complete_prompt()}]},
+            ]
         obs.update(self._get_observation())
         # Reinitialize globals for a fresh episode and prime INPUTS with the reset observation
         self._init_exec_globals()

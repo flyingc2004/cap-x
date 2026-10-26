@@ -1,12 +1,13 @@
 # Shadow Hand 钢琴实验：成功音数与动作步数
 
-当前索引：45 次运行；39 次有可读原生计分和动作审计。其余保留在表中，缺失值用“—”表示，不按 0 处理。
+当前索引：97 次运行；87 次有可读原生计分和动作审计。其余保留在表中，缺失值用“—”表示，不按 0 处理。
 
 ## 统计口径
 
 - **成功音数**取 `shadow_piano_native_audit_summary.json` 的 `native_notes_completed`，分母取该摘要中的请求音数；它是原生任务的逐音计分，不是生成代码打印的信心值，也不是 `Task Completed`。启用失败后继续尝试的运行会将成功音数和尝试数分开记录。
 - **总原生动作步**精确计数 `shadow_native_events.jsonl` 中 `kind=action` 的行数。每行是一次 `Task.step()`；旧配置推进 8 个 240 Hz 物理步，`4phys` 配置推进 4 个。批量 `steps=n` 计为 n 步。包括 reset 后的自动视觉清场动作，不包括 reset、键位映射、尝试结束或 END。
 - **生成代码动作步**＝总原生动作步减去同次 `run.log` 记录的 `keyboard clear at action_step`。没有清场记录但总数为 0 时记 0；其余缺少清场记录的运行记“—”，避免把适配器清场算成模型动作。
+- 本次 `random6_online_skills` 运行另有公开 reset 记录明确记载清场步数，故缓存命中时清场为 0，生成动作数可直接与总数核对；不将这一规则追溯用于缺少记录的旧实验。
 - **END**取私有摘要 `end_submitted`。终端退出码只在 `run.log` 存在时记录；退出码 0 本身不表示钢琴成功。若审计无权限、缺失或运行在启动阶段中断，不虚构成功音数或动作数。
 - 历史运行的控制配置和故障类型不同。本表是完整实验账本；论文计算成功率或平均动作数时，须先固定纳入标准、配置版本及是否包含未完成运行，再从本表筛选，不能直接平均全部行。
 
@@ -60,6 +61,56 @@
 | 2026-10-24 16:22:18 | `5d_matched8_4phys_gpu7_smoke` | 3150 | 7/8 | 8 | 1615 | 1835 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_5d_matched8_4phys_seed3150_gpu7_smoke_rep1_20261024T162218Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_5d_matched8_4phys_seed3150_gpu7_smoke_rep1_20261024T162218Z_277d90e009d642189c3e12d3f09dbf5c/shadow_piano_native_audit_summary.json) |
 | 2026-10-24 17:05:12 | `5d_matched8_repeat_4phys_gpu1_smoke` | 3150 | 6/8 | 8 | 1381 | 1601 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_5d_matched8_repeat_4phys_seed3150_gpu1_smoke_rep1_20261024T170512Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_5d_matched8_repeat_4phys_seed3150_gpu1_smoke_rep1_20261024T170512Z_41d0cd8c4b4d49458c4a457e5f024776/shadow_piano_native_audit_summary.json) |
 
+| 2026-10-24 19:09:46 | `random6_online_skills` | 3300 | 6/6 | 6 | 1140 | 1360 | 是 | 0 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3300_random6_3300_3309_20261025_v1_smoke_rep1_20261024T190946Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3300_random6_3300_3309_20261025_v1_smoke_rep1_20261024T190946Z_658a08a508be470b95c15062f0f01052/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 19:24:38 | `random6_online_skills` | 3301 | 4/6 | 6 | 1160 | 1160 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3301_random6_3300_3309_20261025_v1_smoke_rep1_20261024T192438Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3301_random6_3300_3309_20261025_v1_smoke_rep1_20261024T192438Z_b4e0be99064f4697a5cb0bd1d1d90e20/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 19:30:33 | `random6_online_skills` | 3302 | 6/6 | 6 | 958 | 958 | 是 | 0 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3302_random6_3300_3309_20261025_v1_smoke_rep1_20261024T193033Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3302_random6_3300_3309_20261025_v1_smoke_rep1_20261024T193033Z_924a2b172ed448e1a60dcd6404881204/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 19:35:40 | `random6_online_skills` | 3303 | 4/6 | 6 | 1127 | 1127 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3303_random6_3300_3309_20261025_v1_smoke_rep1_20261024T193540Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3303_random6_3300_3309_20261025_v1_smoke_rep1_20261024T193540Z_e64c7a47f4004234a7989c3b49a0feec/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 19:41:23 | `random6_online_skills` | 3304 | 4/6 | 6 | 1234 | 1234 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3304_random6_3300_3309_20261025_v1_smoke_rep1_20261024T194123Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3304_random6_3300_3309_20261025_v1_smoke_rep1_20261024T194123Z_0b89d303622448e19263d29883ca60ec/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 19:47:23 | `random6_online_skills` | 3305 | 4/6 | 6 | 1061 | 1061 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3305_random6_3300_3309_20261025_v1_smoke_rep1_20261024T194723Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3305_random6_3300_3309_20261025_v1_smoke_rep1_20261024T194723Z_a922757b11c54667bd6d4b8b650be7d4/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 19:52:43 | `random6_online_skills` | 3306 | 6/6 | 6 | 838 | 838 | 是 | 0 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3306_random6_3300_3309_20261025_v1_smoke_rep1_20261024T195243Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3306_random6_3300_3309_20261025_v1_smoke_rep1_20261024T195243Z_22410ad3fc354d9d9b90964115911328/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 19:58:19 | `random6_online_skills` | 3307 | 4/6 | 6 | 1335 | 1335 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3307_random6_3300_3309_20261025_v1_smoke_rep1_20261024T195819Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3307_random6_3300_3309_20261025_v1_smoke_rep1_20261024T195819Z_bc520199faa844b0bfd91e9ff3cbd824/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 20:04:50 | `random6_online_skills` | 3308 | 5/6 | 6 | 1188 | 1188 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3308_random6_3300_3309_20261025_v1_smoke_rep1_20261024T200450Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3308_random6_3300_3309_20261025_v1_smoke_rep1_20261024T200450Z_14a3a0a83a794cc28da09096132616f3/shadow_piano_native_audit_summary.json) |
+| 2026-10-24 20:10:48 | `random6_online_skills` | 3309 | 6/6 | 6 | 993 | 993 | 是 | 0 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3309_random6_3300_3309_20261025_v1_smoke_rep1_20261024T201048Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3309_random6_3300_3309_20261025_v1_smoke_rep1_20261024T201048Z_117fae6989084a1bb0c39518d03561d8/shadow_piano_native_audit_summary.json) |
+
+| 2026-10-25 05:53:15 | `random6_empty_online_skills` | 3300 | 5/6 | 6 | 942 | 1162 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3300_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T055315Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3300_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T055315Z_0dfcbafad7d140fb931eaf6c9fffa43d/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 06:00:04 | `random6_empty_online_skills` | 3301 | 5/6 | 6 | 1115 | 1115 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3301_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T060004Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3301_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T060004Z_6a119f52ec9e4e298543e717af1dd13b/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 06:05:47 | `random6_empty_online_skills` | 3302 | 0/6 | 6 | 823 | 823 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3302_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T060547Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3302_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T060547Z_2c659827ca8047cfa04e6288e50000c5/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 06:11:18 | `random6_empty_online_skills` | 3303 | 4/6 | 6 | 1300 | 1300 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3303_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T061118Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3303_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T061118Z_fdf786e7189b41eaac6f369f765b2808/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 06:17:44 | `random6_empty_online_skills` | 3304 | 4/6 | 6 | 1267 | 1267 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3304_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T061744Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3304_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T061744Z_c86b5be13a2e451093d6e459cbe8f4a5/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 06:24:36 | `random6_empty_online_skills` | 3305 | 4/6 | 6 | 1135 | 1135 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3305_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T062436Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3305_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T062436Z_f180cc1ab13a43199edd40890b17da31/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 06:30:21 | `random6_empty_online_skills` | 3306 | 5/6 | 6 | 1156 | 1156 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3306_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T063021Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3306_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T063021Z_1a392f0bc1474ddf971fad584bde8b25/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 06:36:07 | `random6_empty_online_skills` | 3307 | 6/6 | 6 | 1257 | 1257 | 是 | 0 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3307_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T063607Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3307_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T063607Z_956a790384df46959f3f766b2730c58d/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 06:42:43 | `random6_empty_online_skills` | 3308 | 5/6 | 6 | 1149 | 1149 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3308_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T064243Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3308_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T064243Z_4cbd200a96784ee88a938c9b29b32c6c/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 06:48:39 | `random6_empty_online_skills` | 3309 | 5/6 | 6 | 990 | 990 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_random6_online_seed3309_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T064839Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_random6_online_seed3309_random6_empty_3300_3309_20261025T055314Z_smoke_rep1_20261025T064839Z_974d3086f848431d86783b579536f2b4/shadow_piano_native_audit_summary.json) |
+
+| 2026-10-25 09:43:18 | `executable_code_memory` | 3300 | 5/6 | 6 | 1375 | 1595 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_code_memory_seed3300_code_memory_3300_3309_20261025T094300Z_smoke_rep1_20261025T094318Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_code_memory_seed3300_code_memory_3300_3309_20261025T094300Z_smoke_rep1_20261025T094318Z_97abaf863ff84cde9217a250e86fa18e/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 09:57:28 | `executable_code_memory` | 3301 | 5/6 | 6 | 1157 | 1157 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_code_memory_seed3301_code_memory_3300_3309_20261025T094300Z_smoke_rep1_20261025T095728Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_code_memory_seed3301_code_memory_3300_3309_20261025T094300Z_smoke_rep1_20261025T095728Z_50c25eb3bc654b028263a6ab61e3903e/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 10:04:35 | `executable_code_memory` | 3302 | 6/6 | 6 | 1159 | 1159 | 是 | 0 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_code_memory_seed3302_code_memory_3300_3309_20261025T094300Z_smoke_rep1_20261025T100435Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_code_memory_seed3302_code_memory_3300_3309_20261025T094300Z_smoke_rep1_20261025T100435Z_43efbbae081b415582ae357ad4baf42f/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 10:10:42 | `executable_code_memory` | 3303 | 5/6 | 6 | 1272 | 1272 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_code_memory_seed3303_code_memory_3300_3309_20261025T094300Z_smoke_rep1_20261025T101042Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_code_memory_seed3303_code_memory_3300_3309_20261025T094300Z_smoke_rep1_20261025T101042Z_c85716e8b3e64f96aa26d290a3c40803/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 10:17:23 | `executable_code_memory` | 3304 | 6/6 | 6 | 1242 | 1242 | 是 | 0 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_code_memory_seed3304_code_memory_3300_3309_20261025T094300Z_smoke_rep1_20261025T101723Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_code_memory_seed3304_code_memory_3300_3309_20261025T094300Z_smoke_rep1_20261025T101723Z_4df0235b84cf42c08d5c70f071bee7f9/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 10:23:49 | `executable_code_memory_interrupted` | 3305 | — | — | — | — | — | — | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_code_memory_seed3305_code_memory_3300_3309_20261025T094300Z_smoke_rep1_20261025T102349Z/run.log) · 用户暂停中断，缺少已关闭的原生审计，不按0计 |
+| 2026-10-25 10:53:13 | `seed3302_readonly_diagnostic` | 3302 | 6/6 | 6 | 1267 | 1267 | 是 | 0 | [日志](/mnt/data/ljz/opentacbench/capx-runs/shadow_3302_readonly_diag_20261025T105313Z_smoke_rep1_20261025T105313Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/shadow_3302_readonly_diag_20261025T105313Z_smoke_rep1_20261025T105313Z_047a314839b747b3a67f9042a8e18974/shadow_piano_native_audit_summary.json) |
+
+| 2026-10-25 13:23:31 | `paired_memory_A` | 3300 | 1/6 | 1 | 215 | 215 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_A_seed3300_paired_3300_3309_20261025T132326Z_smoke_rep1_20261025T132331Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_A_seed3300_paired_3300_3309_20261025T132326Z_smoke_rep1_20261025T132331Z_63bbebdb5fa84091bbdf2029c7c83d44/shadow_piano_native_audit_summary.json)；API故障中断，余下音未尝试 |
+| 2026-10-25 13:27:09 | `paired_memory_B` | 3300 | 5/6 | 6 | 1334 | 1334 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_B_seed3300_paired_3300_3309_20261025T132326Z_smoke_rep1_20261025T132709Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_B_seed3300_paired_3300_3309_20261025T132326Z_smoke_rep1_20261025T132709Z_6bb46a6356034fe3937866d068855425/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 13:33:51 | `paired_memory_C` | 3300 | 1/6 | 1 | 215 | 215 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_C_seed3300_paired_3300_3309_20261025T132326Z_smoke_rep1_20261025T133351Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_C_seed3300_paired_3300_3309_20261025T132326Z_smoke_rep1_20261025T133351Z_fe096c9c7ce84120b636b7c3b768f004/shadow_piano_native_audit_summary.json)；API故障中断，余下音未尝试 |
+
+| 2026-10-25 14:35:31 | `model_override_aborted` | 3300 | —/6 | — | 131 | 131 | — | 130 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_A_seed3300_rerun3300_gpt61sol_20261025T143526Z_smoke_rep1_20261025T143531Z/run.log)；启动模型覆盖错误，已中止并排除正式对照 |
+| 2026-10-25 14:40:46 | `model_override_aborted` | 3300 | —/6 | — | 580 | 580 | — | 130 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_A_seed3300_rerun3300_gpt61sol_20261025T144041Z_smoke_rep1_20261025T144046Z/run.log)；启动模型覆盖错误，已中止并排除正式对照 |
+| 2026-10-25 14:53:50 | `paired_gpt61sol_A` | 3300 | 1/6 | 1 | 331 | 331 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_A_seed3300_rerun3300_gpt61sol_20261025T145345Z_smoke_rep1_20261025T145350Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_A_seed3300_rerun3300_gpt61sol_20261025T145345Z_smoke_rep1_20261025T145350Z_30a7ef66a75e46b9bf08da6628cfb961/shadow_piano_native_audit_summary.json)；生成代码异常，剩余音未尝试 |
+| 2026-10-25 14:57:08 | `paired_gpt61sol_B` | 3300 | 1/6 | 1 | 185 | 185 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_B_seed3300_rerun3300_gpt61sol_20261025T145345Z_smoke_rep1_20261025T145708Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_B_seed3300_rerun3300_gpt61sol_20261025T145345Z_smoke_rep1_20261025T145708Z_498461a1b5d842638f1ef1011ce29cb3/shadow_piano_native_audit_summary.json)；API响应超时，剩余音未尝试 |
+| 2026-10-25 15:00:46 | `paired_gpt61sol_C` | 3300 | 1/6 | 1 | 185 | 185 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_C_seed3300_rerun3300_gpt61sol_20261025T145345Z_smoke_rep1_20261025T150046Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_C_seed3300_rerun3300_gpt61sol_20261025T145345Z_smoke_rep1_20261025T150046Z_6f0ad7ab918d410fbffddf71fb27b9c1/shadow_piano_native_audit_summary.json)；生成代码异常，剩余音未尝试 |
+
+完整音序、token、技能库版本和视频参见 [本次十组报告](/mnt/a/ljz/cap/t-cap/cap-x/docs/opentac-shadow-piano-random6-online-skills.md)。
+
+空库起点对照及失败诊断参见 [本轮报告](/mnt/a/ljz/cap/t-cap/cap-x/docs/opentac-shadow-piano-empty-memory-results.md)。
+
+3302单次诊断与修复详见 [报告](/mnt/a/ljz/cap/t-cap/cap-x/docs/opentac-shadow-piano-seed3302-diagnostic.md)。
+
+三组配对实验逐seed表与API故障说明：[实时结果](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/paired_3300_3309_20261025T132326Z/results.md)。首个seed已记录三组，剩余27次因API可用性问题尚未启动。
+
+3300三组改用gpt-6.1-sol的重跑：[结果表](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/rerun3300_gpt61sol_20261025T145345Z/results.md)。三组均仅第一个音通过；A/C为生成代码错误，B为API超时。两次模型覆盖错误的启动单独保留并排除。
+
 ## 更新方式
 
 在现有 CaP-X 工作区运行：
@@ -69,3 +120,81 @@ python3 scripts/opentac/build_shadow_piano_experiment_ledger.py
 ```
 
 默认读取 `/mnt/data/ljz/opentacbench/capx-runs/shadow_*/run.log` 和 `/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1` 下的审计目录，重新生成本文件。此脚本只读实验产物，不运行仿真，不把私有逐帧力标签写入文档或运行时提示词。
+
+| 2026-10-25 17:32:36 | `independent_v2_A_initial_API_timeout` | 3300 | 0/6（未尝试） | 0 | 0 | 0 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_A_seed3300_independent_3300_3301_gpt61_20261025T173235Z_smoke_rep1_20261025T173236Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_A_seed3300_independent_3300_3301_gpt61_20261025T173235Z_smoke_rep1_20261025T173236Z_774be8a797834f0d989e5e2c72e53321/shadow_piano_native_audit_summary.json) |
+
+本轮独立初始化协议 v2 原计划3300/3301各A/B/C共六组。A/3300 首次请求无代理 `gpt-6.1-sol` 超时，无生成代码、无按键动作；API请求1次，用量未知。其余五组未启动，不计为失败或零分。队列暂停，无自动补跑。不得与此前共享A初始源码的三组记录合并为同一协议。
+
+| 2026-10-25 18:43:07 | `independent_v2_A_preflight_ok_initial120_timeout` | 3300 | 0/6（未尝试） | 0 | 0 | 0 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_A_seed3300_independent_preflight_3300_3301_20261025T184303Z_smoke_rep1_20261025T184307Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_A_seed3300_independent_preflight_3300_3301_20261025T184303Z_smoke_rep1_20261025T184307Z_15f86cc6463f40478865f08e0b8f61d0/shadow_piano_native_audit_summary.json) |
+
+该运行原脚本preflight通过，但首次生成仍被代码记忆模块共用的120秒修复限时打断。没有源码返回，无控制动作，不属于策略失败。后续新实验只将首次生成限时与原启动脚本300秒对齐，修复仍限120秒；不使用该运行挑选源码。
+
+| 2026-10-25 18:47:56 | `independent_v2_initial300_A` | 3300 | 6/6 | 6 | 1186 | 1186 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_A_seed3300_independent_initial300_3300_3301_20261025T184748Z_smoke_rep1_20261025T184756Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_A_seed3300_independent_initial300_3300_3301_20261025T184748Z_smoke_rep1_20261025T184756Z_7bf6f9c9c0124e8ba85c338d4e783607/shadow_piano_native_audit_summary.json) |
+
+| 2026-10-25 18:59:18 | `independent_v2_initial300_B` | 3300 | 5/6 | 6 | 1306 | 1306 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_B_seed3300_independent_initial300_3300_3301_20261025T184748Z_smoke_rep1_20261025T185918Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_B_seed3300_independent_initial300_3300_3301_20261025T184748Z_smoke_rep1_20261025T185918Z_9beabdb0efc049a8a36097bfc2000883/shadow_piano_native_audit_summary.json) |
+
+| 2026-10-25 19:11:51 | `independent_v2_initial300_C` | 3300 | 0/6（未尝试） | 0 | 0 | 0 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_C_seed3300_independent_initial300_3300_3301_20261025T184748Z_smoke_rep1_20261025T191151Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_C_seed3300_independent_initial300_3300_3301_20261025T184748Z_smoke_rep1_20261025T191151Z_b66ff3e427ab4610ab9c7bb9c6cd2d4c/shadow_piano_native_audit_summary.json) |
+
+该批次A/B/C独立初始化，首次生成等待300秒，修复120秒，原脚本preflight开启；因C修复超时停在3300结束后，3301未运行。A六音合格但END缺失；B错第二音，原因是释放恢复时重弹F4；C无动作。详见[批次分析](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/independent_initial300_3300_3301_20261025T184748Z/analysis.json)。
+
+
+### 独立配置v4：A3300、A3301（UTC）
+
+| 时间 | 实验版本 | Seed | 原生成功音数 | 尝试数 | 生成代码动作步 | 总原生动作步 | END | 退出码 | 原始证据 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | :---: | ---: | --- |
+| 2026-10-25 20:07:21 | `abc_v4_A_separate_config` | 3300 | 5/6 | 6 | 1303 | 1303 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_A_seed3300_abc_separate_3300_3301_20261025T200709Z_smoke_rep1_20261025T200721Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_A_seed3300_abc_separate_3300_3301_20261025T200709Z_smoke_rep1_20261025T200721Z_498ab9fcd0094e5f9178ca49b749025b/shadow_piano_native_audit_summary.json) |
+| 2026-10-25 20:18:56 | `abc_v4_A_separate_config` | 3301 | 1/6 | 1 | 201 | 201 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_abc_A_seed3301_abc_separate_3300_3301_20261025T200709Z_smoke_rep1_20261025T201856Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_abc_A_seed3301_abc_separate_3300_3301_20261025T200709Z_smoke_rep1_20261025T201856Z_0cd1cbdd1d5a43358b42328bb074ff94/shadow_piano_native_audit_summary.json) |
+
+A3301只尝试首音并原生合格，之后释放计数差一拍触发护栏，修复API超时。剩余5音未尝试，不归类为5次控制失败。A3300完成六次尝试，第二音wrong_key。两轮结束后整理调用均为0；B/C尚未运行。详见[本轮诊断](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/abc_separate_3300_3301_20261025T200709Z/diagnosis.md)。
+
+
+### 原八音请求回归（UTC）
+
+| 时间 | 实验版本 | Seed | 原生成功音数 | 尝试数 | 生成代码动作步 | 总原生动作步 | END | 退出码 | 原始证据 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | :---: | ---: | --- |
+| 2026-10-26 01:49:43 | `old8_prompt_check_gpt61sol_matched5d` | 3150 | 5/8 | 8 | 1575 | 1795 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/piano_old8_prompt_check_seed3150_20261026T014940Z_smoke_rep1_20261026T014943Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/piano_old8_prompt_check_seed3150_20261026T014940Z_smoke_rep1_20261026T014943Z_60c67bb2d0924f189adec9b159a8eb06/shadow_piano_native_audit_summary.json) |
+
+仅一条原八音普通生成入口：无代理，初次请求62.89秒、21717服务商报告token，1代码块、0修复/超时。失败为F4重、D#4重、E4重的原生incomplete_note。含220清场动作；不是与ABC严格同条件的成功率对照。详见[请求与结果对照](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/old8_prompt_check_20261026T014940Z/result.md)。
+
+
+### 直接run_responses：A/B/C独立首轮（UTC）
+
+| 时间 | 实验版本 | Seed | 原生成功音数 | 尝试数 | 生成代码动作步 | 总原生动作步 | END | 退出码 | 原始证据 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | :---: | ---: | --- |
+| 2026-10-26 05:38:35 | `manual_direct_A_gpt61sol_300s` | 3300 | 4/6 | 6 | 1333 | 1333 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/manual_A_seed3300_smoke_rep1_20261026T053835Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/manual_A_seed3300_smoke_rep1_20261026T053835Z_1721d0f44bf544459da95679d7d656c2/shadow_piano_native_audit_summary.json) |
+| 2026-10-26 05:47:41 | `manual_direct_B_gpt61sol_300s` | 3300 | 4/6 | 6 | 1421 | 1421 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/manual_B_seed3300_smoke_rep1_20261026T054741Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/manual_B_seed3300_smoke_rep1_20261026T054741Z_57ac5f5bdc794bf0949b2e790b013de3/shadow_piano_native_audit_summary.json) |
+| 2026-10-26 05:56:06 | `manual_direct_C_gpt61sol_300s` | 3300 | 1/6 | 1 | 327 | 327 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/manual_C_seed3300_smoke_rep1_20261026T055606Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/manual_C_seed3300_smoke_rep1_20261026T055606Z_6f72337259e2483e8d70d6dd2d4fbdd5/shadow_piano_native_audit_summary.json) |
+
+六次生成/修复请求均正常返回，未发生超时，因此没有额外重试。每组均2代码块、1次修复。C只尝试首音，其他5音未尝试；三组均有公开释放计时拒绝。此为三次独立冷启动诊断，不是跨seed记忆复用对照。详见[完整统计与视频](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/manual_abc_direct_20261026T053755Z/results.md)。
+
+
+### C组双seed：3300→3301（UTC）
+
+| 时间 | 实验版本 | Seed | 原生成功音数 | 尝试数 | 生成代码动作步 | 总原生动作步 | END | 退出码 | 原始证据 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | :---: | ---: | --- |
+| 2026-10-26 07:15:23 | `C_two_seed_existing_finish` | 3300 | 4/6 | 6 | 875 | 875 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/manual_C2_seed3300_20261026T071433Z_smoke_rep1_20261026T071523Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/manual_C2_seed3300_20261026T071433Z_smoke_rep1_20261026T071523Z_0653fab20665483f97a73acaaa7453da/shadow_piano_native_audit_summary.json) |
+| 2026-10-26 07:25:17 | `C_two_seed_existing_finish` | 3301 | 5/6 | 6 | 1010 | 1010 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/manual_C2_seed3301_20261026T071433Z_smoke_rep1_20261026T072517Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/manual_C2_seed3301_20261026T071433Z_smoke_rep1_20261026T072517Z_4bf6a59ce96f4f95a6103c2325dc4ec5/shadow_piano_native_audit_summary.json) |
+
+两轮间使用已有finish_episode。3300公开finalize仅5条，未入库；3301仍重新生成。3301公开6条完成后产生有效缓存，但没有追加第三轮验证复用。本次不是记忆提升的成功对照。无API超时，无额外重跑。详见[完整双seed报告](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/manual_c_two_seed_20261026T071433Z/results.md)。
+
+### 部分经验归档与动作函数库：3300→3301（UTC）
+
+| 时间 | 实验版本 | Seed | 原生成功音数 | 尝试数 | 生成代码动作步 | 总原生动作步 | END | 退出码 | 原始证据 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | :---: | ---: | --- |
+| 2026-10-26 09:20:20 | `action_functions_preflight_503` | 3300（请求） | — | — | — | — | — | 1 | [终端](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/action_functions_3300_3301_20261026T092020Z/seed3300.terminal.log)；API预检503，未启动Kit，无原生审计 |
+| 2026-10-26 09:22:14 | `action_functions_partial_memory` | 3300 | 1/6 | 1 | 335 | 335 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/action_functions_seed3300_retry1_20261026T092020Z_smoke_rep1_20261026T092214Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/action_functions_seed3300_retry1_20261026T092020Z_smoke_rep1_20261026T092214Z_3d740cb9ef664de3acfa9001dd1f326b/shadow_piano_native_audit_summary.json) |
+| 2026-10-26 09:31:01 | `action_functions_partial_memory` | 3301 | 3/6 | 6 | 936 | 936 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/action_functions_seed3301_20261026T092020Z_smoke_rep1_20261026T093101Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/action_functions_seed3301_20261026T092020Z_smoke_rep1_20261026T093101Z_8f50181115a747f7a68f9dd3d623c099/shadow_piano_native_audit_summary.json) |
+
+本轮从空代码/参数记忆开始，只复制公开键位缓存。3300首次生成105.40秒、修复106.07秒，两段代码均过早提交释放完成，公开结束0次；不完整经验与8个实验性函数保存，有效整段策略为空。3301首次生成97.86秒、无修复，公开结束6次并END；虽收到8个旧函数卡片，源码未引用任何旧函数，而是重写策略。因此1/6→3/6和API合计211.46→97.86秒不能归因于有效代码复用。3301后三个音私有诊断为incomplete_note，该判分不参与记忆更新。
+
+两轮代码执行墙钟分别80.79和231.37秒，独立于API等待统计。HEAD与第三方视频均含音频流。GPU结束后只修正未使用旧函数的冗余拼装和索引过滤，未追加GPU试跑；无代理、gpt-6.1-sol、四物理步动作和5D模型保持。完整逐请求、源码和视频见[结果报告](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/action_functions_3300_3301_20261026T092020Z/results.md)，另保存[上一轮十seed请求耗时](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/action_functions_3300_3301_20261026T092020Z/previous10_request_timing.md)。
+
+### A组seed0–4：API403中断，尚未完成（UTC）
+
+计划显示seed0–4对应原生3300–3304。使用已有A独立配置，各seed空源码/参数记忆，关闭文字与动作函数库，仅共享公开键位缓存；gpt-6.1-sol、low、GPU0串行，无代理。控制提示、5D模型、四物理步动作和OpenTacBench保持。
+
+| 时间 | 实验版本 | Seed | 原生成功音数 | 尝试数 | 生成代码动作步 | 总原生动作步 | END | 退出码 | 原始证据 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | :---: | ---: | --- |
+| 2026-10-26 10:55:12 | `A_five_fresh_API403_incomplete` | 3300（显示0） | 1/6 | 1 | 185 | 185 | 否 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/A_five_seed3300_20261026T105417Z_smoke_rep1_20261026T105512Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/A_five_seed3300_20261026T105417Z_smoke_rep1_20261026T105512Z_409478c1b8834fbf8131ce8e7b6d660f/shadow_piano_native_audit_summary.json) |
+
+首次生成HTTP200、68.65秒；公开释放检查失败后请求修复，服务商HTTP403拒绝，称客户端异常、要求标准Codex客户端。失败修复等待约1.22秒来自run.log:170，未返回usage；总token未知，不将缺失调用记0。执行源码1代码块，代码执行46.19秒。该行属于API基础设施中断，不能作为完整A组成功率或效率样本；后五音未执行，原生3301–3304尚未启动，无额外重试。HEAD和第三方视频均保存；[五组当前状态和全部产物](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/A_fresh_3300_3304_20261026T105417Z/results.md)。

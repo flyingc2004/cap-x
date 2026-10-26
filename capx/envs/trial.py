@@ -827,6 +827,17 @@ def _add_piano_contact_audio(
         print(f"[capx-shadow] piano audio unavailable for {video_path}: {exc}", flush=True)
 
 
+def _save_third_party_video(env, base_dir, fps):
+    low = getattr(env, 'low_level_env', None)
+    getter = getattr(low, 'get_third_party_video_frames', None)
+    if not callable(getter):
+        return
+    frames = getter(clear=True)
+    if frames:
+        _write_video(frames, base_dir, suffix='combined_third', fps=fps)
+        _add_piano_contact_audio(env, base_dir, 'combined_third', 0, len(frames))
+
+
 def _save_turn_and_combined_videos(
     env: CodeExecutionEnvBase,
     config: dict[str, Any],
@@ -876,6 +887,7 @@ def _save_turn_and_combined_videos(
     # Combined video
     _write_video(all_frames, base_dir, suffix="combined", fps=fps)
     _add_piano_contact_audio(env, base_dir, "combined", 0, len(all_frames))
+    _save_third_party_video(env, base_dir, fps)
 
     # Wrist camera videos
     if config.get("use_wrist_camera") and hasattr(env, "get_wrist_video_frames"):
@@ -1104,6 +1116,10 @@ def _capture_initial_visual_feedback(
     task_description = ""
 
     use_wrist = config.get("use_wrist_camera", False)
+    if _shadow_text_only_after_key_map(config, getattr(env, "low_level_env", None)):
+        task_description = copy.deepcopy(obs["full_prompt"][-1]["content"][0]["text"])
+        print("[capx-shadow] visual_key_map_ready=1 initial image_input=0 cached calibration", flush=True)
+        return visual_feedback_imgs, visual_feedback_base64_history, task_description, raw_visual_snapshots
 
     # Direct visual prompting for this adapter uses only raw public camera
     # pixels.  In particular, do not feed the task-native video dashboard,
@@ -1414,6 +1430,9 @@ def _query_initial_code(
         (raw_code, reasoning, ensemble_data)
     """
     ensemble_data = None
+    if config.get('shadow_piano_code_memory'):
+        from capx.integrations.opentac_shadow_code_memory import initial_code
+        return initial_code(args, config, obs)
     with _suspend_sigalrm():
         if config["use_parallel_ensemble"]:
             if config.get("use_multimodel", False):
@@ -1497,6 +1516,12 @@ def _handle_multi_turn_step(
         (decision, new_code, reasoning, multiturn_ensemble_entry)
         where decision is "regenerate", "finish", or "continue".
     """
+    if config.get('shadow_piano_code_memory'):
+        from capx.integrations.opentac_shadow_code_memory import repair
+        # Detailed feedback comes from the recorded public whitelist, never
+        # arbitrary native traceback/observation payloads.
+        new_code = repair(args, config, {'trigger': 'public_code_failure_or_checkpoint'})
+        return ('regenerate', new_code, '', None, None) if new_code else ('finish', None, '', None, None)
     use_wrist = config.get("use_wrist_camera", False)
     checkpoint_marker = _visual_checkpoint_marker(info_step, config)
 
@@ -1862,6 +1887,12 @@ def _run_single_trial(
             stream_dir=stream_dir,
         )
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
+    if config.get('shadow_piano_code_memory'):
+        low = env.low_level_env
+        config['_piano_public_request'] = {k: list(low._public_sequence[k]) for k in ('notes','dynamics','hold_seconds')}
+        config['_piano_key_map_ready'] = low.visual_key_map_ready
+        config['_piano_low_level'] = {'action_repeat': low.action_repeat,
+            'digit_piano_config': str(low.digit_piano_config), 'digit_force_sidecar': str(low.digit_force_sidecar)}
     print(f"[capx-trial] trial={trial} reset end", flush=True)
     if agent_progress_path is not None:
         env.set_agent_progress_path(str(agent_progress_path.resolve()))
@@ -2043,6 +2074,7 @@ def _run_single_trial(
         action_start = _low_level_count(env, "get_action_count")
         step_start = _low_level_count(env, "get_step_count")
         block_started = time.monotonic()
+        block_returned = False
         env._interrupted_code_output = {"stdout": "", "stderr": ""}
         begin_video_turn = getattr(env, "begin_video_turn", None)
         if recording_frames and callable(begin_video_turn):
@@ -2064,6 +2096,7 @@ def _run_single_trial(
                     < int(config.get("max_regenerations", MULTITURN_LIMIT)),
                 ):
                     obs_next, reward, terminated, truncated, info_step = env.step(code)
+                block_returned = True
             except CodeBlockTimeout as exc:
                 obs_next = obs
                 reward = 0.0
@@ -2076,6 +2109,12 @@ def _run_single_trial(
                     step_start=step_start,
                 )
         finally:
+            if config.get('shadow_piano_code_memory'):
+                from capx.integrations.opentac_shadow_code_memory import record_execution_timing
+                record_execution_timing(config, block=code_block_idx,
+                    seconds=time.monotonic() - block_started, returned=block_returned,
+                    action_start=action_start, action_end=_low_level_count(env, 'get_action_count'),
+                    physics_start=step_start, physics_end=_low_level_count(env, 'get_step_count'))
             _clear_code_block_action_budget(env)
             end_video_turn = getattr(env, "end_video_turn", None)
             if recording_frames and callable(end_video_turn):
@@ -2323,6 +2362,18 @@ def _run_single_trial(
     )
 
     success = info_step["sandbox_rc"] == 0
+
+    # The parameterized-action experiment also works through plain run_responses.
+    # External suite finalization is idempotent and cannot spend a second budget.
+    if config.get('shadow_piano_code_memory'):
+        from capx.integrations.opentac_shadow_code_memory import action_memory_enabled, finish_episode
+        if action_memory_enabled(config):
+            try:
+                memory_result = finish_episode(config)
+                print('[piano-code-memory] episode archived; output_version=' +
+                    str(memory_result.get('output_version')), flush=True)
+            except Exception as exc:
+                print('[piano-code-memory] episode finalization failed: ' + str(exc), flush=True)
 
     # --- Evolving skill library integration (opt-in) ---
     if config.get("evolve_skill_library", False) and info_step.get("task_completed", False):

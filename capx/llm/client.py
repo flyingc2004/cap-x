@@ -11,7 +11,9 @@ import copy
 import contextlib
 import contextvars
 import base64
+import hashlib
 import json
+import math
 import os
 import random
 import time
@@ -20,6 +22,8 @@ import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from capx.llm.deadline import LLMRequestTimeout, deadline_metadata
+from capx.llm.usage_audit import audit_usage, summarize_accounting
 
 try:
     import requests
@@ -217,19 +221,55 @@ def _record_llm_usage(
     payload_stats: dict[str, int],
     body: Any,
     latency_seconds: float,
+    payload: dict[str, Any] | None = None,
+    error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     usage = normalize_llm_usage(body)
+    # Keep transport evidence without recording headers, credentials, prompt
+    # text, returned source, or hidden reasoning in the usage artifact.
+    request_metadata = {}
+    request_metadata.update(deadline_metadata())
+    request_metadata['http_timeout_seconds'] = _request_timeout(args)
+    if payload is not None:
+        request_metadata['payload_sha256'] = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                       separators=(',', ':')).encode('utf-8')
+        ).hexdigest()
+        reasoning = payload.get('reasoning')
+        request_metadata['reasoning_effort_requested'] = (
+            reasoning.get('effort') if isinstance(reasoning, dict)
+            else payload.get('reasoning_effort'))
+    response_metadata = {}
+    if isinstance(body, dict):
+        for key in ('id', 'model', 'status', 'max_output_tokens'):
+            if key in body and isinstance(body[key], (str, int, float, type(None))):
+                response_metadata[key] = body[key]
+        for key, field in (('reasoning', 'effort'), ('incomplete_details', 'reason')):
+            detail = body.get(key)
+            if isinstance(detail, dict) and isinstance(detail.get(field), (str, type(None))):
+                response_metadata[key + '_' + field] = detail.get(field)
+    accounting = audit_usage(usage, protocol=protocol, output_limit=int(args.max_tokens))
+    anomalies = accounting['anomalies']
+    if anomalies:
+        print('[capx-llm] usage anomaly ' + ','.join(anomalies), flush=True)
     event = {
         "schema_version": "capx_llm_usage_query.v1",
         "model": str(args.model),
         "protocol": protocol,
         "latency_seconds": round(float(latency_seconds), 6),
+        "request_wall_seconds": round(float(latency_seconds), 6),
         "request": {
             **payload_stats,
             "max_output_tokens_requested": int(args.max_tokens),
+            **request_metadata,
         },
+        "response_metadata": response_metadata,
+        "usage_anomalies": anomalies,
+        "accounting": accounting,
         "usage": usage,
     }
+    if error is not None:
+        event['error'] = error
     collector = _usage_collector.get()
     if collector is not None:
         events, phase = collector
@@ -257,6 +297,34 @@ def _sum_request_field(events: list[dict[str, Any]], field: str) -> int:
     )
 
 
+def summarize_llm_latency(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Locally measured blocking API time, not provider-only reasoning time.
+
+    Include unsuccessful requests. Missing historical measurements stay unknown;
+    an actual cache hit with no requests is a known zero. Calls can overlap in
+    ensemble mode, so their sum must not be subtracted from episode wall time.
+    """
+    rows = []
+    for i, event in enumerate(events, 1):
+        value = event.get('request_wall_seconds', event.get('latency_seconds'))
+        valid = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+        rows.append({'query': i, 'phase': event.get('request', {}).get('phase') or event.get('phase', 'unknown'),
+            'collector_phase': event.get('phase', 'unknown'),
+            'seconds': round(float(value), 6) if valid else None,
+            'failed': bool(event.get('error')),
+            'basis': 'request_wall' if 'request_wall_seconds' in event else 'legacy_http_wait'})
+    def stats(group):
+        values = [x['seconds'] for x in group if x['seconds'] is not None]
+        return {'query_count': len(group), 'measured_count': len(values),
+            'sum_seconds': round(sum(values), 6) if len(values) == len(group) else None,
+            'known_sum_seconds': round(sum(values), 6),
+            'mean_seconds': round(sum(values) / len(values), 6) if values else None,
+            'max_seconds': max(values) if values else None}
+    return {**stats(rows), 'by_phase': {phase: stats([x for x in rows if x['phase'] == phase])
+            for phase in sorted({x['phase'] for x in rows})}, 'queries': rows,
+        'scope': 'Blocking API wall time including transport, provider queue/compute and retries; not isolated model reasoning time. Query sums are not episode wall time.'}
+
+
 def summarize_llm_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
     """Build a JSON-safe per-trial usage artifact from recorded query events."""
     normalized_events = [event for event in events if isinstance(event, dict)]
@@ -267,7 +335,13 @@ def summarize_llm_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
         "cached_input_tokens",
         "total_tokens",
     )
-    totals = {field: _sum_known_token_field(normalized_events, field) for field in fields}
+    known_totals = {field: _sum_known_token_field(normalized_events, field) for field in fields}
+    totals = {field:known_totals[field] if all(isinstance(e.get('usage',{}).get(field),int)
+              for e in normalized_events) else None for field in fields}
+    if not normalized_events:
+        # No request is a known zero, distinct from an unreported request.
+        totals = {field: 0 for field in fields}
+        known_totals = dict(totals)
     request_fields = (
         "image_items",
         "image_bytes",
@@ -293,6 +367,9 @@ def summarize_llm_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(event.get("usage"), dict)
         ),
         "totals": totals,
+        "known_reported_totals": known_totals,
+        "timing": summarize_llm_latency(normalized_events),
+        "accounting": summarize_accounting(normalized_events),
         "request_totals": {
             field: _sum_request_field(normalized_events, field)
             for field in request_fields
@@ -303,7 +380,9 @@ def summarize_llm_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "protocol": protocol,
                 "query_count": len(model_events),
                 "totals": {
-                    field: _sum_known_token_field(model_events, field) for field in fields
+                    field: _sum_known_token_field(model_events, field)
+                    if all(isinstance(e.get('usage',{}).get(field),int) for e in model_events)
+                    else None for field in fields
                 },
                 "request_totals": {
                     field: _sum_request_field(model_events, field)
@@ -314,8 +393,8 @@ def summarize_llm_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
         ],
         "queries": normalized_events,
         "billing_note": (
-            "Counts are reported by the provider. No monetary estimate is computed "
-            "because endpoint-specific token prices are not configured."
+            "Raw provider reports are preserved, not independently verified. "
+            "Review accounting discrepancies before cost comparisons. No monetary estimate is computed."
         ),
     }
 
@@ -331,6 +410,43 @@ class ModelQueryArgs:
     max_tokens: int = 4096
     reasoning_effort: str = "medium"
     debug: bool = False
+    request_timeout_seconds: float | None = None
+
+
+def _request_timeout(args):
+    value = getattr(args, 'request_timeout_seconds', None)
+    return float(value if value is not None else os.getenv('CAPX_LLM_TIMEOUT_SECONDS', '200'))
+
+
+def _record_llm_failure(*, args, protocol, payload_stats, payload, exc, started):
+    event = _record_llm_usage(args=args, protocol=protocol, payload_stats=payload_stats,
+        body={}, latency_seconds=time.monotonic()-started, payload=payload,
+        error={'type':type(exc).__name__, 'source':exc.source, 'phase':exc.phase,
+               'limit_seconds':exc.timeout_seconds, 'elapsed_seconds':exc.elapsed_seconds})
+    print('[capx-llm] request failed ' + str(exc), flush=True)
+    return event
+
+
+def _final_request_failure(*, args, protocol, payload_stats, payload, exc, started, timeout):
+    if isinstance(exc, LLMRequestTimeout):
+        failure = exc
+    else:
+        is_timeout = isinstance(exc, TimeoutError) or (
+            isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError))
+        if requests is not None:
+            is_timeout = is_timeout or isinstance(exc, requests.exceptions.Timeout)
+        if not is_timeout:
+            raise exc
+        active = deadline_metadata()
+        collector = _usage_collector.get()
+        failure = LLMRequestTimeout(source='transport_timeout',
+            phase=active.get('phase') or (collector[1] if collector else 'model_query'),
+            timeout_seconds=timeout, elapsed_seconds=time.monotonic()-started)
+    _record_llm_failure(args=args, protocol=protocol, payload_stats=payload_stats,
+        payload=payload, exc=failure, started=started)
+    if failure is exc:
+        raise failure
+    raise failure from exc
 
 
 class LLMQueryError(RuntimeError):
@@ -832,8 +948,9 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict
     elif os.getenv("OPENAI_API_KEY") is not None and args.model in GPT_MODELS:
         headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY')}"
     start_time = time.time()
+    monotonic_start = time.monotonic()
 
-    request_timeout = float(os.getenv("CAPX_LLM_TIMEOUT_SECONDS", "200"))
+    request_timeout = _request_timeout(args)
     max_retries = max(0, int(os.getenv("CAPX_LLM_MAX_RETRIES", "1")))
     retry_sleep = float(os.getenv("CAPX_LLM_RETRY_SLEEP_SECONDS", "10"))
     payload_stats = _payload_stats(payload)
@@ -880,9 +997,13 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict
                 timeout=request_timeout,
             )
             break
+        except LLMRequestTimeout as exc:
+            _final_request_failure(args=args, protocol=protocol, payload_stats=payload_stats,
+                payload=payload, exc=exc, started=monotonic_start, timeout=request_timeout)
         except (TimeoutError, urllib.error.URLError, OSError) as exc:
             if retry >= max_retries:
-                raise
+                _final_request_failure(args=args, protocol=protocol, payload_stats=payload_stats,
+                    payload=payload, exc=exc, started=monotonic_start, timeout=request_timeout)
             retry += 1
             sleep_time = retry_sleep + random.uniform(0, min(2.0, retry_sleep))
             print(
@@ -901,7 +1022,8 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict
             if not is_request_error:
                 raise
             if retry >= max_retries:
-                raise
+                _final_request_failure(args=args, protocol=protocol, payload_stats=payload_stats,
+                    payload=payload, exc=exc, started=monotonic_start, timeout=request_timeout)
             retry += 1
             sleep_time = retry_sleep + random.uniform(0, min(2.0, retry_sleep))
             print(
@@ -1003,7 +1125,8 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict
         protocol=protocol,
         payload_stats=payload_stats,
         body=body,
-        latency_seconds=end_time - start_time,
+        latency_seconds=time.monotonic() - monotonic_start,
+        payload=payload,
     )
     return out  # type: ignore[return-value]
 
