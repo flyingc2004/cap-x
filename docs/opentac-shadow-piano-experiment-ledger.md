@@ -1,6 +1,6 @@
 # Shadow Hand 钢琴实验：成功音数与动作步数
 
-当前索引：129 次运行；110 次有可读原生计分和动作审计。其余保留在表中，缺失值用“—”表示，不按 0 处理。
+当前索引：137 次运行；118 次有可读原生计分和动作审计。其余保留在表中，缺失值用“—”表示，不按 0 处理。
 
 ## 统计口径
 
@@ -312,3 +312,26 @@ B在五个seed均高于A；C相对A两组提高、两组持平、一组下降，
 有效两条API请求为0；首份源码生成请求发生在单列的接线诊断中，不能把生成成本当0。56项相关CPU检查及补充透传检查通过；四份视频均含音频。未追加试验、未按成绩换源码、未修改OpenTacBench。
 
 [完整报告、技能快照、全部视频及私有力图](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/C_tactile_skill_pair_20261027T014842Z/results.md)。
+
+### C触觉参数技能：四个新seed的冻结记忆复测（2026-10-27 北京时间）
+
+保持运行代码、5D估计器、检索阈值及控制条件不变，已有run_responses在GPU0串行跑3301–3304，每seed空库/记忆各一次。两边均只读，冻结控制源码5b577958b50d3f238bac286002cf48f666b06ee6d2677cad2693f0f9c139b7a0，记忆仅为3300的F4白键轻音经验。没有重新生成代码、无整组重试或按得分筛选。
+
+| 终端结束北京时间 | 条件 | seed | 原生成功/6 | 尝试 | 生成/清场动作 | 代码块 | 命中/实际采用 | END | 退出码 | 证据 |
+|---|---|---:|---:|---:|---|---:|---|---|---:|---|
+| 2026-10-27 12:41:27 +08:00 | empty | 3301 | 3/6 | 6 | 1164/0 | 1 | 0/0 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/C_tactile_transfer_empty_seed3301_20261027T043600Z_smoke_rep1_20261027T043600Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/C_tactile_transfer_empty_seed3301_20261027T043600Z_smoke_rep1_20261027T043600Z_1c79ea1f87824e64b903b82c6fc8556d/shadow_piano_native_audit_summary.json) |
+| 2026-10-27 12:46:58 +08:00 | memory | 3301 | 3/6 | 6 | 1164/0 | 1 | 1/1 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/C_tactile_transfer_memory_seed3301_20261027T043600Z_smoke_rep1_20261027T044127Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/C_tactile_transfer_memory_seed3301_20261027T043600Z_smoke_rep1_20261027T044127Z_27297c58f9784b7c84bd80cde449561d/shadow_piano_native_audit_summary.json) |
+| 2026-10-27 12:52:49 +08:00 | empty | 3302 | 4/6 | 6 | 1281/0 | 1 | 0/0 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/C_tactile_transfer_empty_seed3302_20261027T043600Z_smoke_rep1_20261027T044658Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/C_tactile_transfer_empty_seed3302_20261027T043600Z_smoke_rep1_20261027T044658Z_710433e2db4a46a6bb0bbd31ce7e50f6/shadow_piano_native_audit_summary.json) |
+| 2026-10-27 12:58:50 +08:00 | memory | 3302 | 4/6 | 6 | 1281/0 | 1 | 1/1 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/C_tactile_transfer_memory_seed3302_20261027T043600Z_smoke_rep1_20261027T045249Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/C_tactile_transfer_memory_seed3302_20261027T043600Z_smoke_rep1_20261027T045249Z_b6a403ee2da140ec8d9c8b4dd02ebdce/shadow_piano_native_audit_summary.json) |
+| 2026-10-27 13:04:37 +08:00 | empty | 3303 | 5/6 | 6 | 1275/0 | 1 | 0/0 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/C_tactile_transfer_empty_seed3303_20261027T043600Z_smoke_rep1_20261027T045850Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/C_tactile_transfer_empty_seed3303_20261027T043600Z_smoke_rep1_20261027T045850Z_5b99703d69494367809253b32b591266/shadow_piano_native_audit_summary.json) |
+| 2026-10-27 13:10:38 +08:00 | memory | 3303 | 5/6 | 6 | 1275/0 | 1 | 0/0 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/C_tactile_transfer_memory_seed3303_20261027T043600Z_smoke_rep1_20261027T050437Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/C_tactile_transfer_memory_seed3303_20261027T043600Z_smoke_rep1_20261027T050437Z_e6d66d36a1f24304bafe32c01eec9de7/shadow_piano_native_audit_summary.json) |
+| 2026-10-27 13:16:30 +08:00 | empty | 3304 | 4/6 | 6 | 1238/0 | 1 | 0/0 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/C_tactile_transfer_empty_seed3304_20261027T043600Z_smoke_rep1_20261027T051038Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/C_tactile_transfer_empty_seed3304_20261027T043600Z_smoke_rep1_20261027T051038Z_9f99490dbc04478e91e4eaac10f98f72/shadow_piano_native_audit_summary.json) |
+| 2026-10-27 13:22:13 +08:00 | memory | 3304 | 4/6 | 6 | 1238/0 | 1 | 0/0 | 是 | 1 | [日志](/mnt/data/ljz/opentacbench/capx-runs/C_tactile_transfer_memory_seed3304_20261027T043600Z_smoke_rep1_20261027T051630Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/C_tactile_transfer_memory_seed3304_20261027T043600Z_smoke_rep1_20261027T051630Z_e85101ad3d424acf8528482adc2384cc/shadow_piano_native_audit_summary.json) |
+
+逐seed配对：3301为3/6、1164步；3302为4/6、1281步；3303为5/6、1275步；3304为4/6、1238步，两条件均相同。每次六音尝试、一个代码块并END，均无代码异常；退出码1来自未全对。
+
+3301在273步查询、274步首次动作差异；3302在961步查询、962步首次动作差异；两者匹配前目标逐帧一致，分别实际采用一次。3303/3304没有白键轻音，均无命中且动作目标全程逐帧一致。输入库哈希前后不变，八条API请求均0，16份HEAD/第三方视频均含音轨。
+
+离线实测力：匹配后同物理窗口MAE，3301/F4轻0.022578→0.021407 N（约−5.18%），3302/C4轻0.021651→0.020680 N（约−4.48%）。绝对变化约0.001 N，仅两个有匹配新seed、每seed一对，不作统计显著性或整体策略提升结论。全部原生失败均为重音，当前库没有重音技能。未修改OpenTacBench、估计器或运行代码；未追加实验。
+
+[完整逐音报告、动作证据、16份视频及对照图](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/C_tactile_skill_transfer_3301_3304_20261027T043600Z/results.md)。
