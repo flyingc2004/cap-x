@@ -197,6 +197,7 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         else configs_dict.get("use_oracle_code", False),
         "resume_idx": configs_dict.get("resume_idx", None),
         "shadow_piano_code_memory": configs_dict.get("shadow_piano_code_memory"),
+        "shadow_piano_tactile_skill_pilot": configs_dict.get("shadow_piano_tactile_skill_pilot", False),
         "shadow_piano_action_memory": configs_dict.get("shadow_piano_action_memory", False),
         "shadow_piano_memory_policy": shadow_memory_policy,
         "shadow_piano_code_memory_read_only": bool(configs_dict.get("shadow_piano_code_memory_read_only", False))

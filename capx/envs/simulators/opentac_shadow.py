@@ -54,6 +54,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         public_episode_recording: bool = False,
         require_public_release: bool = False,
         third_party_video: bool = False,
+        tactile_skill_memory_path: str | None = None,
+        tactile_skill_memory_mode: str = 'collect',
     ) -> None:
         super().__init__()
         self.univtac_root = Path(univtac_root).expanduser().resolve()
@@ -66,6 +68,9 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self.public_episode_recording = bool(public_episode_recording)
         self.require_public_release = bool(require_public_release)
         self.third_party_video = bool(third_party_video)
+        self.tactile_skill_memory_path = Path(tactile_skill_memory_path) if tactile_skill_memory_path else None
+        self.tactile_skill_memory_mode = tactile_skill_memory_mode
+        self._tactile_skill_memory = None
         self._release_ready_since = None
         self._keyboard_calibration = None
         self._cached_key_targets = {}
@@ -302,6 +307,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         Image.fromarray(self.get_index_tactile_rgb()).save(self._output_dir / filename)
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        self._tactile_skill_memory = None
         explicit_seed = getattr(self, "task_seed", None)
         actual_seed = explicit_seed if explicit_seed is not None else (self.seed_base if seed is None else self.seed_base + int(seed))
         self._visual_key_map_ready = False
@@ -477,6 +483,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             else:
                 self._release_ready_since = None
         self._sample_public_force_depth()
+        if getattr(self, '_tactile_skill_memory', None) is not None:
+            self._tactile_skill_memory.observe_action(self._action.tolist(), self._sim_step_count)
         self._write_native_event("action")
         if self.visual_key_mode:
             self._write_private_force_audit("action")
@@ -532,6 +540,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
                     'and wrist Z within 0.002 m of 0.04 m continuously for >=0.12 s; keep advancing bounded release actions')
         self._native_info = self._task.finish_piano_note_attempt(index)
         self._public_attempts_finalized += 1
+        if getattr(self, '_tactile_skill_memory', None) is not None:
+            self._tactile_skill_memory.next_attempt()
         self._write_public_event("attempt_finalized", index=index,
             release_verified=bool(getattr(self, 'require_public_release', False)))
         self._release_ready_since = None
@@ -653,6 +663,41 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             estimator.observe_frame(tactile.depth_m, tactile.reference_depth_m,
                                     physics_step=self._task.step_count)
 
+    def _ensure_tactile_skill_memory(self):
+        if self.tactile_skill_memory_path is None:
+            raise RuntimeError('Tactile skill memory is not enabled')
+        if self._tactile_skill_memory is None:
+            from capx.integrations.opentac_shadow_code_memory import PublicTactileSkillMemory
+            signature={'sensor':self._force_estimator.sidecar['sensor_sha256'],
+                'force_model':hashlib.sha256(Path(self.digit_force_sidecar).read_bytes()).hexdigest(),
+                'action_repeat':self.action_repeat,'physics_hz':240,'features':5}
+            session=json.loads((self._output_dir/'piano_code_memory_session.json').read_text(encoding='utf-8'))
+            signature['controller_source']=session['executed_version']
+            self._tactile_skill_memory=PublicTactileSkillMemory(self.tactile_skill_memory_path,
+                signature,self._force_estimator.sidecar['models'],self.tactile_skill_memory_mode,
+                self._write_public_event)
+        return self._tactile_skill_memory
+
+    def _tactile_skill_context(self, note, dynamics, probe_z_m):
+        from capx.integrations.opentac_shadow_vision import parse_note
+        i=self._public_attempts_finalized
+        if i>=len(self.piano_notes) or parse_note(note)[0]!=parse_note(self.piano_notes[i])[0] or dynamics!=self.piano_dynamics[i]:
+            raise ValueError('Tactile skill context must match the current public request')
+        if not isinstance(probe_z_m,(int,float)) or not np.isfinite(probe_z_m):
+            raise ValueError('Invalid public probe height')
+        return 'black' if parse_note(note)[1] else 'white'
+
+    def query_tactile_skill(self, note, dynamics, probe_z_m):
+        color=self._tactile_skill_context(note,dynamics,probe_z_m)
+        return self._ensure_tactile_skill_memory().query(str(note),dynamics,color,
+            float(probe_z_m),self._sim_step_count)
+
+    def record_tactile_skill(self, note, dynamics, probe_z_m, function_name):
+        color=self._tactile_skill_context(note,dynamics,probe_z_m)
+        session=json.loads((self._output_dir/'piano_code_memory_session.json').read_text(encoding='utf-8'))
+        return self._ensure_tactile_skill_memory().record(str(note),dynamics,color,
+            float(probe_z_m),session['source'],function_name,self._sim_step_count,self._output_dir.name)
+
     def estimate_key_force(self, note: str | int) -> dict[str, Any]:
         if not self.visual_key_mode or self._force_estimator is None:
             raise RuntimeError("DIGIT key-force calibration is not enabled")
@@ -663,7 +708,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             return {"estimated_key_force_N": None, "sample_step": None,
                     "age_steps": None, "quality": "unavailable",
                     "calibration_version": self._force_estimator.sidecar["schema"]}
-        diagnostics = {} if self._output_dir is not None else None
+        diagnostics = {} if self._output_dir is not None or getattr(self,'tactile_skill_memory_path',None) is not None else None
         estimate = self._force_estimator.predict(
             tactile.depth_m, tactile.reference_depth_m,
             color="black" if black else "white",
@@ -673,6 +718,11 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         )
         self._write_public_event("force_estimate", note=str(note), estimate=estimate,
                                  target=self._action.tolist(), hand_state=self.get_observation()["hand_state"])
+        if getattr(self,'tactile_skill_memory_path',None) is not None:
+            i=self._public_attempts_finalized
+            self._ensure_tactile_skill_memory().observe(str(note),self.piano_dynamics[i],
+                estimate,diagnostics.get('features'),self._sim_step_count,self._task.step_count,
+                self._action.tolist(),self.get_observation()['hand_state'])
         if self._output_dir is not None:
             truth = float(np.asarray(tactile.key_forces())[midi - 21])
             snapshot = (f"shadow_digit_ood_depth_{self._sim_step_count}_{midi}.npz"

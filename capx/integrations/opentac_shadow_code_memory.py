@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import symtable
 import textwrap
+import numpy as np
 
 from capx.integrations.opentac_shadow_keyboard import atomic_json
 from capx.integrations.opentac_shadow_online_skills import public_evidence
@@ -69,7 +70,7 @@ submission before advancing completed. A completed counter alone is not evidence
 
 PUBLIC_FUNCTIONS = {'get_keyboard_endpoints', 'locate_visual_keys', 'get_hand_state',
     'move_shadow_index', 'wait_steps', 'get_index_tactile_rgb', 'estimate_key_force',
-    'finish_piano_note_attempt'}
+    'finish_piano_note_attempt', 'query_tactile_skill', 'record_tactile_skill'}
 
 
 def action_memory_enabled(config):
@@ -87,6 +88,9 @@ def digest(value):
 
 def memory_policy(config):
     """Validate explicit comparison policies; retain legacy suite behavior."""
+    if config.get('shadow_piano_tactile_skill_pilot'):
+        return {'arm': 'C_tactile_pilot', 'mode': 'frozen',
+            'post_episode_repair': False, 'optimize_actions_on_repair': False}
     raw = config.get('shadow_piano_memory_policy')
     if raw is None:
         return {'arm': None, 'mode': 'adaptive', 'post_episode_repair': True, 'optimize_actions_on_repair': False}
@@ -536,6 +540,9 @@ def initial_code(args,config,obs):
         if session.get('assembly_error'): raise ValueError(session['assembly_error'])
         source=validate_source(source)
         session['source']=source;session['executed_version']=digest(source);atomic_json(_session_path(config),session)
+        if config.get('shadow_piano_tactile_skill_pilot') and record is None:
+            store_version(root,source,signature,None,{},'pending_public_execution',
+                {'basis':'frozen_before_execution_for_tactile_memory_pair'})
         if policy['mode'] == 'adaptive' and not config.get('shadow_piano_code_memory_read_only'):
             archive_proposal(config, source, 'initial')
         return wrapped(source,request,session['parameters']),reasoning,None
@@ -547,6 +554,9 @@ def initial_code(args,config,obs):
 
 
 def repair(args,config,extra=None):
+    if config.get('shadow_piano_tactile_skill_pilot'):
+        print('[piano-code-memory] tactile pilot freezes source; no repair request', flush=True)
+        return None
     if config.get('shadow_piano_code_memory_read_only'):
         return None
     path=_session_path(config);session=json.loads(path.read_text())
@@ -803,3 +813,120 @@ def finish_episode(config):
     result['finalized_evidence'] = evidence_id()
     atomic_json(run/'piano_code_memory_result.json',result)
     return result
+
+
+class PublicTactileSkillMemory:
+    """Small public-only contact-signature -> bounded controller-parameter memory.
+
+    A process reads one immutable input snapshot. Collection writes proposals
+    for the NEXT episode; no cold-run retrieval can see its own new entries.
+    """
+    schema = 'shadow_digit_tactile_skill_memory.v1'
+
+    def __init__(self, path, signature, models, mode, emit):
+        if mode not in ('collect', 'reuse'):
+            raise ValueError('Tactile skill mode must be collect or reuse')
+        self.path=Path(path);self.signature=signature;self.models=models
+        self.mode=mode;self.emit=emit;self.samples=[];self.pending=None
+        self.proposals=[];self.applied=set()
+        data=json.loads(self.path.read_text(encoding='utf-8')) if self.path.exists() else {
+            'schema':self.schema,'signature':signature,'entries':[]}
+        if data.get('schema')!=self.schema or data.get('signature')!=signature:
+            raise ValueError('Incompatible tactile skill memory')
+        self.entries=data['entries']
+        if not isinstance(self.entries,list) or len(self.entries)>16:
+            raise ValueError('Invalid tactile skill entry list')
+        self.emit('tactile_memory_loaded', mode=mode, input_entries=len(self.entries),
+                  input_hash=digest(json.dumps(data,sort_keys=True)))
+
+    def next_attempt(self):
+        self.samples=[];self.pending=None
+
+    def observe(self, note, dynamics, estimate, features, step, physics_step, action, hand):
+        row={'note':note,'dynamics':dynamics,'step':int(step),'physics_step':int(physics_step),
+             'quality':estimate.get('quality'),'force':estimate.get('estimated_key_force_N'),
+             'features':features,'action':list(action),
+             'actual_flexion':hand.get('index_flexion_rad')}
+        self.samples.append(row)
+        if len(self.samples)>96:self.samples.pop(0)
+        if row['quality']!='ok':self.pending=None
+
+    def _signature_vector(self):
+        good=[r for r in self.samples if r['quality']=='ok' and r['features'] is not None]
+        # The entry phase is the first three valid contact observations, not
+        # the later force-optimized hold. Match the same phase on retrieval.
+        if len(good)<3:return None
+        value=np.asarray([r['features'] for r in good[:3]],float)
+        return np.median(value,axis=0) if value.shape==(3,5) and np.isfinite(value).all() else None
+
+    def query(self, note, dynamics, color, probe_z, step):
+        self.pending=None
+        vector=self._signature_vector()
+        if vector is None:return {'status':'collecting','skill_id':None}
+        if not self.samples or self.samples[-1]['step']!=step or self.samples[-1]['quality']!='ok':
+            return {'status':'unavailable','skill_id':None}
+        if self.mode=='collect':
+            self.emit('tactile_skill_query', status='empty', note=note, dynamics=dynamics,
+                      features=vector.tolist())
+            return {'status':'empty','skill_id':None}
+        iqr=np.asarray(self.models[color]['iqr'],float)
+        candidates=[]
+        for entry in self.entries:
+            if entry['color']!=color or entry['dynamics']!=dynamics:continue
+            delta=np.abs((vector-np.asarray(entry['entry_features'],float))/iqr)
+            distance=float(np.sqrt(np.mean(delta**2)))
+            if distance<=1.0 and float(delta.max())<=3.0:candidates.append((distance,entry))
+        if not candidates:
+            self.emit('tactile_skill_query',status='miss',note=note,dynamics=dynamics,features=vector.tolist())
+            return {'status':'miss','skill_id':None}
+        distance,entry=min(candidates,key=lambda x:x[0])
+        correction=float(entry['z_correction_m'])
+        if not np.isfinite(correction) or abs(correction)>.001:
+            raise ValueError('Unsafe stored tactile skill correction')
+        self.pending={'skill_id':entry['skill_id'],'recommended_z':probe_z+correction,
+                      'probe_z':probe_z,'queried_step':step}
+        self.emit('tactile_skill_query',status='matched',note=note,dynamics=dynamics,
+                  skill_id=entry['skill_id'],distance=distance,features=vector.tolist(),
+                  z_correction_m=correction,source_version=entry['source_version'])
+        return {'status':'matched','skill_id':entry['skill_id'],'distance':distance,
+                'z_correction_m':correction,'source_version':entry['source_version'],
+                'function_name':entry['function_name']}
+
+    def observe_action(self, action, step):
+        if self.pending is None or step<=self.pending['queried_step']:return
+        target=float(action[2]);p=self.pending
+        if action[3]>=.495 and abs(target-p['recommended_z'])<=2.e-6 and p['skill_id'] not in self.applied:
+            self.applied.add(p['skill_id'])
+            self.emit('tactile_skill_applied',**p,applied_step=step,target=list(action),
+                      nonzero_correction=abs(target-p['probe_z'])>1.e-7)
+
+    def record(self, note, dynamics, color, probe_z, source, function_name, step, run_id):
+        if self.mode!='collect':return {'stored':False,'reason':'reuse_snapshot_is_read_only'}
+        vector=self._signature_vector();recent=self.samples[-9:]
+        if vector is None or len(recent)!=9:return {'stored':False,'reason':'insufficient_public_history'}
+        gate,upper={'white_light':(.311,.42),'white_heavy':(.473,.57),
+                    'black_light':(.615,.84),'black_heavy':(1.04,1.14)}[color+'_'+dynamics]
+        qualifies=all(r['note']==note and r['dynamics']==dynamics and r['quality']=='ok'
+            and isinstance(r['force'],(int,float)) and np.isfinite(r['force'])
+            and gate<r['force']<upper and r['actual_flexion'] is not None
+            and r['actual_flexion']>=.495 for r in recent)
+        consecutive=all(b['step']==a['step']+1 for a,b in zip(recent,recent[1:]))
+        if not qualifies or not consecutive or recent[-1]['step']!=step or (
+                recent[-1]['physics_step']-recent[0]['physics_step'])/240<.12:
+            return {'stored':False,'reason':'public_hold_not_observed'}
+        functions=[n for n in ast.walk(ast.parse(source)) if isinstance(n,ast.FunctionDef) and n.name==function_name]
+        if len(functions)!=1:return {'stored':False,'reason':'unknown_controller_function'}
+        correction=float(np.median([r['action'][2]-probe_z for r in recent]))
+        if abs(correction)>.001:return {'stored':False,'reason':'correction_outside_fixed_bounds'}
+        entry={'note_source':note,'color':color,'dynamics':dynamics,'entry_features':vector.tolist(),
+            'z_correction_m':correction,'function_name':function_name,'source_version':digest(source),
+            'function_hash':digest(ast.dump(functions[0])), 'source_run':run_id,
+            'hold_start_step':recent[0]['step'],'hold_end_step':step,
+            'status':'public_hold_observed_not_native_verdict'}
+        entry['skill_id']=digest(json.dumps(entry,sort_keys=True))
+        if not any(e['color']==color and e['dynamics']==dynamics for e in self.proposals):
+            self.proposals.append(entry)
+            atomic_json(self.path,{'schema':self.schema,'signature':self.signature,'entries':self.proposals})
+            self.emit('tactile_skill_recorded',**entry)
+            return {'stored':True,'skill_id':entry['skill_id']}
+        return {'stored':False,'reason':'class_already_recorded'}

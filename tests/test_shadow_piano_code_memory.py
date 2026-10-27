@@ -16,6 +16,58 @@ SOURCE='''def run_piano(request, piano_state):
 '''
 
 
+def test_tactile_memory_pairs_contact_signature_with_public_hold_and_actual_application(tmp_path):
+    path=tmp_path/'tactile.json';events=[]
+    emit=lambda kind,**row:events.append({'kind':kind,**row})
+    models={'white':{'iqr':[1.]*5},'black':{'iqr':[1.]*5}}
+    cold=mem.PublicTactileSkillMemory(path,{},models,'collect',emit)
+    def feed(bank):
+        for step in range(1,10):
+            bank.observe('F4','light',{'quality':'ok','estimated_key_force_N':.35},
+                [1.]*5,step,step*4,[0,0,.0102,.5],{'index_flexion_rad':.5})
+    feed(cold)
+    assert cold.query('F4','light','white',.01,9)['status']=='empty'
+    src='def press_and_hold():\n    return 1\n'+SOURCE
+    assert cold.record('F4','light','white',.01,src,'press_and_hold',9,'cold')['stored']
+    assert cold.query('F4','light','white',.01,9)['status']=='empty'
+    warm=mem.PublicTactileSkillMemory(path,{},models,'reuse',emit)
+    feed(warm)
+    answer=warm.query('F4','light','white',.02,9)
+    assert answer['status']=='matched' and answer['z_correction_m']==pytest.approx(.0002)
+    warm.observe_action([0,.3,.0202,.5],10)
+    assert any(e['kind']=='tactile_skill_applied' and e['nonzero_correction'] for e in events)
+    before=path.read_bytes()
+    assert not warm.record('F4','light','white',.01,src,'press_and_hold',9,'warm')['stored']
+    assert path.read_bytes()==before
+    warm.next_attempt();feed(warm)
+    warm.samples[0]['features']=[100.]*5;warm.samples[1]['features']=[100.]*5
+    assert warm.query('F4','light','white',.02,9)['status']=='miss'
+
+
+def test_tactile_memory_rejects_incomplete_or_invalid_hold(tmp_path):
+    bank=mem.PublicTactileSkillMemory(tmp_path/'memory.json',{},
+        {'white':{'iqr':[1.]*5}},'collect',lambda *a,**kw:None)
+    for step in range(1,10):
+        bank.observe('F4','light',{'quality':'ood' if step==5 else 'ok','estimated_key_force_N':.35},
+            [1.]*5,step,step*4,[0,0,0,.5],{'index_flexion_rad':.5})
+    assert not bank.record('F4','light','white',0,SOURCE,'run_piano',9,'cold')['stored']
+    assert not bank.path.exists()
+
+
+def test_tactile_pilot_freezes_first_controller_before_execution_and_skips_repairs(tmp_path,monkeypatch):
+    asset=tmp_path/'asset';asset.write_text('fixed');calls=[]
+    cfg={'shadow_piano_tactile_skill_pilot':True,'shadow_piano_code_memory':str(tmp_path/'cache'),
+         'output_dir':str(tmp_path/'run'),'_piano_public_request':{'notes':['F4']},
+         '_piano_low_level':{'action_repeat':4,'digit_piano_config':str(asset),'digit_force_sidecar':str(asset)}}
+    monkeypatch.setattr(mem,'_query',lambda *a,**kw:calls.append(1) or {'content':SOURCE})
+    mem.initial_code(SimpleNamespace(),cfg,{'full_prompt':[]})
+    active=(tmp_path/'cache'/'active.json').read_bytes()
+    assert mem.repair(SimpleNamespace(),cfg) is None
+    cfg['output_dir']=str(tmp_path/'warm')
+    mem.initial_code(SimpleNamespace(),cfg,{'full_prompt':[]})
+    assert calls==[1] and (tmp_path/'cache'/'active.json').read_bytes()==active
+
+
 def test_cached_module_accepts_new_requests_and_resets_progress():
     source=mem.validate_source(SOURCE)
     for notes in [['C4','D4'],['F#4','B4','C4']]:
@@ -444,6 +496,10 @@ def test_action_memory_config_reaches_runtime(monkeypatch,tmp_path):
     monkeypatch.setenv('CAPX_SHADOW_ACTION_MEMORY','false')
     _,cfg,_=_load_config(LaunchArgs(config_path='env_configs/opentac/play_piano_shadow_digit_code_memory.yaml'))
     assert not mem.action_memory_enabled(cfg)
+    monkeypatch.setenv('CAPX_TACTILE_SKILL_MEMORY',str(tmp_path/'tactile.json'))
+    _,cfg,_=_load_config(LaunchArgs(config_path='env_configs/opentac/play_piano_shadow_digit_tactile_skill_pilot.yaml'))
+    assert cfg['shadow_piano_tactile_skill_pilot'] is True
+    assert mem.memory_policy(cfg)['mode']=='frozen'
 
 
 def test_timing_keeps_execution_separate_and_chooses_one_usage_snapshot(tmp_path):

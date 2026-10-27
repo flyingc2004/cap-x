@@ -1,6 +1,6 @@
 # Shadow Hand 钢琴实验：成功音数与动作步数
 
-当前索引：126 次运行；108 次有可读原生计分和动作审计。其余保留在表中，缺失值用“—”表示，不按 0 处理。
+当前索引：129 次运行；110 次有可读原生计分和动作审计。其余保留在表中，缺失值用“—”表示，不按 0 处理。
 
 ## 统计口径
 
@@ -296,3 +296,19 @@ A来自manual_A_0_4_20261026T135957Z，B/C来自client_sse_BC_3300_3304_20261026
 B在五个seed均高于A；C相对A两组提高、两组持平、一组下降，不能仅因C低于B就否认相对无记忆A的局部提升。A/C3300只尝试一音，不用于完整六音动作效率比较。C3302–3304零请求属真实跳过API；非零耗时含协议/排队差异，不证明推理能力提升，token需核对。没有追加实验、筛选原生得分或修改任务。
 
 [完整逐seed对照及限制](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/client_sse_BC_3300_3304_20261026T183404Z/results.md)。
+
+### C触觉技能冷启动／复用配对（2026-10-27 UTC）
+
+使用已有run_responses串行，两条有效执行固定同一份LLM上层代码及seed3300。冷启动空触觉记忆，复用读取冷启动公开保持得到的一条白键轻音技能。数据盘保留首份源码、5D接触特征、函数哈希、候选参数及真实力离线审计。原生标签不输入检索或模型。
+
+| 版本 | seed | 原生成功/6 | 尝试 | 生成/清场动作 | 代码块 | END | 退出码 | 证据 |
+|---|---:|---:|---:|---|---:|---|---:|---|
+| 接线中断，不纳入控制比较 | 3300 | — | — | — | — | 否 | 137 | [日志](/mnt/data/ljz/opentacbench/capx-runs/C_tactile_skill_cold_seed3300_20261027T014444Z_smoke_rep1_20261027T014444Z/run.log)；pilot开关漏透传，停止本次进程后保留首份模型源码 |
+| 空记忆冷启动 | 3300 | 6/6 | 6 | 1143/0 | 1 | 是 | 0 | [日志](/mnt/data/ljz/opentacbench/capx-runs/C_tactile_skill_cold_seed3300_20261027T014842Z_smoke_rep1_20261027T014844Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/C_tactile_skill_cold_seed3300_20261027T014842Z_smoke_rep1_20261027T014844Z_1c4f9306e0ae4e44861e0866b4c42e09/shadow_piano_native_audit_summary.json) |
+| 只读触觉技能复用 | 3300 | 6/6 | 6 | 1143/0 | 1 | 是 | 0 | [日志](/mnt/data/ljz/opentacbench/capx-runs/C_tactile_skill_reuse_seed3300_20261027T014842Z_smoke_rep1_20261027T015511Z/run.log) · [审计](/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1/C_tactile_skill_reuse_seed3300_20261027T014842Z_smoke_rep1_20261027T015511Z_f4ca93d599514e9ba28e22cc20fc1724/shadow_piano_native_audit_summary.json) |
+
+四次命中并应用：F4、A4、A4、E4，来源均为冷启动F4轻音，Z修正−0.0890888 mm；四次均从实际action记录确认。两条6/6且1143步相同，未显示成功数或总动作收益。匹配后相同物理窗口的真实力MAE三处略降、一处略升，变化小于0.001 N，不能据单对样本称稳定控制提升。重音未获得合格记忆，继续原控制器。
+
+有效两条API请求为0；首份源码生成请求发生在单列的接线诊断中，不能把生成成本当0。56项相关CPU检查及补充透传检查通过；四份视频均含音频。未追加试验、未按成绩换源码、未修改OpenTacBench。
+
+[完整报告、技能快照、全部视频及私有力图](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/C_tactile_skill_pair_20261027T014842Z/results.md)。

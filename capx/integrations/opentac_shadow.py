@@ -71,7 +71,7 @@ class ShadowPianoVisualForceApi(ApiBase):
     """Piano controls using visual key picks and public DIGIT appearance only."""
 
     def functions(self):
-        return {"get_keyboard_endpoints": self.get_keyboard_endpoints,
+        functions = {"get_keyboard_endpoints": self.get_keyboard_endpoints,
                 "locate_visual_keys": self.locate_visual_keys,
                 "get_hand_state": self.get_hand_state,
                 "move_shadow_index": self.move_shadow_index,
@@ -79,6 +79,30 @@ class ShadowPianoVisualForceApi(ApiBase):
                 "get_index_tactile_rgb": self.get_index_tactile_rgb,
                 "estimate_key_force": self.estimate_key_force,
                 "finish_piano_note_attempt": self.finish_piano_note_attempt}
+        if getattr(self._env, 'tactile_skill_memory_path', None) is not None:
+            functions.update(query_tactile_skill=self.query_tactile_skill,
+                             record_tactile_skill=self.record_tactile_skill)
+        return functions
+
+    def query_tactile_skill(self, note: str, dynamics: str, probe_z_m: float) -> dict:
+        """Match the first three valid public 5D contact frames to a prior skill.
+
+        Returns collecting/empty/miss/matched/unavailable. A match supplies a
+        bounded z_correction_m, to approach gradually within existing controls.
+        It does not move or certify scoring. Query after fresh estimate_key_force.
+        """
+        return self._env.query_tactile_skill(note, dynamics, probe_z_m)
+
+    def record_tactile_skill(self, note: str, dynamics: str, probe_z_m: float,
+                             function_name: str) -> dict:
+        """Record a controller's public contact/hold evidence for a later episode.
+
+        Call before release, after at least nine consecutive fresh qualified
+        estimates spanning 0.12 s. The host independently checks the public
+        window. No true force or score is used. function_name identifies the
+        generated press/hold helper. A reuse snapshot cannot be overwritten.
+        """
+        return self._env.record_tactile_skill(note, dynamics, probe_z_m, function_name)
 
     def get_keyboard_endpoints(self) -> dict:
         """Return public fixed A0/C8 white-key centers in world metres and HEAD pixels.
