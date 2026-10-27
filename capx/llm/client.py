@@ -483,7 +483,7 @@ class _SimpleResponse:
 
     def __init__(self, status_code: int, headers: dict[str, str], text: str) -> None:
         self.status_code = int(status_code)
-        self.headers = headers
+        self.headers = {str(key).lower(): value for key, value in headers.items()}
         self.text = text
 
     def json(self) -> Any:
@@ -494,13 +494,115 @@ class _SimpleResponse:
             raise RuntimeError(f"HTTP {self.status_code}: {self.text[:500]}")
 
 
+def _codex_responses_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Opt into the public stateless Responses/SSE wire shape, without agent state.
+
+    This is protocol compatibility, not a claim to be the Codex CLI. It adds
+    neither Codex instructions/tools nor client-identity or routing headers.
+    """
+    if not _env_flag("CAPX_RESPONSES_CODEX_FORMAT", False):
+        return payload
+    result = copy.deepcopy(payload)
+    messages = result.get("input")
+    if isinstance(messages, str):
+        messages = [{"role": "user", "content": [{"type": "input_text", "text": messages}]}]
+    if not isinstance(messages, list):
+        raise ValueError("Stateless Responses input must be text or a message list")
+    instructions: list[str] = []
+    inputs: list[dict] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("Stateless Responses input items must be objects")
+        if message.get("role") == "system":
+            if inputs:
+                raise ValueError("Cannot move an interleaved system message into instructions")
+            content = message.get("content", "")
+            if isinstance(content, str):
+                instructions.append(content)
+            elif isinstance(content, list) and all(
+                isinstance(x, dict) and x.get("type") in {"text", "input_text"}
+                and isinstance(x.get("text"), str) for x in content
+            ):
+                instructions.extend(x["text"] for x in content)
+            else:
+                raise ValueError("Responses instructions must contain only text")
+        else:
+            inputs.append(message)
+    result.update(input=inputs, instructions="\n\n".join(instructions),
+                  stream=True, store=False, tools=[], tool_choice="none")
+    return result
+
+
+def _completed_responses_stream(lines: Iterable, timeout: float) -> dict[str, Any]:
+    """Accept a complete SSE response only; never execute an interrupted delta."""
+    started = time.monotonic()
+    data: list[str] = []
+    total_bytes = 0
+    for line in lines:
+        if time.monotonic() - started > timeout:
+            raise TimeoutError("Responses SSE exceeded its request deadline")
+        line = line.decode("utf-8", errors="strict") if isinstance(line, bytes) else line
+        line = line.rstrip("\r\n")
+        total_bytes += len(line.encode("utf-8"))
+        if total_bytes > 64 * 1024 * 1024:
+            raise RuntimeError("Responses SSE exceeds 64 MiB")
+        if line.startswith("data:"):
+            data.append(line[5:].lstrip(" "))
+        elif not line and data:
+            value = "\n".join(data)
+            data = []
+            if value == "[DONE]":
+                break
+            event = json.loads(value)
+            if not isinstance(event, dict):
+                raise RuntimeError("Invalid Responses SSE event")
+            kind = event.get("type")
+            if kind == "response.completed":
+                body = event.get("response")
+                if not isinstance(body, dict) or body.get("status") != "completed":
+                    raise RuntimeError("Responses SSE terminal body is not completed")
+                return body
+            if kind in {"error", "response.failed", "response.incomplete", "response.cancelled"}:
+                raise RuntimeError("Responses SSE failed: " + json.dumps(event, ensure_ascii=False)[:1500])
+    raise RuntimeError("Responses SSE ended without response.completed; partial output rejected")
+
+
+def _checked_responses_stream(lines, timeout: float, *, status_code: int, server_url: str):
+    try:
+        return _completed_responses_stream(lines, timeout)
+    except LLMRequestTimeout:
+        raise
+    except (RuntimeError, ValueError, UnicodeError) as exc:
+        # HTTP 200 can carry an SSE error (including upstream transport errors).
+        # Keep the actual HTTP status and expose this as an endpoint failure so
+        # trial runners don't count a missing response as a policy failure.
+        raise LLMQueryError(status_code=status_code, server_url=server_url,
+            response_preview=str(exc)[:1500], retry_after=None) from exc
+
+
+def _streamed_response(response, timeout: float) -> _SimpleResponse:
+    if response.status_code >= 400:
+        return _SimpleResponse(response.status_code, dict(response.headers), response.text)
+    if "text/event-stream" not in response.headers.get("content-type", "").lower():
+        raise RuntimeError("Streaming Responses endpoint did not return text/event-stream")
+    body = _checked_responses_stream(response.iter_lines(chunk_size=1), timeout,
+        status_code=response.status_code, server_url=getattr(response, "url", "<stream>"))
+    return _SimpleResponse(response.status_code, dict(response.headers), json.dumps(body))
+
+
 def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float):
     data = json.dumps(payload)
     disable_proxy = _env_flag("CAPX_DISABLE_PROXY", False)
     trust_env = _env_flag("CAPX_LLM_TRUST_ENV", True) and not disable_proxy
+    streamed = payload.get("stream") is True
+    if streamed:
+        headers = {**headers, "Accept": "text/event-stream"}
 
     if requests is not None:
         if trust_env:
+            if streamed:
+                with requests.post(url, headers=headers, data=data, timeout=timeout, stream=True) as response:
+                    return _streamed_response(response, timeout)
             return requests.post(
                 url,
                 headers=headers,
@@ -510,6 +612,9 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
             )
         with requests.Session() as session:
             session.trust_env = False
+            if streamed:
+                with session.post(url, headers=headers, data=data, timeout=timeout, stream=True) as response:
+                    return _streamed_response(response, timeout)
             return session.post(
                 url,
                 headers=headers,
@@ -531,6 +636,10 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
             else urllib.request
         )
         with opener.open(req, timeout=timeout) as resp:
+            if streamed:
+                body = _checked_responses_stream(resp, timeout,
+                    status_code=resp.status, server_url=resp.geturl())
+                return _SimpleResponse(resp.status, dict(resp.headers.items()), json.dumps(body))
             text = resp.read().decode("utf-8", errors="replace")
             return _SimpleResponse(resp.status, dict(resp.headers.items()), text)
     except urllib.error.HTTPError as exc:
@@ -547,7 +656,14 @@ def _response_preview(response: Any, *, limit: int = 500) -> str:
         text = str(content)
     else:
         text = str(getattr(response, "text", ""))
-    return text[:limit].replace("\n", "\\n")
+    preview = text[:limit].replace("\n", "\\n")
+    # Provider IDs can follow a long bilingual error. Keep them for support
+    # without dumping the response or any request authorization headers.
+    import re
+    ids = re.findall(r"(?:request_ori_id|request[ _]id)\s*[:=]\s*([A-Za-z0-9_-]+)", text, re.IGNORECASE)
+    if ids:
+        preview += " request_ids=" + ",".join(dict.fromkeys(ids))
+    return preview
 
 
 def _disable_thinking_requested(args: Any) -> bool:
@@ -570,12 +686,14 @@ def _payload_stats(payload: dict[str, Any]) -> dict[str, int]:
         "image_bytes": 0,
         "json_bytes": len(json.dumps(payload).encode("utf-8")),
     }
+    if isinstance(payload.get("instructions"), str):
+        stats["text_chars"] += len(payload["instructions"])
     messages = payload.get("messages")
     if messages is None:
         messages = payload.get("input")
     if isinstance(messages, str):
         stats["messages"] = 1
-        stats["text_chars"] = len(messages)
+        stats["text_chars"] += len(messages)
         return stats
     if not isinstance(messages, list):
         return stats
@@ -747,6 +865,7 @@ def preflight_image_input(args: "LaunchArgs | ModelQueryArgs") -> None:
             ],
             "max_output_tokens": 8,
         }
+        payload = _codex_responses_payload(payload)
     else:
         image_item = {"type": "image_url", "image_url": {"url": _IMAGE_PREFLIGHT_DATA_URL}}
         payload = {
@@ -869,6 +988,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict
         }
         if _env_flag("CAPX_RESPONSES_SEND_REASONING_EFFORT", False):
             payload["reasoning"] = {"effort": args.reasoning_effort}
+        payload = _codex_responses_payload(payload)
     elif _is_kimi_k3_model(args.model):
         payload = {
             "model": args.model,
@@ -997,6 +1117,12 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict
                 timeout=request_timeout,
             )
             break
+        except LLMQueryError as exc:
+            _record_llm_usage(args=args, protocol=protocol, payload_stats=payload_stats,
+                body={}, latency_seconds=time.monotonic()-monotonic_start, payload=payload,
+                error={"type": type(exc).__name__, "http_status": exc.status_code,
+                       "source": "endpoint_stream", "message": exc.response_preview})
+            raise
         except LLMRequestTimeout as exc:
             _final_request_failure(args=args, protocol=protocol, payload_stats=payload_stats,
                 payload=payload, exc=exc, started=monotonic_start, timeout=request_timeout)
@@ -1067,6 +1193,10 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict
     try:
         response.raise_for_status()
     except Exception as exc:
+        _record_llm_usage(args=args, protocol=protocol, payload_stats=payload_stats,
+            body={}, latency_seconds=time.monotonic()-monotonic_start, payload=payload,
+            error={"type": "LLMQueryError", "http_status": int(response.status_code),
+                   "source": "endpoint_http", "message": _response_preview(response)})
         raise LLMQueryError(
             status_code=int(getattr(response, "status_code", 0)),
             server_url=server_url,

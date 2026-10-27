@@ -202,13 +202,94 @@ def test_A_B_never_promote_or_query_after_episode(tmp_path,monkeypatch,arm,faile
     (run/'piano_code_memory_session.json').write_text(json.dumps(session))
     monkeypatch.setattr(mem,'public_summary',lambda _: {
         'public_checks_complete':not failed,'last_code_messages':['ValueError: release incomplete'] if failed else [],
-        'failures':['Public attempt chain incomplete'] if failed else [],'parameters':{'white_light':{'trim_m':-.001}}})
+        'failures':['Public attempt chain incomplete'] if failed else [],
+        'control_failures':[{'index':0,'reason':'alignment_lost'}],
+        'parameters':{'white_light':{'trim_m':-.001}}})
     monkeypatch.setattr(mem,'_query',lambda *a,**kw:pytest.fail('A/B made an episode-end API call'))
     # No explicit config policy: the runtime session must preserve isolation.
     result=mem.finish_episode({'output_dir':str(run),'shadow_piano_code_memory':str(root)})
     assert result['post_episode_usage']['query_count']==0 and result['repair_calls']==0
     assert result['updates_retained'] is False and result['post_episode_repair_enabled'] is False
     assert {str(p.relative_to(root)):p.read_bytes() for p in root.rglob('*') if p.is_file()}==before
+
+
+@pytest.mark.parametrize('reason',['alignment_lost','press_cap','ood','overforce'])
+@pytest.mark.parametrize('as_json',[False,True])
+def test_explicit_public_control_issue_is_distinct_from_native_verdict(reason,as_json):
+    data={'index':0,'note':'untrusted printed name','abort_reason':reason,
+        'quality':'ood' if reason=='ood' else 'ok','public_hold_confidence':False,
+        'private_key_top_force_N':99,'native_notes_completed':6}
+    text=json.dumps(data) if as_json else repr(data)
+    issue=mem._public_note_control_failure('PIANO_NOTE '+text,{'notes':['F4']},75)
+    assert issue['reason']==reason and issue['index']==0 and issue['note']=='F4'
+    assert issue['action_step']==75 and issue['basis']=='public_report_not_native_verdict'
+    assert 'private_key_top_force' not in json.dumps(issue)
+    assert 'native_notes_completed' not in json.dumps(issue)
+
+
+def test_ambiguous_or_malformed_public_reports_do_not_invent_control_failures():
+    request={'notes':['F4']}
+    messages=[
+        "PIANO_NOTE {'index':0,'outcome':'uncertain'}",
+        "PIANO_NOTE {'index':0,'public_hold_confidence':False}",
+        "PIANO_NOTE {'index':0,'public_hold_confidence':True,'abort_reason':'public_hold_provisional'}",
+        "PIANO_NOTE {'index':99,'abort_reason':'ood'}",
+        "PIANO_NOTE {'index':True,'abort_reason':'ood'}",
+        'PIANO_NOTE not a dictionary',
+    ]
+    assert all(mem._public_note_control_failure(s,request,1) is None for s in messages)
+
+
+@pytest.mark.parametrize('used_budget,read_only,reason,decision',[
+    (0,False,'alignment_lost','requested'),
+    (1,False,'alignment_lost','repair_budget_exhausted'),
+    (0,True,'alignment_lost','read_only'),
+    (0,False,'public_hold_provisional','no_public_failure'),
+])
+def test_C_public_contact_problem_requests_next_episode_patch(tmp_path,monkeypatch,
+        used_budget,read_only,reason,decision):
+    run=tmp_path/'run';run.mkdir();root=tmp_path/'memory';calls=[]
+    request={'notes':['F4'],'dynamics':['heavy'],'hold_seconds':[.12]}
+    (run/'shadow_public_episode.json').write_text(json.dumps({
+        'sequence':request,'clear_action_steps':0}))
+    note={'index':0,'note':'F4','abort_reason':reason,'quality':'ok',
+        'had_valid_contact':reason=='public_hold_provisional',
+        'public_hold_confidence':reason=='public_hold_provisional'}
+    events=[{'kind':'action','action_step':1,'target':[0,0,.04,0]},
+        {'kind':'attempt_finalized','action_step':1,'index':0,'release_verified':True},
+        {'kind':'code_execution','action_step':1,'public_messages':['PIANO_NOTE '+repr(note)]}]
+    (run/'shadow_public_observations.jsonl').write_text('\n'.join(json.dumps(e) for e in events))
+    session={'request':request,'compatibility':{},'cache_hit':True,'cache_reason':'hit',
+        'input_version':None,'executed_version':mem.digest(SOURCE),'source':SOURCE,
+        'repair_calls':used_budget,'parameters':{},'memory_policy':mem.ARM_POLICIES['C'],
+        'control_instructions':'fixed controls'}
+    (run/'piano_code_memory_session.json').write_text(json.dumps(session))
+    # An unreadable private verdict must not affect public feedback or repairs.
+    (run/'shadow_piano_native_audit_summary.json').write_text('NOT PUBLIC JSON')
+    monkeypatch.setattr(mem,'compact_repair_evidence',lambda _:{'public_events':[]})
+    monkeypatch.setattr(mem,'_query',lambda args,messages,**kw:
+        calls.append(messages) or {'content':SOURCE+'\n# proposed public control patch'})
+    monkeypatch.setenv('CAPX_API_BASE_URL','https://unused.invalid/v1')
+    monkeypatch.setenv('CAPX_API_KEY','unused-test-key')
+    cfg={'output_dir':str(run),'shadow_piano_code_memory':str(root),
+        'shadow_piano_memory_policy':mem.ARM_POLICIES['C'],
+        'shadow_piano_code_memory_read_only':read_only}
+    result=mem.finish_episode(cfg)
+    assert result['public_summary']['failures']==[]
+    assert result['post_episode_repair_decision']==decision
+    assert result['feedback_version']==mem.PUBLIC_FEEDBACK_VERSION
+    assert len(calls)==int(decision=='requested')
+    if calls:
+        extra=json.loads(calls[0][1]['content'])['public_failure']
+        assert extra['control_failures'][0]['reason']=='alignment_lost'
+        assert extra['control_failures'][0]['index']==0
+        assert mem.OPTIMIZATION_CONTRACT in calls[0][0]['content']
+        active=json.loads((root/'active.json').read_text())
+        assert active['status']=='pending_public_execution'
+        assert active['version']!=mem.digest(SOURCE)
+        assert mem.read_active(root,{})[0]['source']!=SOURCE
+    mem.finish_episode(cfg)
+    assert len(calls)==int(decision=='requested')
 
 
 @pytest.mark.parametrize('used_budget',[0,1])

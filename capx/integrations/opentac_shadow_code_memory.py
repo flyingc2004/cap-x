@@ -17,12 +17,15 @@ from capx.llm.deadline import request_deadline
 from capx.integrations.opentac_shadow_skills import _PRIVATE_MARKERS
 
 SCHEMA = 'shadow_piano_executable_memory.v1'
+PUBLIC_FEEDBACK_VERSION = 'public_control_feedback.v2'
 ARM_POLICIES = {
     'A': {'arm': 'A', 'mode': 'fresh', 'post_episode_repair': False, 'optimize_actions_on_repair': False},
     'B': {'arm': 'B', 'mode': 'frozen', 'post_episode_repair': False, 'optimize_actions_on_repair': False},
     'C': {'arm': 'C', 'mode': 'adaptive', 'post_episode_repair': True, 'optimize_actions_on_repair': True},
 }
-OPTIMIZATION_CONTRACT = '''After resolving the public failure, improve reusable action planning using ONLY the supplied
+OPTIMIZATION_CONTRACT = '''First address the reported public control problems; completing an attempt safely does not
+establish that contact or the required hold was achieved. A public problem is not a native scoring verdict.
+After resolving the public failure, improve reusable action planning using ONLY the supplied
 public motion summary and recent observations. Minimize redundant approach, force-trim, and release/wait
 actions per finalized attempt. Prefer actual-pose arrival checks and bounded adaptive motion over excess
 fixed waits. Do not reduce required hold/release duration, the fixed hover height, minimum press duration,
@@ -277,7 +280,7 @@ def archive_episode(config, session, summary, checked):
     run = Path(config['output_dir'])
     source = session['source']
     proposal = archive_proposal(config, source, 'episode_end')
-    safe = {k: summary[k] for k in ('request', 'completed', 'failures', 'notes',
+    safe = {k: summary[k] for k in ('request', 'completed', 'failures', 'control_failures', 'notes',
         'parameters', 'uncertain_observations', 'public_checks_complete') if k in summary}
     record = {**proposal, 'status': 'parent_protocol_checked' if checked else 'experimental_partial',
         'public_summary': safe, 'public_observations': str(run / 'shadow_public_observations.jsonl'),
@@ -615,11 +618,52 @@ def compact_repair_evidence(run):
     return result
 
 
+def _public_note_control_failure(line, request, action_step):
+    """Classify explicit public reports, without treating uncertainty as a verdict."""
+    if not line.startswith('PIANO_NOTE ') or len(line) > 4096:
+        return None
+    text = line[len('PIANO_NOTE '):]
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        try:
+            data = ast.literal_eval(text)
+        except (ValueError, SyntaxError, TypeError, RecursionError):
+            return None
+    if not isinstance(data, dict):
+        return None
+    index = data.get('index')
+    notes = request.get('notes', [])
+    if type(index) is not int or not 0 <= index < len(notes):
+        return None
+    reason = data.get('abort_reason')
+    reason = reason.lower() if isinstance(reason, str) else ''
+    quality = data.get('quality')
+    known_reasons = {'alignment_lost', 'no_contact', 'missing_contact', 'press_cap',
+        'hold_uncertain', 'hold_timeout', 'release_timeout', 'ood', 'overforce'}
+    if reason not in known_reasons:
+        if quality == 'ood':
+            reason = 'ood'
+        elif data.get('had_valid_contact') is False:
+            reason = 'no_valid_contact'
+        else:
+            return None
+    # Never copy arbitrary fields from generated text into the repair evidence.
+    result = {'index': index, 'note': notes[index], 'reason': reason,
+        'action_step': action_step, 'basis': 'public_report_not_native_verdict'}
+    if quality in ('ok', 'ood', 'no_contact', 'unavailable', 'stale'):
+        result['quality'] = quality
+    for key in ('had_valid_contact', 'public_hold_confidence'):
+        if type(data.get(key)) is bool:
+            result[key] = data[key]
+    return result
+
+
 def public_summary(run):
     episode=json.loads((run/'shadow_public_episode.json').read_text())
     events=[json.loads(s) for s in (run/'shadow_public_observations.jsonl').read_text().splitlines()]
     actions=[e for e in events if e['kind']=='action']
-    failures=[];uncertain_observations=[];messages=[];last_messages=[];params={};previous=episode['clear_action_steps']
+    failures=[];control_failures=[];uncertain_observations=[];messages=[];last_messages=[];params={};previous=episode['clear_action_steps']
     notes=[]
     for e in events:
         if e['kind']=='attempt_finalized':
@@ -642,14 +686,17 @@ def public_summary(run):
                     try:params=validate_parameters(json.loads(line[len('PIANO_POLICY_STATE '):])['policy_parameters'])
                     except (ValueError,KeyError):pass
                 if line.startswith(('ValueError:','RuntimeError:','StaticCodeError:','PIANO_STOP')):failures.append(line)
+                control_failure = _public_note_control_failure(line, episode['sequence'], e['action_step'])
+                if control_failure is not None:
+                    control_failures.append(control_failure)
                 if line.startswith('PIANO_NOTE') and any(v in line for v in ('hold_uncertain','press_cap',"'hold_confidence': False","'public_hold_confidence': False",'ood','overforce')):
-                    # A safely finalized uncertain attempt is not evidence of a
-                    # code defect. Keep the diagnostic without automatically
-                    # uploading/replacing the whole module after every episode.
+                    # Preserve uncertainty separately from explicit public
+                    # control problems. Neither establishes a native verdict.
                     uncertain_observations.append(line)
     completed=sum(e['kind']=='attempt_finalized' for e in events)
     if completed!=len(episode['sequence']['notes']):failures.append('Public attempt chain incomplete')
-    return {'request':episode['sequence'],'completed':completed,'failures':failures,'messages':messages,
+    return {'request':episode['sequence'],'completed':completed,'failures':failures,
+        'control_failures':control_failures,'feedback_version':PUBLIC_FEEDBACK_VERSION,'messages':messages,
         'parameters':params,'notes':notes,'last_code_messages':last_messages,
         'uncertain_observations':uncertain_observations,
         'public_checks_complete':completed==len(episode['sequence']['notes']) and all(x['release_verified'] for x in notes)}
@@ -680,13 +727,15 @@ def finish_episode(config):
         'input_version':session['input_version'],'executed_version':session['executed_version'],
         'public_summary':summary,'repair_calls':session['repair_calls'],
         'memory_policy':policy,'updates_retained':policy['mode']=='adaptive',
-        'post_episode_repair_enabled':policy['post_episode_repair']}
+        'post_episode_repair_enabled':policy['post_episode_repair'],
+        'feedback_version':PUBLIC_FEEDBACK_VERSION}
     root=Path(config['shadow_piano_code_memory']);events=[]
     if policy['mode'] in ('fresh','frozen'):
         # A/B may repair within this episode, but never spend another API call
         # after it ends or promote those changes into the next episode.
         current,_=read_active(root,session['compatibility']) if policy['mode']=='frozen' else (None,None)
         result['output_version']=current['version'] if current else None
+        result['post_episode_repair_decision']='disabled_by_policy'
         result['post_episode_usage']=summarize_llm_usage([])
         result['timing'] = timing_report(run, result['post_episode_usage'])
         result['finalized_evidence'] = evidence_id()
@@ -717,13 +766,27 @@ def finish_episode(config):
                 rejected={k:v for k,v in current.items() if k!='source'};rejected['status']='quarantined'
                 atomic_json(root/'active.json',rejected);current=None
         result['output_version']=current['version'] if current else None
-    if (policy['post_episode_repair'] and summary['failures'] and session['repair_calls']<1
-            and not config.get('shadow_piano_code_memory_read_only')):
+    control_failures = summary.get('control_failures', []) if policy['arm'] == 'C' else []
+    if config.get('shadow_piano_code_memory_read_only'):
+        decision = 'read_only'
+    elif not policy['post_episode_repair']:
+        decision = 'disabled_by_policy'
+    elif not (summary['failures'] or control_failures):
+        decision = 'no_public_failure'
+    elif session['repair_calls'] >= 1:
+        decision = 'repair_budget_exhausted'
+    else:
+        decision = 'requested'
+    result['post_episode_repair_decision'] = decision
+    if decision == 'requested':
+        print('[piano-code-memory] post-episode repair requested: '
+              f"code_failures={len(summary['failures'])} control_failures={len(control_failures)}", flush=True)
         args=ModelQueryArgs(model=os.environ.get('MODEL',os.environ.get('CAPX_MODEL','gpt-6-sol')),
             server_url=os.environ['CAPX_API_BASE_URL'].rstrip('/')+'/responses',api_key=os.environ['CAPX_API_KEY'],max_tokens=8192,reasoning_effort='low')
         try:
             with collect_llm_usage(events,'code_memory_repair'):
-                repaired=repair(args,config,{'failures':summary['failures'],'notes':summary['notes']})
+                repaired=repair(args,config,{'failures':summary['failures'],
+                    'control_failures':control_failures,'notes':summary['notes']})
             session=json.loads(path.read_text())
             if repaired:
                 if session.get('action_memory'):
