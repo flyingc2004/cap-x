@@ -56,6 +56,9 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         third_party_video: bool = False,
         tactile_skill_memory_path: str | None = None,
         tactile_skill_memory_mode: str = 'collect',
+        evidence_memory_root: str | None = None,
+        tactile_temporal_encoder: Any | None = None,
+        retrieve_tactile_history: bool = True,
     ) -> None:
         super().__init__()
         self.univtac_root = Path(univtac_root).expanduser().resolve()
@@ -71,6 +74,10 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self.tactile_skill_memory_path = Path(tactile_skill_memory_path) if tactile_skill_memory_path else None
         self.tactile_skill_memory_mode = tactile_skill_memory_mode
         self._tactile_skill_memory = None
+        self.evidence_memory_root = evidence_memory_root
+        self._tactile_temporal_encoder = tactile_temporal_encoder
+        self._retrieve_tactile_history = bool(retrieve_tactile_history)
+        self._tactile_evidence = None
         self._release_ready_since = None
         self._keyboard_calibration = None
         self._cached_key_targets = {}
@@ -307,6 +314,9 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         Image.fromarray(self.get_index_tactile_rgb()).save(self._output_dir / filename)
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        if getattr(self, '_tactile_evidence', None) is not None:
+            self._tactile_evidence.close()
+        self._tactile_evidence = None
         self._tactile_skill_memory = None
         explicit_seed = getattr(self, "task_seed", None)
         actual_seed = explicit_seed if explicit_seed is not None else (self.seed_base if seed is None else self.seed_base + int(seed))
@@ -371,6 +381,17 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             self._clear_keyboard_for_visual()
             self._clear_action_steps = self._sim_step_count
         self._save_public_episode(actual_seed)
+        if getattr(self, 'evidence_memory_root', None):
+            if self._output_dir is None or not self._force_estimator or not self._force_estimator.uses_area_rate:
+                raise ValueError('Evidence memory requires an output directory and the existing 5D estimator')
+            from capx.integrations.opentac_shadow_online_skills import PublicTactileEvidence
+            self._tactile_evidence = PublicTactileEvidence(self.evidence_memory_root, self._output_dir,
+                {'sensor': self._force_estimator.sidecar['sensor_sha256'],
+                 'force_model': hashlib.sha256(self.digit_force_sidecar.read_bytes()).hexdigest(),
+                 'action_repeat': self.action_repeat, 'physics_hz': 240,
+                 'frame': 'public_endpoint_geometry.v1'}, self._public_sequence,
+                encoder=self._tactile_temporal_encoder, retrieve_history=self._retrieve_tactile_history)
+            self._record_tactile_evidence_sample()
         return self.get_observation(), {}
 
     def public_task_context(self) -> str:
@@ -394,6 +415,10 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             "action_repeat": self.action_repeat, "localization_mode": "public_endpoint_geometry"})
 
     def _write_public_event(self, kind: str, **fields) -> None:
+        evidence = getattr(self, '_tactile_evidence', None)
+        if evidence is not None:
+            evidence.clock = {'action_step': self._sim_step_count, 'physics_step': int(self._task.step_count)}
+            evidence.event(kind, **fields)
         if not getattr(self, "public_episode_recording", False) or self._output_dir is None:
             return
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -410,7 +435,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         errors = [line[:800] for line in stderr.splitlines()
                   if re.match(r"^[A-Za-z]+(?:Error|Exception):", line)]
         safe = [line for line in lines + errors if not any(m in line.lower() for m in _PRIVATE_MARKERS)]
-        self._write_public_event("code_execution", public_messages=safe[-24:])
+        self._write_public_event("code_execution", public_messages=safe[-24:], has_exception=bool(errors))
 
     def _clear_keyboard_for_visual(self) -> None:
         """Move the open index away from the keyboard before the sole initial image."""
@@ -538,12 +563,13 @@ class ShadowPianoLowLevelEnv(BaseEnv):
                     hand_state=self.get_observation()['hand_state'],continuous_release_seconds=elapsed)
                 raise ValueError('Public release has not completed: actual index must be <=0.02 rad '
                     'and wrist Z within 0.002 m of 0.04 m continuously for >=0.12 s; keep advancing bounded release actions')
+        release_verified = bool(getattr(self, 'require_public_release', False) and not self._native_done)
         self._native_info = self._task.finish_piano_note_attempt(index)
         self._public_attempts_finalized += 1
         if getattr(self, '_tactile_skill_memory', None) is not None:
             self._tactile_skill_memory.next_attempt()
         self._write_public_event("attempt_finalized", index=index,
-            release_verified=bool(getattr(self, 'require_public_release', False)))
+            release_verified=release_verified, finalization_source="policy")
         self._release_ready_since = None
         self._observation = self._task._observation()
         self._native_done = bool(self._task._done)
@@ -553,6 +579,35 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         if self._native_done:
             self._save_tactile_snapshot("shadow_digit_terminal.png")
         return {"ok": True, "native_done": self._native_done}
+
+    def finalize_native_termination(self) -> bool:
+        """Host-only END after a normal policy return from a terminal episode.
+
+        Reconcile only attempts already consumed by the native task. This is
+        lifecycle bookkeeping, not a release-pose check or a policy success.
+        Never step physics, invoke the scoring transition again, or use the
+        private success flag to decide whether to submit END.
+        """
+        if not self._native_done or self._policy_end_submitted:
+            return False
+        finalized = []
+        if self.visual_key_mode and self.piano_continue_on_note_failure:
+            consumed = self._native_info.get("notes_attempted", 0)
+            if (isinstance(consumed, bool) or not isinstance(consumed, (int, np.integer))
+                    or not self._public_attempts_finalized <= consumed <= len(self.piano_notes)):
+                raise RuntimeError("Invalid terminal attempt count; cannot reconcile public progress")
+            for index in range(self._public_attempts_finalized, int(consumed)):
+                self._public_attempts_finalized += 1
+                if getattr(self, '_tactile_skill_memory', None) is not None:
+                    self._tactile_skill_memory.next_attempt()
+                self._write_public_event("attempt_finalized", index=index,
+                    release_verified=False, finalization_source="host_native_termination")
+                self._write_native_event("attempt_end")
+                finalized.append(index)
+            self._release_ready_since = None
+        self.submit_policy_end()
+        self._write_public_event("native_terminal_end", finalized_indices=finalized)
+        return True
 
     def get_observation(self) -> dict[str, Any]:
         if self._observation is None:
@@ -662,6 +717,33 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             tactile = self._task.tactile
             estimator.observe_frame(tactile.depth_m, tactile.reference_depth_m,
                                     physics_step=self._task.step_count)
+        self._record_tactile_evidence_sample()
+
+    def _record_tactile_evidence_sample(self):
+        evidence = getattr(self, '_tactile_evidence', None)
+        if evidence is None or self._public_attempts_finalized >= len(self.piano_notes):
+            return
+        from capx.integrations.opentac_shadow_vision import parse_note
+        i = self._public_attempts_finalized
+        note = self.piano_notes[i]
+        color = 'black' if parse_note(note)[1] else 'white'
+        tactile = self._task.tactile
+        diagnostics = {}
+        # Pure public estimator path. Do NOT call estimate_key_force here: that
+        # API also writes a separate private audit and notifies parameter memory.
+        estimate = self._force_estimator.predict(tactile.depth_m, tactile.reference_depth_m,
+            color=color, sample_step=self._sim_step_count, current_step=self._sim_step_count,
+            diagnostics_out=diagnostics, physics_step=int(self._task.step_count))
+        evidence.sample(action_step=self._sim_step_count, physics_step=int(self._task.step_count),
+            attempt=i, note=note, dynamics=self.piano_dynamics[i], action=self._action.tolist(),
+            hand=self.get_observation()['hand_state'], estimate=estimate, features=diagnostics.get('features'),
+            rgb=self.get_index_tactile_rgb(), depth=tactile.depth_m, reference=tactile.reference_depth_m,
+            scales=self._force_estimator.sidecar['models'][color]['iqr'])
+
+    def public_execution_trace(self, code, namespace):
+        from contextlib import nullcontext
+        evidence = getattr(self, '_tactile_evidence', None)
+        return evidence.trace_execution(code, namespace) if evidence is not None else nullcontext('<string>')
 
     def _ensure_tactile_skill_memory(self):
         if self.tactile_skill_memory_path is None:
@@ -930,6 +1012,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
             return
         self._closed = True
         try:
+            if getattr(self, '_tactile_evidence', None) is not None:
+                self._tactile_evidence.close()
             if self.visual_key_mode and self._output_dir is not None:
                 try:
                     self._close_private_audit()

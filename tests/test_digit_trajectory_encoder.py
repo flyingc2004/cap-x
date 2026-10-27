@@ -181,3 +181,45 @@ def test_views_preserve_order_and_loss_finite():
     z=model(view);loss,_=vicreg(z,model(x))
     loss.backward()
     assert torch.isfinite(loss) and any(p.grad is not None for p in model.parameters())
+
+
+@pytest.mark.parametrize('method', ['window4', 'tactile', 'tactile_action'])
+def test_evidence_wrapper_60hz_time_selection_and_missing_inputs(prepared, tmp_path, method):
+    from capx.memory.trajectory.model import EvidenceTrajectoryEncoder
+    root = prepared.path.parent
+    if method != 'window4':
+        path = root / f'models/{method}/seed_0/best.pt'
+        path.parent.mkdir(parents=True)
+        model = TrajectoryEncoder(method == 'tactile_action').eval()
+        torch.save(dict(schema=d.SCHEMA, window=d.WINDOW, normalization=prepared.norm,
+            sensor_sha256='test_sensor', use_motion=method == 'tactile_action', state_dict=model.state_dict()), path)
+    encoder = EvidenceTrajectoryEncoder(root, method)
+    ref = np.full((240, 320), .03, np.float32)
+    frames = [{'depth_m': ref - i*.000001, 'reference_depth_m': ref} for i in range(31)]
+    window = dict(sensor_sha256='test_sensor', frames=frames, timestamps_s=(np.arange(31)/60).tolist(),
+        valid_masks=[np.ones_like(ref, bool)]*31, actions=[[0., 0., .04, .1]]*31,
+        actual_state=[[.002, .003, .04, .12]]*31, episode_id='one',
+        sources=[{'sample_id': str(i), 'physics_step': i*4, 'clip_id': 'a' if i<25 else 'b'} for i in range(31)])
+    got = encoder.encode(window)
+    assert got['quality'] == 'ok'
+    assert len(got['vector']) == (64 if method == 'window4' else 32)
+    assert np.linalg.norm(got['vector']) == pytest.approx(1.)
+    assert [s['physics_step'] for s in got['provenance']['samples']] == list(range(0, 121, 8))
+    assert {s['clip_id'] for s in got['provenance']['samples']} == {'a', 'b'}
+    if method == 'window4':
+        _, f, _ = d.reduce_depth(np.stack([frames[i]['depth_m'] for i in range(0, 31, 2)]), ref,
+                                 np.ones((16,240,320), bool))
+        expected = unit_rows(((f-prepared.norm['feature_mean'])/prepared.norm['feature_std']).reshape(1,64))[0]
+    else:
+        expected = encoder.frozen.encode_window(np.stack([f['depth_m'] for f in frames]), ref,
+            np.stack(window['valid_masks']), window['timestamps_s'], sensor_sha256='test_sensor',
+            actions=window['actions'], actual_state=window['actual_state'])['embedding']
+    np.testing.assert_allclose(got['vector'], expected, atol=1e-6)
+    short = {**window, **{k: window[k][-16:] for k in
+        ('frames', 'timestamps_s', 'valid_masks', 'actions', 'actual_state', 'sources')}}
+    assert encoder.encode(short)['quality'] == 'insufficient_valid_history'
+    assert encoder.encode({**window, 'sensor_sha256': 'wrong'})['quality'] == 'incompatible_sensor'
+    broken = {**window, 'actual_state': [None]*31}
+    assert encoder.encode(broken)['quality'] == ('missing_public_motion' if method == 'tactile_action' else 'ok')
+    invalid = {**window, 'valid_masks': [np.zeros_like(ref, bool)]*31}
+    assert encoder.encode(invalid)['vector'] is None

@@ -335,3 +335,58 @@ B在五个seed均高于A；C相对A两组提高、两组持平、一组下降，
 离线实测力：匹配后同物理窗口MAE，3301/F4轻0.022578→0.021407 N（约−5.18%），3302/C4轻0.021651→0.020680 N（约−4.48%）。绝对变化约0.001 N，仅两个有匹配新seed、每seed一对，不作统计显著性或整体策略提升结论。全部原生失败均为重音，当前库没有重音技能。未修改OpenTacBench、估计器或运行代码；未追加实验。
 
 [完整逐音报告、动作证据、16份视频及对照图](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/C_tactile_skill_transfer_3301_3304_20261027T043600Z/results.md)。
+
+
+### 2026-10-27 入口修复后的单 seed 门控验证
+
+本条为独立验证，不加入前述历史批次，也未携带试采记忆进入新对照。GPU3、joint 空记忆、seed3300，仍由原 `./run_responses` 启动；API 无代理、无重试。终端结束时间为北京时间 2026-10-27T20:07:37+08:00。
+
+| seed | 音序及轻重 | 原生成功音数 | 原生尝试／公开提交 | 生成／清场动作 | 代码块／重新生成 | END | 退出码 |
+|---|---|---:|---|---:|---|---|---:|
+| 3300 | F4轻、A4轻、C#4重、A4轻、A4重、E4轻 | 4/6 | 6／5 | 3635／220 | 1／0 | 否 | 1 |
+
+初始生成 8082 token、API 耗时 125.441 秒；整理 7314 token、API 耗时 8.202 秒，返回 `no_change`，公开执行检查未通过。API 耗时包含服务端排队和传输，不能称为纯模型推理时间。原生两次失败均为重音（C#4、A4），原因记录为 `incomplete_note`，本条不将其进一步归因于估计误差。
+
+源码通过模块校验，生成代码正常返回。两个已核实的问题：生成策略把 `steps=4` 当成四个物理步，但底层每个动作步已推进四个物理步，实际每次调用16步、反馈约15Hz；代码却仅累计4/240秒。最后物理步15420返回公开 `native_done=True`，生成函数抛出并捕获 `NativeDone` 后直接返回，跳过第六次公开提交与计数；宿主因完成计数仍为5而未提交END。
+
+结论：入口修复得到真实运行验证，但完整单seed门控未通过；未启动四组并行，不进行自动补跑。
+
+[结构化结果](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_seed_entry_gate_3300_20261027T112731Z/gate_result.json) · [日志](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_seed_entry_gate_3300_20261027T112731Z/joint/runs/seed_3300/gate_joint_seed3300_20261027T112731Z_smoke_rep1_20261027T112735Z/run.log) · [代码](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_seed_entry_gate_3300_20261027T112731Z/joint/runs/seed_3300/gate_joint_seed3300_20261027T112731Z_smoke_rep1_20261027T112735Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/code.py) · [原生审计](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_seed_entry_gate_3300_20261027T112731Z/joint/private_audits/gate_joint_seed3300_20261027T112731Z_smoke_rep1_20261027T112735Z_3ec2e4895d75420381b7700d92d9a874/shadow_piano_native_audit_summary.json) · [HEAD视频](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_seed_entry_gate_3300_20261027T112731Z/joint/runs/seed_3300/gate_joint_seed3300_20261027T112731Z_smoke_rep1_20261027T112735Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/videos/video_combined.mp4) · [第三方视频](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_seed_entry_gate_3300_20261027T112731Z/joint/runs/seed_3300/gate_joint_seed3300_20261027T112731Z_smoke_rep1_20261027T112735Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/videos/video_combined_third.mp4)
+
+
+### 2026-10-27 文字＋触觉证据＋代码更新：单 seed 3300（21:07 完成）
+
+使用现有 `./run_responses`、GPU 3、joint 模式、全新独立记忆，模型 gpt-6.1-sol/low，代理关闭、无重试。运行 API 文档明确动作与物理步单位后的版本；未修改任务或力估计器。
+
+| seed | 音序／力度 | 原生成功音 | 原生尝试／公开结束记录 | 生成动作／清场动作 | 代码块／重新生成 | END／运行退出码 | 更新结果 |
+|---|---|---|---|---|---|---|---|
+| 3300 | F4轻、A4轻、C#4重、A4轻、A4重、E4轻 | 6/6 | 6/5 | 1186/220 | 1/0 | 否／1 | API 成功，no_change；未生成修改候选 |
+
+生成调用 88.13 秒、7462 token（输入4691／输出2771）；更新调用 5.03 秒、9714 token（输入9669／输出45）。这是接口请求耗时，不是纯模型推理耗时；独立 preflight 不计入这两项用量。后台 shell 最终退出0仅代表队列结束，实际 run 退出码为1。
+
+本次代码使用 steps=1、DT=4/240，按压期间测力相隔4物理步。原生最后一音在物理步5621释放计分，native_done=True；生成的 release 随即跳出并误报 release_timeout，返回False，导致最后的 finish_piano_note_attempt 与 END 未执行。原生6/6与CaP-X整条未完成须分别报告。
+
+公开记忆保存1187帧、24片段（接近／按下／保持／释放各6段）。原始公开日志保留停止原因，但证据 manifest 的 code_execution 只保存 has_exception；更新器又按异常优先、函数名排序选中 hold 和 press，未传 release 函数、释放片段或 release_timeout 原因。输入压缩JSON为24368字节，未混入私有判分。API返回空 functions/rules/rule_evidence，校验合法但无修改，文字库仍为空；没有待执行候选或有效活动版本。不能称为更新成功，也不能据此归因于模型性能。
+
+[完整审计](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_update_3300_20261027T125710Z/result_audit.json) · [运行日志](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_update_3300_20261027T125710Z/joint/runs/seed_3300/joint_update_seed3300_20261027T125710Z_smoke_rep1_20261027T125720Z/run.log) · [生成代码](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_update_3300_20261027T125710Z/joint/runs/seed_3300/joint_update_seed3300_20261027T125710Z_smoke_rep1_20261027T125720Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/code.py) · [更新输入](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_update_3300_20261027T125710Z/joint/runs/seed_3300/joint_update_seed3300_20261027T125710Z_smoke_rep1_20261027T125720Z/tactile_evidence_update/public_input.json) · [更新结果](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_update_3300_20261027T125710Z/joint/runs/seed_3300/joint_update_seed3300_20261027T125710Z_smoke_rep1_20261027T125720Z/piano_evidence_update_result.json) · [私有原生审计](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_update_3300_20261027T125710Z/joint/private_audits/joint_update_seed3300_20261027T125710Z_smoke_rep1_20261027T125720Z_8e63a50359f84cb89ca682b953081ca5/shadow_piano_native_audit_summary.json) · [HEAD视频](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_update_3300_20261027T125710Z/joint/runs/seed_3300/joint_update_seed3300_20261027T125710Z_smoke_rep1_20261027T125720Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/videos/video_combined.mp4) · [第三方视频](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_update_3300_20261027T125710Z/joint/runs/seed_3300/joint_update_seed3300_20261027T125710Z_smoke_rep1_20261027T125720Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/videos/video_combined_third.mp4)。
+
+本条进程已结束；未追加 seed、未启动并行组、未人工修改生成代码或替换更新结果。
+
+后续收尾修复验证（离线回放，不计为新增实验）：保持本条原生成源码和全部公开观测，1186次动作目标与468次测力读取逐项匹配；终止仍在物理步5621，主机补记末次尝试后提交一次END，CaP-X返回Task Completed=True。原生结果未变，原代码completed=5和release_timeout日志保留，补记单独标为host_native_termination且release_verified=false；不据此晋升策略或改写上表。见[离线回放结果](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_update_3300_20261027T125710Z/terminal_finalization_replay.json)。
+
+
+### 2026-10-27 原生终止修复后的真实单 seed 验证（23:54 完成）
+
+此前22:46的首次启动在预检收到HTTP400“Input must be a list”，仿真未启动，不记作0/6。修复t-cap/run预检为消息列表并复用现有Responses报文/SSE解析；用户明确要求修复后重启。原失败日志保留于[预检失败审计](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_terminal_fix_3300_20261027T144629Z/result_audit.json)。
+
+| seed | 音序／力度 | 原生成功音 | 原生尝试／公开结束 | 生成动作／清场 | 代码块／重新生成 | 生成token／更新token | END／退出码 | 更新 |
+|---|---|---|---|---|---|---|---|---|
+| 3300 | F4轻、A4轻、C#4重、A4轻、A4重、E4轻 | 4/6 | 6/6（策略5、主机1） | 1225/220 | 1/0 | 8080/0 | 是，1次／1 | 输入构建失败，未调用更新API |
+
+GPU3，joint模式，全新独立记忆；gpt-6.1-sol/low，无代理、无自动重试。真实预检200/OK，生成请求98.60秒，输入4934／输出3146 token；策略源码381行。测力540次，连续按压读数间隔4物理步，公开质量ok215/no_contact325，无OOD。以上不证明估计力逐物理步准确。
+
+C#4重、A4重原生判incomplete_note，其他四音成功；生成代码五条PIANO_NOTE都报告press_budget，公开保持信心与原生判分不同。此次不是上次6/6代码的原样重放，不能将成绩变化归因于主机收尾修复。最后一音在物理步5777终止，代码正确传播native_done并正常返回，无release_timeout；主机仅补记原生已消费的末次尝试并提交一次END，原生失败仍为失败，run退出1。后台队列退出0仅表示队列结束。
+
+更新器返回rejected_or_unavailable：No tactile clip is associated with the executed helpers。按名称排序选了_release_pose（369次调用）和hold（540次调用），两者都无含触觉样本的关联片段；实际press和release各调用6次，分别有关联片段18和12个。选函数时先占满两个名额再检查触觉关联，导致发送前失败；不是API超时或模型拒绝修改。记忆仍保存1226帧和24片段，未产生候选。该筛选缺陷及此前释放证据遗漏尚待修复。
+
+[完整结果](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/result_audit.json) · [run.log](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/joint/runs/seed_3300/joint_preflight_fix_seed3300_20261027T154339Z_smoke_rep1_20261027T154350Z/run.log) · [更新错误](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/joint/runs/seed_3300/joint_preflight_fix_seed3300_20261027T154339Z_smoke_rep1_20261027T154350Z/piano_evidence_update_result.json) · [私有原生审计](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/joint/private_audits/joint_preflight_fix_seed3300_20261027T154339Z_smoke_rep1_20261027T154350Z_3b820e5b108c47ca827f9b41f0d4e6ef/shadow_piano_native_audit_summary.json) · [HEAD视频](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/joint/runs/seed_3300/joint_preflight_fix_seed3300_20261027T154339Z_smoke_rep1_20261027T154350Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/videos/video_combined.mp4) · [第三方视频](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/joint/runs/seed_3300/joint_preflight_fix_seed3300_20261027T154339Z_smoke_rep1_20261027T154350Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/videos/video_combined_third.mp4)。实验已结束，无剩余本次进程，未追加seed或批量实验。

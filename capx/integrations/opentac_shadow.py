@@ -46,17 +46,30 @@ class ShadowPianoControlApi(ApiBase):
     def move_shadow_index(self, wrist_x_offset_m: float, wrist_y_m: float,
                           lift_z_m: float, index_flexion_rad: float,
                           steps: int = 1) -> dict:
-        """Command the native four-dimensional wrist/index target for 1..240 steps.
+        """Command a wrist/index target for 1..240 native ACTION repetitions.
 
         Targets are absolute in the task's local control frame. The adapter
         rejects values outside the native action bounds. Native Task.step()
-        applies its own rate filter and advances PhysX. Stop if native_done.
+        applies its own rate filter and advances PhysX.
+
+        steps counts actions, NOT physics ticks. Each action advances the
+        configured action_repeat physics ticks at 240 Hz. With action_repeat=4,
+        steps=1 means 4 ticks (1/60 s); steps=4 means 16 ticks (1/15 s).
+        Use steps=1 when feedback is needed after every action.
+        Returns ok, steps_executed (completed ACTION repetitions), native_done.
+        Execution can stop early on native_done; never move or wait after it.
         """
         action = np.asarray([wrist_x_offset_m, wrist_y_m, lift_z_m, index_flexion_rad], dtype=np.float32)
         return self._env.command(action, steps)
 
     def wait_steps(self, steps: int) -> dict:
-        """Advance 1..240 native action steps while holding the last target."""
+        """Hold the last target for 1..240 ACTION repetitions, advancing physics.
+
+        Units and return fields match move_shadow_index. With action_repeat=4,
+        wait_steps(1) advances 4 physics ticks, not one. This is simulated time,
+        not wall-clock sleep; forces and measured positions may change.
+        Use wait_steps(1) for per-action feedback; never wait after native_done.
+        """
         return self._env.wait_steps(steps)
 
     def get_index_tactile_rgb(self) -> np.ndarray:
@@ -143,12 +156,37 @@ class ShadowPianoVisualForceApi(ApiBase):
     def move_shadow_index(self, wrist_x_offset_m: float, wrist_y_m: float,
                           lift_z_m: float, index_flexion_rad: float,
                           steps: int = 1) -> dict:
-        """Send one bounded native four-dimensional action for 1..240 steps."""
+        """Send a bounded wrist/index target for 1..240 ACTION repetitions.
+
+        steps counts native actions, NOT physics ticks. Each action advances
+        the configured action_repeat physics ticks at 240 Hz. In the 60 Hz
+        configuration (action_repeat=4): steps=1 advances 4 ticks (1/60 s),
+        while steps=4 advances 16 ticks (1/15 s).
+
+        During press/hold use steps=1, then estimate_key_force(note) after EVERY
+        return. Batched steps=4 gives feedback only every 16 physics ticks;
+        it does not request four physics ticks or provide intermediate readings.
+
+        Returns ok, steps_executed (completed ACTION repetitions), native_done.
+        For a nonterminal return, elapsed simulated seconds are
+        steps_executed * action_repeat / 240, NOT steps_executed / 240.
+        Termination may shorten execution; never move or wait after native_done.
+        Propagate this terminal outcome through helpers and return normally from
+        run_piano. It is not release_timeout or proof of success. The host closes
+        already-consumed attempts and submits END with the native verdict.
+        """
         action = np.asarray([wrist_x_offset_m, wrist_y_m, lift_z_m, index_flexion_rad], dtype=np.float32)
         return self._env.command(action, steps)
 
     def wait_steps(self, steps: int) -> dict:
-        """Hold the last native action target for a bounded number of steps."""
+        """Hold the last target for 1..240 ACTION repetitions, advancing physics.
+
+        Units and return fields match move_shadow_index: with action_repeat=4,
+        wait_steps(1) advances 4 physics ticks; wait_steps(4) advances 16.
+        During press/hold use wait_steps(1), then estimate_key_force(note).
+        Holding a target does not freeze the hand, force, or simulation time.
+        Never wait after native_done.
+        """
         return self._env.wait_steps(steps)
 
     def get_index_tactile_rgb(self) -> np.ndarray:
@@ -165,6 +203,13 @@ class ShadowPianoVisualForceApi(ApiBase):
         'no_contact' intentionally has None force and is normal before contact.
         Handle it before checking for a finite force: keep the bounded initial
         curl and reset hold counters; it is not an invalid estimate by itself.
+
+        sample_step and age_steps use native ACTION units, not physics ticks.
+        This read does not advance simulation. Repeated reads without an action
+        have the same sample_step and must not extend the hold clock. In the
+        60 Hz configuration, consecutive samples differ by 1 action (4 ticks,
+        1/60 s); 9 samples span 8 intervals, not 9. A skipped action invalidates
+        a consecutive hold streak; never fill missing readings by interpolation.
         """
         return self._env.estimate_key_force(note)
 
@@ -173,5 +218,10 @@ class ShadowPianoVisualForceApi(ApiBase):
 
         Returns only whether the native episode has ended. Native per-note
         success, failure and measured force remain private.
+        The measured release-pose guard applies while the episode is active.
+        If motion returns native_done, do not wait for hover or label it a release
+        timeout: return normally from run_piano. The host reconciles attempts
+        already consumed by the native task and submits END; unattempted notes
+        remain unattempted. Host cleanup does not certify the public release pose.
         """
         return self._env.finish_piano_note_attempt(index)

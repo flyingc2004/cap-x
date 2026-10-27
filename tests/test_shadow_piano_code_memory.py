@@ -16,6 +16,280 @@ SOURCE='''def run_piano(request, piano_state):
 '''
 
 
+EVIDENCE_SOURCE='''def press(value):
+    move_shadow_index(value)
+
+def release(value):
+    move_shadow_index(value)
+
+def run_piano(request, piano_state):
+    for i in range(piano_state['completed'], len(request['notes'])):
+        press(0.2)
+        press(0.5)
+        press(0.5)
+        release(0.0)
+        finish_piano_note_attempt(i)
+        piano_state['completed'] = i + 1
+'''
+
+
+def run_public_evidence_fixture(tmp_path, name, source=EVIDENCE_SOURCE, config=None):
+    from test_shadow_piano_online_skills import evidence_recorder, record_sample
+    rec=evidence_recorder(tmp_path,name)
+    cfg=config or {'shadow_piano_evidence_memory':str(tmp_path/'evidence'),
+        'shadow_piano_code_memory':str(tmp_path/'old_code'),'output_dir':str(tmp_path/name)}
+    cfg['output_dir']=str(tmp_path/name)
+    run=Path(cfg['output_dir'])
+    request={'notes':['F4'],'dynamics':['light'],'hold_seconds':[.12]}
+    (run/'shadow_public_episode.json').write_text(json.dumps({'sequence':request,'clear_action_steps':0}))
+    stream=run/'shadow_public_observations.jsonl'
+    stream.write_text('')
+    count=[0]
+    def emit(kind,**fields):
+        row={'kind':kind,'action_step':count[0],'physics_step':count[0]*4,**fields}
+        with stream.open('a') as f:f.write(json.dumps(row)+'\n')
+        rec.event(kind,**fields)
+    def motion(flex):
+        count[0]+=1
+        record_sample(rec,count[0],flex,.04 if flex==0 else .01)
+        emit('action',target=[0,0,.04 if flex==0 else .01,flex])
+    scope={'move_shadow_index':motion,
+           'finish_piano_note_attempt':lambda i:emit('attempt_finalized',index=i,release_verified=True)}
+    code=mem.wrapped(source,request,{})
+    with rec.trace_execution(code,scope) as filename:
+        exec(compile(code,filename,'exec'),scope)
+    emit('code_execution',public_messages=[],has_exception=False)
+    rec.close()
+    mem.atomic_json(run/'piano_code_memory_session.json',{'source':mem.validate_source(source),
+        'compatibility':{'fixed':'signature'},'executed_version':mem.digest(source),
+        'evidence_input_bundle':cfg.get('_linked_input_bundle')})
+    # The updater must never open these or copy their fields into its input.
+    (run/'shadow_piano_native_audit_summary.json').write_text('{"success":true,"key_forces":[98765]}')
+    return cfg,rec
+
+
+def linked_proposal(evidence):
+    f=next(f for f in evidence['functions'] if f['name']=='press')
+    clip=evidence['clips'][0]
+    refs=[{'clip_id':clip['clip_id'],'physics_steps':[clip['samples'][0]['physics_step']]}]
+    return {'functions':[{'qualified_name':f['qualified_name'],
+        'source':'def press(value):\n    if value > 0:\n        move_shadow_index(value)\n',
+        'evidence':refs,'basis':'hypothesis','reason':'Separate positive pressing from release motion.',
+        'expected_effect':'Keep press commands associated with contact samples.'}],
+        'rules':[{'id':'positive_press','trigger':'Entering the press helper',
+                  'practice':'Test this hypothesis with fresh contact: press only for positive flexion.'}],
+        'rule_evidence':[{'rule_id':'positive_press','evidence':refs,'basis':'hypothesis',
+                         'reason':'Public contact samples belong to positive flexion.',
+                         'expected_effect':'Keep release separate from press.'}]}
+
+
+def test_joint_loop_records_updates_and_executes_candidate_without_initial_api(tmp_path,monkeypatch):
+    cfg,rec=run_public_evidence_fixture(tmp_path,'first')
+    calls=[]
+    import os
+    monkeypatch.setenv('HTTPS_PROXY','http://must-not-be-used.invalid')
+    def query(args,messages,**kwargs):
+        assert os.environ['CAPX_DISABLE_PROXY']=='1' and 'HTTPS_PROXY' not in os.environ
+        assert kwargs['deadline_seconds']==300
+        evidence=json.loads(messages[1]['content'])
+        assert len(messages[1]['content'].encode())<=24*1024
+        assert '98765' not in json.dumps(evidence) and 'key_forces' not in json.dumps(evidence)
+        assert 'generated_code' not in evidence and 'current_source' not in evidence
+        calls.append(evidence)
+        return {'content':json.dumps(linked_proposal(evidence))}
+    monkeypatch.setattr(mem,'_query',query)
+    result=mem.finish_linked_episode(cfg,SimpleNamespace())
+    assert result['accepted'] and result['logic_change_proposed'],result
+    assert result['public_execution_checked']
+    assert os.environ['HTTPS_PROXY']=='http://must-not-be-used.invalid'
+    assert mem.finish_linked_episode(cfg,SimpleNamespace())==result and len(calls)==1
+    root=Path(cfg['shadow_piano_evidence_memory'])
+    active_before=(root/'active_bundle.json').read_bytes()
+    assert json.loads(active_before)['bundle_id']!=result['candidate_bundle']
+    next_cfg={**cfg,'output_dir':str(tmp_path/'second'),'_piano_public_request':rec.request,
+              '_piano_key_map_ready':True}
+    monkeypatch.setattr(mem,'compatibility',lambda _: {'fixed':'signature'})
+    monkeypatch.setattr(mem,'_query',lambda *a,**kw:pytest.fail('Cache hit must not call initial API'))
+    code,_,_=mem.initial_code(SimpleNamespace(),next_cfg,{'full_prompt':[]})
+    assert 'if value > 0:' in code
+    session=json.loads(mem._session_path(next_cfg).read_text())
+    assert session['evidence_input_bundle']==result['candidate_bundle']
+    next_cfg,rec2=run_public_evidence_fixture(tmp_path,'second',session['source'],next_cfg)
+    monkeypatch.setattr(mem,'_query',lambda args,messages,**kwargs:{'content':json.dumps({
+        'functions':[],'rules':json.loads(messages[1]['content'])['rules']['skills'],'rule_evidence':[]})})
+    second=mem.finish_linked_episode(next_cfg,SimpleNamespace())
+    assert second['status']=='no_change' and second['public_execution_checked'],second
+    assert json.loads((root/'active_bundle.json').read_text())['bundle_id']==result['candidate_bundle']
+    applications=[r for r in rec2.index.records() if r['kind']=='application']
+    assert applications[-1]['payload']['changed_functions_called']
+    assert applications[-1]['payload']['bundle_id']==result['candidate_bundle']
+    assert rec2.index.related(result['candidate_bundle'])
+    second_input=json.loads((Path(next_cfg['output_dir'])/'tactile_evidence_update'/'public_input.json').read_text())
+    assert second_input['historical_clips']
+    assert second_input['historical_clips'][0]['association_ids']
+
+
+@pytest.mark.parametrize('failure',['timeout','bad_reference','bad_signature','oversize','unknown_global'])
+def test_joint_update_failure_preserves_previous_valid_bundle(tmp_path,monkeypatch,failure):
+    cfg,rec=run_public_evidence_fixture(tmp_path,'first')
+    rules={'schema':'shadow_piano_public_skills.v1','skills':[]}
+    root=Path(cfg['shadow_piano_evidence_memory'])
+    identifier=mem._store_linked_bundle(root,mem.validate_source(EVIDENCE_SOURCE),{'fixed':'signature'},rules,{},None,[],[])
+    mem.atomic_json(root/'active_bundle.json',{'bundle_id':identifier})
+    cfg['_linked_input_bundle']=identifier
+    def query(args,messages,**kw):
+        if failure=='timeout':raise TimeoutError('test deadline')
+        proposal=linked_proposal(json.loads(messages[1]['content']))
+        if failure=='bad_reference':proposal['functions'][0]['evidence'][0]['physics_steps']=[999999]
+        if failure=='bad_signature':proposal['functions'][0]['source']='def press(value, extra):\n    return 0\n'
+        if failure=='oversize':proposal['functions']*=3
+        if failure=='unknown_global':proposal['functions'][0]['source']='def press(value):\n    made_up_api(value)\n'
+        return {'content':json.dumps(proposal)}
+    monkeypatch.setattr(mem,'_query',query)
+    result=mem.finish_linked_episode(cfg,SimpleNamespace())
+    assert not result['accepted'],result
+    assert json.loads((root/'active_bundle.json').read_text())['bundle_id']==identifier
+    assert not (root/'pending_bundle.json').exists()
+    assert (Path(cfg['output_dir'])/'tactile_evidence_update'/'validation.json').exists()
+
+
+def test_joint_patch_cannot_change_frozen_force_or_release_parameters(tmp_path):
+    cfg,rec=run_public_evidence_fixture(tmp_path,'first')
+    source=EVIDENCE_SOURCE.replace('def press(value):','def press(value):\n    target_force_N = 0.35')
+    manifest=json.loads(rec.manifest_path.read_text())
+    evidence=mem._linked_update_input(source,manifest,{'schema':'shadow_piano_public_skills.v1','skills':[]},{})
+    proposal=linked_proposal(evidence)
+    proposal['functions'][0]['source']='def press(value):\n    target_force_N = 0.50\n    move_shadow_index(value)\n'
+    with pytest.raises(ValueError,match='constraints'):
+        mem.validate_linked_proposal(proposal,source,evidence)
+
+
+def test_updater_selects_helpers_with_clip_evidence_not_pure_predicates(tmp_path):
+    source=EVIDENCE_SOURCE.replace('def press(value):', 'def _release_pose():\n    return True\n\ndef hold():\n    return True\n\ndef press(value):\n    _release_pose()\n    hold()')
+    _,rec=run_public_evidence_fixture(tmp_path,'linked',source)
+    evidence=mem._linked_update_input(source,json.loads(rec.manifest_path.read_text()),{}, {})
+    assert {f['name'] for f in evidence['functions']}=={'press','release'}
+
+
+def test_linked_config_and_plain_runner_wiring(tmp_path,monkeypatch):
+    from capx.envs.launch import LaunchArgs
+    from capx.utils.launch_utils import _load_config
+    monkeypatch.setenv('CAPX_SHADOW_EVIDENCE_ROOT',str(tmp_path/'evidence'))
+    factory,cfg,_=_load_config(LaunchArgs(config_path='env_configs/opentac/play_piano_shadow_digit_evidence_memory.yaml'))
+    assert cfg['shadow_piano_evidence_memory']==str(tmp_path/'evidence')
+    assert factory['cfg']['low_level']['evidence_memory_root']==str(tmp_path/'evidence')
+    assert factory['cfg']['low_level']['action_repeat']==4
+    assert mem.memory_policy(cfg)['arm']=='tactile_evidence_joint'
+    assert mem.repair(SimpleNamespace(),cfg) is None
+    assert not mem.action_memory_enabled(cfg)
+    assert cfg['max_regenerations']==0
+
+
+@pytest.mark.parametrize('mode,text,history,updates',[
+    ('none',False,False,False),('text',True,False,True),
+    ('tactile',False,True,True),('joint',True,True,True)])
+def test_four_arm_policy_reaches_runtime(tmp_path,monkeypatch,mode,text,history,updates):
+    from capx.envs.launch import LaunchArgs
+    from capx.utils.launch_utils import _load_config
+    monkeypatch.setenv('CAPX_SHADOW_EVIDENCE_ROOT',str(tmp_path/'memory'))
+    monkeypatch.setenv('CAPX_SHADOW_EVIDENCE_MODE',mode)
+    monkeypatch.setenv('CAPX_SHADOW_KEYBOARD_CACHE',str(tmp_path/'one_seed_keyboard.json'))
+    factory,cfg,_=_load_config(LaunchArgs(config_path='env_configs/opentac/play_piano_shadow_digit_evidence_memory.yaml'))
+    assert mem.evidence_policy(cfg)=={'mode':mode,'text_memory':text,'tactile_history':history,'update':updates}
+    assert factory['cfg']['low_level']['retrieve_tactile_history'] is history
+    assert factory['cfg']['low_level']['keyboard_calibration_path']==str(tmp_path/'one_seed_keyboard.json')
+
+
+def test_no_memory_never_reads_previous_code_or_calls_episode_updater(tmp_path,monkeypatch):
+    cfg,rec=run_public_evidence_fixture(tmp_path,'none')
+    cfg['shadow_piano_evidence_mode']='none'
+    cfg['_piano_public_request']=rec.request
+    monkeypatch.setattr(mem,'compatibility',lambda _: {})
+    monkeypatch.setattr(mem,'linked_initial_record',lambda *a:pytest.fail('No-memory arm read code cache'))
+    calls=[]
+    monkeypatch.setattr(mem,'_query',lambda *a,**kw: calls.append(1) or {'content':EVIDENCE_SOURCE})
+    for name in ('seed0','seed1'):
+        cfg['output_dir']=str(tmp_path/name)
+        mem.initial_code(SimpleNamespace(),cfg,{'full_prompt':[]})
+        result=mem.finish_linked_episode(cfg,SimpleNamespace())
+        assert result['status']=='disabled_no_memory'
+    assert len(calls)==2
+    assert not (tmp_path/'evidence'/'active_bundle.json').exists()
+
+
+def test_api_queue_wait_is_separate_and_lock_releases(tmp_path,monkeypatch):
+    import fcntl,threading,time
+    from capx.llm import client
+    from contextlib import contextmanager
+    lock_path=tmp_path/'api.lock';lock=lock_path.open('a')
+    fcntl.flock(lock,fcntl.LOCK_EX)
+    monkeypatch.setenv('CAPX_LLM_SERIAL_LOCK',str(lock_path))
+    monkeypatch.setenv('CAPX_OUTPUT_DIR',str(tmp_path))
+    deadlines=[]
+    @contextmanager
+    def deadline(seconds,*,phase):
+        deadlines.append(seconds);yield
+    monkeypatch.setattr(mem,'request_deadline',deadline)
+    monkeypatch.setattr(client,'query_model',lambda *args:{'content':'ok'})
+    timer=threading.Timer(.1,lambda:fcntl.flock(lock,fcntl.LOCK_UN));timer.start()
+    try:
+        assert mem._query(SimpleNamespace(),[],deadline_seconds=300)['content']=='ok'
+    finally:
+        timer.join();lock.close()
+    row=json.loads((tmp_path/'piano_api_queue.jsonl').read_text())
+    assert row['queue_seconds']>=.1 and deadlines==[300]
+    with lock_path.open('a') as stream:fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize('mode', ['text','tactile','joint'])
+def test_updater_arm_input_and_output_isolation(tmp_path,monkeypatch,mode):
+    run_public_evidence_fixture(tmp_path,'prior')
+    cfg,rec=run_public_evidence_fixture(tmp_path,'current')
+    cfg['shadow_piano_evidence_mode']=mode
+    seen=[]
+    def query(args,messages,**kw):
+        e=json.loads(messages[1]['content']);seen.append(e)
+        if mode=='text':assert not e['historical_clips']
+        else:assert e['historical_clips']
+        proposal=linked_proposal(e)
+        if mode=='tactile':
+            proposal['rules']=[];proposal['rule_evidence']=[]
+        return {'content':json.dumps(proposal)}
+    monkeypatch.setattr(mem,'_query',query)
+    result=mem.finish_linked_episode(cfg,SimpleNamespace())
+    assert result['accepted'],result
+    assert len(seen)==1
+    bundle=mem._linked_bundle(Path(cfg['shadow_piano_evidence_memory']),result['candidate_bundle'])
+    assert bool(bundle['rules']['skills'])==(mode!='tactile')
+    if mode=='tactile':
+        with pytest.raises(ValueError,match='text experience'):
+            mem.validate_linked_proposal(linked_proposal(seen[0]),EVIDENCE_SOURCE,seen[0])
+
+
+def test_unexecuted_or_failed_candidate_keeps_previous_active_version(tmp_path,monkeypatch):
+    cfg,rec=run_public_evidence_fixture(tmp_path,'first')
+    def query(args,messages,**kw):return {'content':json.dumps(linked_proposal(json.loads(messages[1]['content'])))}
+    monkeypatch.setattr(mem,'_query',query)
+    first=mem.finish_linked_episode(cfg,SimpleNamespace())
+    root=Path(cfg['shadow_piano_evidence_memory'])
+    before=json.loads((root/'active_bundle.json').read_text())['bundle_id']
+    next_cfg={**cfg,'output_dir':str(tmp_path/'next')}
+    record,_=mem.linked_initial_record(next_cfg,{'fixed':'signature'})
+    assert record['bundle_id']==first['candidate_bundle']
+    next_cfg,rec2=run_public_evidence_fixture(tmp_path,'next',record['source'],next_cfg)
+    manifest=json.loads(rec2.manifest_path.read_text())
+    # A function definition alone is not an actual application of the patch.
+    press_ids={f['function_id'] for f in manifest['functions'] if f['name']=='press'}
+    manifest['invocations']=[i for i in manifest['invocations'] if i['function_id'] not in press_ids]
+    mem.atomic_json(rec2.manifest_path,manifest)
+    monkeypatch.setattr(mem,'_query',lambda *a,**kw: (_ for _ in ()).throw(TimeoutError('offline')))
+    second=mem.finish_linked_episode(next_cfg,SimpleNamespace())
+    assert not second['public_execution_checked'] and not second['accepted']
+    assert json.loads((root/'active_bundle.json').read_text())['bundle_id']==before
+    fallback,_=mem.linked_initial_record({**next_cfg,'output_dir':str(tmp_path/'fallback')},{'fixed':'signature'})
+    assert fallback['bundle_id']==before
+
+
 def test_tactile_memory_pairs_contact_signature_with_public_hold_and_actual_application(tmp_path):
     path=tmp_path/'tactile.json';events=[]
     emit=lambda kind,**row:events.append({'kind':kind,**row})
@@ -130,6 +404,111 @@ def test_reject_nonreusable_or_unsafe_modules(source):
     with pytest.raises(ValueError):mem.validate_source(source)
 
 
+def test_marker_exception_is_valid_and_runs_inside_host_wrapper():
+    source = '''class PianoTerminated(Exception):
+    """Local control-flow marker; not a native scoring signal."""
+    pass
+
+DT = 4.0 / 240.0
+def run_piano(request, piano_state):
+    try:
+        raise PianoTerminated()
+    except PianoTerminated:
+        piano_state['completed'] += 1
+'''
+    scope = {}
+    exec(mem.wrapped(source, {'notes': ['F4']}, {}), scope)
+    assert scope['piano_state']['completed'] == 1 and scope['capx_stop'] is True
+
+
+@pytest.mark.parametrize('declaration', [
+    'class Unsafe(Exception):\n    get_hand_state()\n',
+    'class Unsafe(Exception):\n    def __init__(self):\n        pass\n',
+    '@get_hand_state\nclass Unsafe(Exception):\n    pass\n',
+    'class Unsafe(get_hand_state()):\n    pass\n',
+])
+def test_exception_declaration_cannot_execute_or_hide_class_logic(declaration):
+    with pytest.raises(ValueError, match='marker exception'):
+        mem.validate_source(declaration + SOURCE)
+
+
+@pytest.mark.parametrize('call', ['solve()', 'run_piano(request, piano_state)'])
+def test_entry_calls_are_rejected_with_precise_location(call):
+    source = SOURCE + '\n' + call + '\n'
+    with pytest.raises(ValueError, match='Top-level call') as error:
+        mem.validate_source(source)
+    assert call in str(error.value) and 'line ' in str(error.value)
+    assert 'exactly once' in str(error.value)
+
+
+@pytest.mark.parametrize('extra', [
+    'state = get_hand_state()\n',
+    'def helper(value=get_hand_state()):\n    pass\n',
+    '@get_hand_state\ndef helper():\n    pass\n',
+])
+def test_observation_and_action_setup_cannot_run_while_module_loads(extra):
+    with pytest.raises(ValueError, match='during loading|Module-loading expression'):
+        mem.validate_source(extra + SOURCE)
+
+
+def test_host_module_calls_policy_once_without_automatic_solve(monkeypatch):
+    from capx.envs.tasks.base import CodeExecEnvConfig, CodeExecutionEnvBase
+    low = SimpleNamespace(get_observation=lambda: {}, get_action_count=lambda: 0, get_step_count=lambda: 0)
+    monkeypatch.setattr(CodeExecutionEnvBase, '_build_low_level', lambda *a: low)
+    env = CodeExecutionEnvBase(CodeExecEnvConfig(low_level=low, apis=[], prompt='Reusable policy.',
+        generated_code_mode='host_module', stream_user_code_output=False))
+    calls = []
+    env._exec_globals['finish_piano_note_attempt'] = calls.append
+    source = '''def solve():
+    finish_piano_note_attempt(99)
+def run_piano(request, piano_state):
+    finish_piano_note_attempt(0)
+'''
+    result = env._exec_user_code(mem.wrapped(source, {'notes':['F4']}, {}))
+    assert result['ok'], result['stderr']
+    assert calls == [0]
+    assert 'auto-calling generated solve' not in result['stdout']
+    assert 'must also call solve()' not in env._system_prompt
+    assert 'exactly once' in env._system_prompt
+
+
+@pytest.mark.parametrize('arm', ['none', 'text', 'tactile', 'joint'])
+def test_memory_generation_prompt_uses_one_consistent_module_contract(tmp_path, monkeypatch, arm):
+    from capx.envs.launch import LaunchArgs
+    from capx.utils.launch_utils import _load_config
+    from capx.envs.tasks.base import CodeExecEnvConfig, CodeExecutionEnvBase
+    monkeypatch.setenv('CAPX_SHADOW_EVIDENCE_ROOT', str(tmp_path/'memory'))
+    monkeypatch.setenv('CAPX_SHADOW_EVIDENCE_MODE', arm)
+    factory, cfg, _ = _load_config(LaunchArgs(
+        config_path='env_configs/opentac/play_piano_shadow_digit_evidence_memory.yaml'))
+    assert factory['cfg']['generated_code_mode'] == 'host_module'
+    low = SimpleNamespace(get_observation=lambda: {})
+    monkeypatch.setattr(CodeExecutionEnvBase, '_build_low_level', lambda *a: low)
+    env = CodeExecutionEnvBase(CodeExecEnvConfig(low_level=low, apis=[],
+        prompt=factory['cfg']['prompt'], generated_code_mode=factory['cfg']['generated_code_mode']))
+    cfg['output_dir'] = str(tmp_path/'run')
+    cfg['_piano_public_request'] = {'notes':['F4'], 'dynamics':['light'], 'hold_seconds':[.12]}
+    monkeypatch.setattr(mem, 'compatibility', lambda _: {'test':'module'})
+    captured = []
+    monkeypatch.setattr(mem, '_query', lambda args, messages, **kw: captured.append(messages) or {'content':SOURCE})
+    code, _, _ = mem.initial_code(SimpleNamespace(), cfg, env._get_observation())
+    prompt = json.dumps(captured)
+    assert 'must also call solve()' not in prompt
+    assert 'perform actions immediately' not in prompt
+    assert 'calls the entry point exactly once' in prompt
+    assert 'No top-level execution or entry-point call' in prompt
+    assert 'run_piano(_PUBLIC_PIANO_REQUEST, piano_state)' in code
+
+
+def test_code_memory_refuses_explicit_script_execution_mode(monkeypatch):
+    from capx.envs.launch import LaunchArgs
+    from capx.utils import launch_utils
+    monkeypatch.setattr(launch_utils.DictLoader, 'load', lambda _: {
+        'env': {'cfg': {'generated_code_mode':'script'}}, 'shadow_piano_code_memory':'cache'})
+    with pytest.raises(ValueError, match='requires generated_code_mode=host_module'):
+        launch_utils._load_config(LaunchArgs(config_path='unused.yaml'))
+
+
 def test_release_guard_refuses_early_finalization_without_advancing(tmp_path):
     env=ShadowPianoLowLevelEnv.__new__(ShadowPianoLowLevelEnv)
     env.piano_continue_on_note_failure=True;env.visual_key_mode=True;env._policy_end_submitted=False
@@ -140,6 +519,111 @@ def test_release_guard_refuses_early_finalization_without_advancing(tmp_path):
     with pytest.raises(ValueError,match='release has not completed'):env.finish_piano_note_attempt(0)
     assert env._task.step_count==112 and env._public_attempts_finalized==0
     assert events[0][0]=='release_rejected'
+
+
+def terminal_return_fixture(monkeypatch, *, consumed=6, finalized=5, verdict=True, native_done=True):
+    from capx.envs.tasks.base import CodeExecEnvConfig, CodeExecutionEnvBase
+    low = ShadowPianoLowLevelEnv.__new__(ShadowPianoLowLevelEnv)
+    low._native_done = native_done
+    low._policy_end_submitted = False
+    low._policy_end_verdict = False
+    low.visual_key_mode = True
+    low.piano_continue_on_note_failure = True
+    low.piano_notes = ['F4', 'A4', 'C#4', 'A4', 'A4', 'E4']
+    low._public_attempts_finalized = finalized
+    low.require_public_release = True
+    low._release_ready_since = None
+    low._sim_step_count = 1406
+    low._native_info = {'notes_attempted': consumed, 'success': verdict, 'actual_force_N': 98765}
+    low._task = SimpleNamespace(step_count=5621,
+        step=lambda *a: pytest.fail('Terminal cleanup must not step physics'),
+        finish_piano_note_attempt=lambda *a: pytest.fail('Already-consumed attempts must not be scored again'))
+    low.get_observation = lambda: {'hand_state': {'index_flexion_rad': .14, 'wrist_z_m': -.001}}
+    low._save_tactile_snapshot = lambda *a: None
+    events, native_events = [], []
+    low._write_public_event = lambda kind, **fields: events.append({'kind': kind, **fields})
+    low._write_native_event = native_events.append
+    monkeypatch.setattr(CodeExecutionEnvBase, '_build_low_level', lambda *a: low)
+    high = CodeExecutionEnvBase(CodeExecEnvConfig(low_level=low, apis=[], prompt='Piano.',
+        generated_code_mode='host_module', stream_user_code_output=False))
+    high._exec_globals['piano_state'] = {'completed': finalized, 'policy_parameters': {}}
+    return high, low, events, native_events
+
+
+@pytest.mark.parametrize('verdict', [True, False])
+def test_terminal_return_submits_end_without_changing_native_verdict(monkeypatch, verdict):
+    high, low, events, native_events = terminal_return_fixture(monkeypatch, verdict=verdict)
+    # Reproduce the archived policy: release returns False after native_done,
+    # so run_piano returns normally before updating completed or submitting END.
+    source = '''def release():
+    print('PIANO_STOP release_timeout')
+    return False
+def run_piano(request, piano_state):
+    if not release():
+        return
+'''
+    snapshot = dict(low._native_info)
+    _, reward, terminated, _, info = high.step(mem.wrapped(source, {'notes': low.piano_notes}, {}))
+    assert info['sandbox_rc'] == 0 and terminated
+    assert reward == float(verdict) and info['task_completed'] is verdict
+    assert low._native_info == snapshot and low._task.step_count == 5621
+    assert low._public_attempts_finalized == 6 and low._policy_end_submitted
+    assert high._exec_globals['capx_stop'] is True
+    # Preserve what the policy actually did; host cleanup is separately labeled.
+    assert high._exec_globals['piano_state']['completed'] == 5
+    assert 'PIANO_STOP release_timeout' in info['stdout'] and '[capx-host] END' in info['stdout']
+    finalizations = [e for e in events if e['kind'] == 'attempt_finalized']
+    assert finalizations == [{'kind':'attempt_finalized', 'index':5, 'release_verified':False,
+                             'finalization_source':'host_native_termination'}]
+    assert native_events.count('END') == 1
+    assert low.finalize_native_termination() is False and native_events.count('END') == 1
+    assert '98765' not in json.dumps(events) and not any('success' in e for e in events)
+    with pytest.raises(RuntimeError, match='ended'):
+        low.step([0, 0, .04, 0])
+
+
+@pytest.mark.parametrize('consumed,finalized,new_indices', [(2, 2, []), (3, 2, [2]), (6, 6, [])])
+def test_terminal_cleanup_never_invents_unattempted_notes(monkeypatch, consumed, finalized, new_indices):
+    high, low, events, native_events = terminal_return_fixture(
+        monkeypatch, consumed=consumed, finalized=finalized, verdict=False)
+    _, reward, terminated, _, info = high.step(mem.wrapped(
+        'def run_piano(request, piano_state):\n    return\n', {'notes':low.piano_notes}, {}))
+    assert terminated and reward == 0 and info['task_completed'] is False
+    assert low._public_attempts_finalized == consumed
+    assert [e['index'] for e in events if e['kind']=='attempt_finalized'] == new_indices
+    assert native_events.count('END') == 1
+
+
+def test_active_release_timeout_does_not_trigger_terminal_cleanup(monkeypatch):
+    high, low, events, native_events = terminal_return_fixture(monkeypatch, consumed=5, native_done=False)
+    source = 'def run_piano(request, piano_state):\n    print("PIANO_STOP release_timeout")\n'
+    _, reward, terminated, _, info = high.step(mem.wrapped(source, {'notes':low.piano_notes}, {}))
+    assert not terminated and reward == 0 and not low._policy_end_submitted
+    assert low._public_attempts_finalized == 5 and not native_events
+    with pytest.raises(ValueError, match='release has not completed'):
+        low.finish_piano_note_attempt(5)
+
+
+def test_terminal_cleanup_does_not_mask_policy_exceptions(monkeypatch):
+    high, low, events, native_events = terminal_return_fixture(monkeypatch)
+    source = 'def run_piano(request, piano_state):\n    raise ValueError("policy bug")\n'
+    _, reward, terminated, _, info = high.step(mem.wrapped(source, {'notes':low.piano_notes}, {}))
+    assert info['sandbox_rc'] == 1 and 'policy bug' in info['stderr']
+    assert reward == 0 and not terminated and not low._policy_end_submitted
+    assert low._public_attempts_finalized == 5 and not native_events
+
+
+def test_host_terminal_outcome_is_public_but_not_a_release_check(tmp_path):
+    from test_shadow_piano_online_skills import evidence_recorder
+    rec = evidence_recorder(tmp_path, 'terminal')
+    rec.event('attempt_finalized', index=0, release_verified=False,
+        finalization_source='host_native_termination', success=True, actual_force_N=98765)
+    rec.event('native_terminal_end', finalized_indices=[0], success=True)
+    rec.close()
+    assert rec.events[-2]['release_verified'] is False
+    assert rec.events[-2]['finalization_source'] == 'host_native_termination'
+    assert rec.events[-1]['finalized_indices'] == [0]
+    assert 'success' not in json.dumps(rec.events) and '98765' not in json.dumps(rec.events)
 
 
 def test_public_evidence_includes_actual_release_actions_and_excludes_labels(tmp_path):
@@ -545,3 +1029,49 @@ def test_corrupt_function_index_falls_back_and_preserves_original_on_rebuild(tmp
     mem.finish_episode(cfg)
     assert next((root/'rejected_indexes').glob('*.json')).read_text()=='{broken'
     assert json.loads((root/'action_skills.json').read_text())['bundles']
+
+
+def test_parallel_api_failure_sets_shared_abort_and_prevents_next_request(tmp_path, monkeypatch):
+    flag = tmp_path / 'api_abort.json'
+    monkeypatch.setenv('CAPX_LLM_ABORT_FILE', str(flag))
+    monkeypatch.setenv('CAPX_OUTPUT_DIR', str(tmp_path))
+    calls = []
+    def failing(*args, **kwargs):
+        calls.append(1)
+        raise RuntimeError('request failed secret-test-key')
+    monkeypatch.setattr(mem, '_query_impl', failing)
+    args = SimpleNamespace(model='test', api_key='secret-test-key')
+    with pytest.raises(RuntimeError, match='request failed'):
+        mem._query(args, [], phase='initial')
+    first = flag.read_text()
+    assert 'secret-test-key' not in first and '[REDACTED]' in first
+    assert json.loads(first)['phase'] == 'initial'
+    with pytest.raises(RuntimeError, match='earlier API failure'):
+        mem._query(args, [], phase='update')
+    assert calls == [1] and flag.read_text() == first
+    events = [json.loads(line) for line in (tmp_path/'piano_api_requests.jsonl').read_text().splitlines()]
+    assert [e['event'] for e in events] == ['started', 'failed']
+
+
+def test_parallel_success_records_timing_without_abort(tmp_path, monkeypatch):
+    flag = tmp_path / 'api_abort.json'
+    monkeypatch.setenv('CAPX_LLM_ABORT_FILE', str(flag))
+    monkeypatch.setenv('CAPX_OUTPUT_DIR', str(tmp_path))
+    monkeypatch.setattr(mem, '_query_impl', lambda *a, **kw: {'content': 'code'})
+    assert mem._query(SimpleNamespace(model='test'), []) == {'content': 'code'}
+    assert not flag.exists()
+    events = [json.loads(line) for line in (tmp_path/'piano_api_requests.jsonl').read_text().splitlines()]
+    assert [e['event'] for e in events] == ['started', 'completed']
+    assert events[0]['request_id'] == events[1]['request_id']
+
+
+def test_parallel_reply_is_not_executed_after_other_request_failed(tmp_path, monkeypatch):
+    flag = tmp_path / 'api_abort.json'
+    monkeypatch.setenv('CAPX_LLM_ABORT_FILE', str(flag))
+    monkeypatch.setenv('CAPX_OUTPUT_DIR', str(tmp_path))
+    def reply(*args, **kwargs):
+        flag.write_text('{"error":"other request"}')
+        return {'content':'code'}
+    monkeypatch.setattr(mem, '_query_impl', reply)
+    with pytest.raises(RuntimeError, match='another request failed'):
+        mem._query(SimpleNamespace(model='test'), [])

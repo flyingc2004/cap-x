@@ -538,6 +538,7 @@ def _completed_responses_stream(lines: Iterable, timeout: float) -> dict[str, An
     started = time.monotonic()
     data: list[str] = []
     total_bytes = 0
+    completed_items: dict[int, dict[str, Any]] = {}
     for line in lines:
         if time.monotonic() - started > timeout:
             raise TimeoutError("Responses SSE exceeded its request deadline")
@@ -557,10 +558,25 @@ def _completed_responses_stream(lines: Iterable, timeout: float) -> dict[str, An
             if not isinstance(event, dict):
                 raise RuntimeError("Invalid Responses SSE event")
             kind = event.get("type")
+            if kind == "response.output_item.done":
+                index, item = event.get("output_index"), event.get("item")
+                if not isinstance(index, int) or index < 0 or not isinstance(item, dict):
+                    raise RuntimeError("Invalid Responses SSE completed output item")
+                if index in completed_items and completed_items[index] != item:
+                    raise RuntimeError("Conflicting Responses SSE completed output item")
+                completed_items[index] = item
             if kind == "response.completed":
                 body = event.get("response")
                 if not isinstance(body, dict) or body.get("status") != "completed":
                     raise RuntimeError("Responses SSE terminal body is not completed")
+                # Some compatible endpoints omit output from the terminal
+                # envelope even though output_item.done carries the full item.
+                # Recover only completed items after a completed request; never
+                # execute accumulated deltas or an interrupted response.
+                if not body.get("output") and completed_items:
+                    if sorted(completed_items) != list(range(len(completed_items))):
+                        raise RuntimeError("Responses SSE completed output items have gaps")
+                    body = {**body, "output": [completed_items[i] for i in sorted(completed_items)]}
                 return body
             if kind in {"error", "response.failed", "response.incomplete", "response.cancelled"}:
                 raise RuntimeError("Responses SSE failed: " + json.dumps(event, ensure_ascii=False)[:1500])

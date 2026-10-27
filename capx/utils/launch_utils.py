@@ -98,7 +98,31 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
             f"YAML config {config_path} must contain 'env' key with environment configuration"
         )
     env_factory = configs_dict["env"]
+    if configs_dict.get('shadow_piano_code_memory'):
+        # This runner already adds the sole entry-point call around the module.
+        # Never send the generic script/solve() instruction or auto-call solve.
+        mode = env_factory['cfg'].get('generated_code_mode', 'host_module')
+        if mode != 'host_module':
+            raise ValueError('Shadow code memory requires generated_code_mode=host_module')
+        env_factory['cfg']['generated_code_mode'] = 'host_module'
     shadow_memory_policy = configs_dict.get("shadow_piano_memory_policy")
+    evidence_root = configs_dict.get('shadow_piano_evidence_memory')
+    evidence_mode = configs_dict.get('shadow_piano_evidence_mode', 'joint')
+    if evidence_root:
+        from capx.integrations.opentac_shadow_code_memory import evidence_policy
+        evidence_options = evidence_policy(configs_dict)
+        if (configs_dict.get('shadow_piano_tactile_skill_pilot') or configs_dict.get('evolve_skill_library')
+                or configs_dict.get('shadow_piano_action_memory') or configs_dict.get('shadow_piano_public_skill_library')
+                or not configs_dict.get('shadow_piano_code_memory')):
+            raise ValueError('Evidence mode needs independent code memory and one joint updater')
+        low = env_factory['cfg']['low_level']
+        if low.get('_target_') != 'capx.envs.simulators.opentac_shadow.ShadowPianoLowLevelEnv':
+            raise ValueError('Evidence mode requires the public Shadow adapter')
+        if int(low.get('action_repeat', 0)) != 4 or not low.get('require_public_release'):
+            raise ValueError('Evidence mode preserves four physics steps and measured release guards')
+        low['evidence_memory_root'] = evidence_root
+        low['public_episode_recording'] = True
+        low['retrieve_tactile_history'] = evidence_options['tactile_history']
     if shadow_memory_policy is not None:
         from capx.integrations.opentac_shadow_code_memory import memory_policy
         shadow_memory_policy = memory_policy(configs_dict)
@@ -197,6 +221,8 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         else configs_dict.get("use_oracle_code", False),
         "resume_idx": configs_dict.get("resume_idx", None),
         "shadow_piano_code_memory": configs_dict.get("shadow_piano_code_memory"),
+        "shadow_piano_evidence_memory": evidence_root,
+        "shadow_piano_evidence_mode": evidence_mode,
         "shadow_piano_tactile_skill_pilot": configs_dict.get("shadow_piano_tactile_skill_pilot", False),
         "shadow_piano_action_memory": configs_dict.get("shadow_piano_action_memory", False),
         "shadow_piano_memory_policy": shadow_memory_policy,

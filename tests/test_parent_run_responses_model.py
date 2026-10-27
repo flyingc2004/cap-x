@@ -4,8 +4,66 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
+
+
+def _run_text_preflight(monkeypatch):
+    parent = Path(__file__).resolve().parents[2]
+    run = parent / 'run'
+    if not run.exists():
+        pytest.skip('Parent t-cap wrapper is not present in this checkout')
+    block = run.read_text().split('echo "[run] llm preflight begin', 1)[1]
+    code = block.split("<<'PY'\n", 1)[1].split('\nPY', 1)[0]
+    monkeypatch.setattr(sys, 'argv', ['-', str(parent / 'cap-x')])
+    for key, value in {'CAPX_SERVER_URL':'https://unused.invalid/v1/responses',
+        'CAPX_MODEL':'gpt-6.1-sol', 'CAPX_LLM_PROTOCOL':'responses',
+        'CAPX_API_KEY':'fake-test-key', 'CAPX_DISABLE_PROXY':'1',
+        'LLM_PREFLIGHT_TIMEOUT_SECONDS':'60'}.items():
+        monkeypatch.setenv(key, value)
+    exec(compile(code, '<parent-run-preflight>', 'exec'), {})
+
+
+@pytest.mark.parametrize('codex_format', ['0', '1'])
+def test_text_preflight_uses_message_list_and_shared_response_transport(monkeypatch, capsys, codex_format):
+    from capx.llm import client
+    monkeypatch.setenv('CAPX_RESPONSES_CODEX_FORMAT', codex_format)
+    calls = []
+    def post(url, *, headers, payload, timeout):
+        calls.append(payload)
+        assert timeout == 60
+        assert headers['Authorization'] == 'Bearer fake-test-key'
+        return client._SimpleResponse(200, {}, json.dumps({'status':'completed', 'output_text':'OK'}))
+    monkeypatch.setattr(client, '_post_json', post)
+    _run_text_preflight(monkeypatch)
+    assert len(calls) == 1
+    payload = calls[0]
+    assert payload['input'] == [{'role':'user', 'content':[{'type':'input_text','text':'Reply with OK.'}]}]
+    if codex_format == '1':
+        assert payload['stream'] is True and payload['store'] is False
+        assert payload['tools'] == [] and payload['tool_choice'] == 'none'
+    assert "preflight ok status=200 preview='OK'" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('status,body', [
+    (400, {'error':{'message':'Input must be a list'}}),
+    (200, {'status':'incomplete','output_text':'partial'}),
+    (200, {'status':'completed','output':[]}),
+])
+def test_text_preflight_rejects_errors_without_retry(monkeypatch, capsys, status, body):
+    from capx.llm import client
+    monkeypatch.setenv('CAPX_RESPONSES_CODEX_FORMAT', '1')
+    calls = []
+    def post(*args, **kwargs):
+        calls.append(1)
+        return client._SimpleResponse(status, {}, json.dumps(body))
+    monkeypatch.setattr(client, '_post_json', post)
+    with pytest.raises(SystemExit) as exc:
+        _run_text_preflight(monkeypatch)
+    assert exc.value.code == 1 and calls == [1]
+    output = capsys.readouterr()
+    assert 'preflight failed' in output.err and 'preflight ok' not in output.out
 
 
 @pytest.mark.parametrize('overrides,expected', [

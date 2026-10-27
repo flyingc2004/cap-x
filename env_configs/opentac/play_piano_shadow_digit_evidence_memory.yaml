@@ -1,0 +1,258 @@
+# Opt-in public evidence loop. No encoder training or automatic experiment suite.
+env:
+  _target_: capx.envs.tasks.base.CodeExecutionEnvBase
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    generated_code_mode: host_module
+    stream_user_code_output: false
+    low_level:
+      _target_: capx.envs.simulators.opentac_shadow.ShadowPianoLowLevelEnv
+      univtac_root: ${oc.env:UNIVTAC_ROOT,/mnt/a/ljz/cap/OpenTacBench}
+      piano_notes: null
+      piano_dynamics: null
+      piano_hold_seconds: 0.12
+      piano_require_dynamics: true
+      piano_continue_on_note_failure: true
+      seed_base: 0
+      device: cuda:0
+      tactile_image_width: 320
+      action_repeat: 4
+      digit_piano_config: ${oc.env:CAPX_DIR,/mnt/a/ljz/cap/t-cap/cap-x}/env_configs/opentac/config_digit_piano_0_2.v1.yml
+      digit_force_sidecar: ${oc.env:CAPX_SHADOW_FORCE_SIDECAR,${oc.env:CAPX_DIR,/mnt/a/ljz/cap/t-cap/cap-x}/env_configs/opentac/shadow_digit_key_top_force_5d_matched60hz_8episode.v1.json}
+      private_audit_root: ${oc.env:CAPX_SHADOW_PRIVATE_AUDIT_ROOT,/mnt/data/ljz/opentacbench/capx-private-audits/shadow_piano_visual_force_v1}
+      visual_key_mode: true
+      auto_clear_keyboard_for_visual: true
+      snap_visual_key_pixels: true
+      mirror_head_view: true
+      video_frame_stride: 12
+      video_width: 512
+      piano_note_count: 6
+      task_seed: ${oc.env:CAPX_SHADOW_TASK_SEED,3300}
+      endpoint_calibration: true
+      keyboard_calibration_path: ${oc.env:CAPX_SHADOW_KEYBOARD_CACHE,${oc.env:CAPX_SHADOW_EVIDENCE_ROOT,/mnt/data/ljz/opentacbench/shadow_piano_evidence_v1}/keyboard_calibration.json}
+      public_episode_recording: true
+      require_public_release: true
+      third_party_video: true
+      evidence_memory_root: ${oc.env:CAPX_SHADOW_EVIDENCE_ROOT,/mnt/data/ljz/opentacbench/shadow_piano_evidence_v1}
+      # Parallel retrieval spaces; the frozen instantaneous 5D force model above stays active.
+      tactile_temporal_encoder:
+        run_dir: ${oc.env:CAPX_SHADOW_TRAJECTORY_RUN,/mnt/data/ljz/opentacbench/tactile_trajectory_encoder_v1/run_20261027T091422Z}
+        representations: [window4, tactile, tactile_action]
+    privileged: false
+    apis:
+    - ShadowPianoVisualForceApi
+    prompt: 'Play the CURRENT PUBLIC REQUEST appended after reset using the Shadow
+      Hand index finger.
+
+      Define run_piano(request, piano_state) with reusable MODULE-LEVEL press, hold
+      and release helpers.
+
+      Iterate request notes/dynamics/hold_seconds, preserve completed attempts, and
+      return after every
+
+      requested attempt is finalized. The host submits END. A failed note consumes
+      an attempt.
+
+      Never read native scoring, true forces, rewards, success, task objects or expert
+      policies.
+
+
+      Use get_keyboard_endpoints(). If calibration_ready reuse mapped_keys with no
+      image. Otherwise
+
+      confirm A0/C8 and the black-key pattern in the initial mirrored HEAD image (960x662,
+      header22px).
+
+      Call locate_visual_keys with A0/C8 {u:x/960,v:(y-22)/640,color:''white''}; public
+      endpoints and
+
+      0.0235m white-key spacing determine targets. Save the accepted map in piano_state[''keys''].
+
+      Never bake individual notes, coordinates or the current melody into the reusable
+      policy.
+
+      At hover z=0.04m with finger extended, move to mapped X/Y. Verify actual X/Y
+      arrival and
+
+      stability from get_hand_state before lowering or curling. Use the API''s measured
+      arrival guards.
+
+
+      Initial numerical priors: descend in about0.50s, curl smoothly to0.50rad over0.45s
+      with
+
+      u=clamp(elapsed/0.45,0,1), theta=0.50*(3*u*u-2*u*u*u), extend about0.30s then
+      lift about0.50s.
+
+      These strategy durations may be adapted from public evidence; they are NOT mandatory
+      minimum
+
+      press counts. Native requested hold, release checks and motion/force safety
+      limits remain fixed.
+
+      Mapped nominal press_lift_z_m plus class trim gives a bounded probe: white/light
+      -0.00069m,
+
+      white/heavy -0.00286m, black/light -0.00090m, black/heavy -0.00209m. Clamp to
+      API bounds.
+
+      Use a common strategy with four color/dynamic parameter dictionaries, not note-specific
+      controls.
+
+
+      Time units: move_shadow_index(...,steps=1) and wait_steps(1) each execute ONE
+      native action. This configuration has action_repeat=4 and physics_hz=240,
+      so one action advances 4 physics ticks, or 1/60 second.
+
+      During press and hold ALWAYS pass steps=1, then read estimate_key_force(note)
+      after EACH return. Never pass steps=4 to request four physics ticks: it
+      executes FOUR actions (16 physics ticks), reducing feedback to 15Hz.
+
+      For nonterminal motion returns, advance elapsed simulation time by
+      result[''steps_executed'']*4/240, not steps_executed/240 or wall-clock time.
+      Budgets of 90 press actions and 180 release actions count executed ACTIONS,
+      not calls that batch several actions. Termination can shorten execution;
+      stop motion on native_done and do not fabricate remaining hold time.
+
+      Force sample_step and age_steps also use ACTION units. Consecutive samples
+      must differ by exactly 1. Re-reading without motion does not advance time;
+      skip duplicate samples and never interpolate missing force readings.
+
+      Normalize quality to lowercase. Handle no_contact before numeric checks: its
+      force is None;
+
+      continue bounded probing for this same note, reset the hold clock, and never
+      fabricate force.
+
+      OOD/stale/invalid or overforce requires safe release; finalize that attempt
+      and continue.
+
+      No in-episode code regeneration is enabled; the host reviews evidence once after
+      the episode.
+
+      Fresh quality=''ok'', age_steps=0 and finite force are prerequisites for feedback.
+      Keep Z fixed
+
+      until near-full curl and successive force samples stop rising. Then use bounded
+      Z feedback:
+
+      error=estimated-target; dz=clip(0.012*error,-0.003,0.003)*(4/240); clip Z to
+      probe+/-0.0010m
+
+      and native bounds. Per-action correction <=0.00005m. Positive Z reduces force.
+      Do not trim
+
+      on no_contact/OOD/stale or early transients. Stop pressing above target+tolerance.
+
+      Force targets/tolerances are fixed: white/light0.35+/-0.07N, white/heavy0.50+/-0.07N,
+
+      black/light0.70+/-0.14N, black/heavy1.00+/-0.14N. Hold gates (not setpoints)
+      remain
+
+      0.311,0.473,0.615,1.040N respectively. Use named target_force_N, tolerance_N,
+
+      hold_gate_median_N and hold_seconds bindings so updates can preserve them explicitly.
+
+      Start hold time only on stable fresh force above the gate and below target+tolerance.
+
+      Reset on any invalid, nonconsecutive or out-of-band sample. Count elapsed sample
+      intervals:
+
+      9 samples span8 intervals. Continue until the CURRENT streak spans request hold_seconds.
+
+      Keep a bounded attempt budget of at most90 press actions and180 release actions;
+      never force
+
+      completion by exceeding bounds. Public samples cannot certify every intermediate
+      physics tick.
+
+
+      Release by extending and lifting to hover. Before finish_piano_note_attempt(i),
+      ACTUAL index
+
+      flexion <=0.02rad and abs(wrist_z_m-0.04)<=0.002m must remain true continuously
+      for>=0.12s.
+
+      Keep advancing bounded release actions until measured arrival and elapsed interval
+      checks pass.
+
+      Never substitute sent targets or sample count for elapsed physical time. On
+      release timeout
+
+      print PIANO_STOP release_timeout and return without falsely finalizing. Check
+      native_done
+
+      from EVERY motion return; never move after termination. native_done is a distinct
+      terminal outcome, NOT release_timeout and NOT evidence of success. Propagate it
+      through helpers and return normally from run_piano immediately, even before
+      the hand reaches hover. The host records only attempts already consumed by
+      the native task and submits END using its unchanged verdict. Do not call more
+      motion or mark unattempted notes completed to satisfy the requested count.
+
+      After finalization update piano_state[''completed''], append a public attempt
+      summary and print
+
+      PIANO_NOTE with index, quality, had_valid_contact, public_hold_confidence and
+      abort_reason.
+
+      No public confidence or memory entry proves official success. No files or arbitrary
+      env access.
+
+
+      The host records continuous public 5D plus RGB/depth/masks and actual helper
+      invocations.
+
+      A future temporal encoder is a PARALLEL memory representation, never a replacement
+      for 5D
+
+      or the frozen force estimator. One episode-boundary updater can modify up to
+      two helpers
+
+      using these public trajectories. Historical rules and parameter suggestions
+      are advisory;
+
+      verify them with fresh tactile feedback. Preserve hard limits and the requested
+      melody.
+
+      '
+    multi_turn_prompt: 'Use the unchanged public request and preserve finalized attempts.
+      No private scoring. {console_stdout}
+
+      {console_stderr}'
+trials: 1
+num_workers: 1
+record_video: true
+output_dir: ${oc.env:CAPX_OUTPUT_DIR,/mnt/data/ljz/opentacbench/capx-runs/shadow_piano_evidence}
+trial_timeout_seconds: 7200
+code_block_wall_timeout_seconds: 3300
+max_trial_retries: 0
+max_regenerations: 0
+stop_multiturn_when_regeneration_exhausted: true
+multi_turn_on_failure_only: true
+multiturn_requires_checkpoint_or_failure: true
+shadow_piano_recover_on_stop: false
+shadow_piano_wrist_on_failure: false
+split_code_blocks_on_breakpoint: true
+visual_checkpoint_markers:
+- finger_alignment
+use_visual_feedback: true
+use_wrist_camera: false
+visual_feedback_raw_camera_views: true
+visual_feedback_context: shadow_piano
+visual_feedback_max_image_side_px: 960
+visual_feedback_jpeg_quality: 92
+visual_feedback_allow_unlisted_model: true
+visual_feedback_require_image_input: true
+save_multiturn_prompts: true
+tactile_memory:
+  trial:
+    enabled: false
+    include_in_multiturn: false
+  persistent:
+    enabled: false
+shadow_piano_code_memory: ${oc.env:CAPX_SHADOW_EVIDENCE_ROOT,/mnt/data/ljz/opentacbench/shadow_piano_evidence_v1}/legacy_code_archive
+shadow_piano_public_skill_library: null
+evolve_skill_library: false
+shadow_piano_evidence_memory: ${oc.env:CAPX_SHADOW_EVIDENCE_ROOT,/mnt/data/ljz/opentacbench/shadow_piano_evidence_v1}
+shadow_piano_evidence_mode: ${oc.env:CAPX_SHADOW_EVIDENCE_MODE,joint}
+shadow_piano_action_memory: false

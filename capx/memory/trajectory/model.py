@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 from torch import nn
+from pathlib import Path
 
 from .data import SCHEMA, WINDOW, causal_windows, read_json, reduce_depth, relative_motion, sha256
 
@@ -113,6 +114,94 @@ class FrozenTrajectoryEncoder:
         except (ValueError, TypeError, IndexError):
             return {**result, "quality": "invalid_input"}
         return {**result, "quality": "ok", "embedding": key.tolist(), "sample_time_s": float(times[-1])}
+
+
+class EvidenceTrajectoryEncoder:
+    """CPU adapter for the public evidence protocol; independent of force inference.
+
+    All three spaces use the frozen training preprocessing. The episode supplies
+    the actual sensor hash, timestamps and source references, never the expert index.
+    """
+
+    def __init__(self, run_dir, representation="tactile"):
+        if representation not in ("window4", "tactile", "tactile_action"):
+            raise ValueError("Unknown trajectory representation")
+        root = Path(run_dir).expanduser().resolve()
+        norm_path = root / "cache/normalization.json"
+        self.normalization = read_json(norm_path)
+        manifest = read_json(root / "cache/manifest.json")
+        if manifest["schema"] != SCHEMA or manifest["window"] != WINDOW:
+            raise ValueError("Incompatible trajectory preprocessing")
+        self.sensor = manifest["sensor_sha256"]
+        self.representation = representation
+        self.frozen = None
+        version = sha256(norm_path)
+        if representation != "window4":
+            self.frozen = FrozenTrajectoryEncoder(root / f"models/{representation}/seed_0/best.pt", device="cpu")
+            if (self.frozen.bundle["normalization"] != self.normalization or
+                    self.frozen.bundle["sensor_sha256"] != self.sensor or
+                    self.frozen.model.use_motion != (representation == "tactile_action")):
+                raise ValueError("Checkpoint and preprocessing contract differ")
+            version = self.frozen.encoder_version
+        self.contract = {"version": version, "representation": representation,
+            "preprocessing": "digit_trajectory_key.v1/reduce_depth.v1/causal_previous.v1",
+            "normalization_sha256": sha256(norm_path), "sensor_sha256": self.sensor,
+            "window": dict(WINDOW), "dimension": 64 if representation == "window4" else 32,
+            "modalities": ["depth_m", "reference_depth_m", "valid_mask"] +
+                (["actions", "actual_state"] if representation == "tactile_action" else [])}
+
+    def encode(self, window):
+        unavailable = {"vector": None, "quality": "unavailable"}
+        if window.get("sensor_sha256") != self.sensor:
+            return {**unavailable, "quality": "incompatible_sensor"}
+        try:
+            times = np.asarray(window["timestamps_s"], np.float64)
+            ids = causal_windows(times, np.ones(len(times), bool))
+            if not len(ids) or ids[-1, -1] != len(times)-1 or len(set(ids[-1])) != 16:
+                return {**unavailable, "quality": "insufficient_valid_history"}
+            ids = ids[-1]
+            frames = window["frames"]
+            reference = np.asarray(frames[0]["reference_depth_m"])
+            if any(not np.array_equal(f["reference_depth_m"], reference, equal_nan=True) for f in frames):
+                return {**unavailable, "quality": "incompatible_reference"}
+            depth = np.stack([f["depth_m"] for f in frames])
+            if any(m is None for m in window["valid_masks"]):
+                return {**unavailable, "quality": "missing_valid_mask"}
+            mask = np.stack(window["valid_masks"])
+            provenance = {"episode_id": window.get("episode_id"),
+                "target_times_s": (times[-1] - np.arange(15, -1, -1)/30).tolist(),
+                "samples": [window["sources"][i] for i in ids]}
+            if self.frozen is None:
+                _, features, good = reduce_depth(depth[ids], reference, mask[ids])
+                if not good.all():
+                    return {**unavailable, "quality": "insufficient_valid_history"}
+                mean = np.asarray(self.normalization["feature_mean"])
+                std = np.asarray(self.normalization["feature_std"])
+                if mean.shape != (4,) or std.shape != (4,) or np.any(std <= 0):
+                    raise ValueError("Invalid feature normalization")
+                vector = unit_rows(((features-mean)/std).reshape(1, 64))[0].tolist()
+            else:
+                motion = {}
+                if self.representation == "tactile_action":
+                    for name in ("actions", "actual_state"):
+                        value = window.get(name)
+                        # Historical missing X remains unavailable, never zero-filled.
+                        if value is None or any(value[i] is None for i in ids):
+                            return {**unavailable, "quality": "missing_public_motion", "provenance": provenance}
+                        array = np.asarray([value[i] for i in ids], np.float32)
+                        if array.shape != (16, 4) or not np.isfinite(array).all():
+                            return {**unavailable, "quality": "invalid_public_motion"}
+                        motion[name] = array
+                # Select by physical time first. This is 16 x 30Hz, not the last
+                # 16 observations of a 60Hz controller. No interpolation/padding.
+                result = self.frozen.encode_window(depth[ids], reference, mask[ids], times[ids],
+                    sensor_sha256=window["sensor_sha256"], **motion)
+                if result["quality"] != "ok":
+                    return {**unavailable, "quality": result["quality"], "provenance": provenance}
+                vector = result["embedding"]
+            return {"vector": vector, "quality": "ok", "provenance": provenance}
+        except (KeyError, ValueError, TypeError, IndexError):
+            return {**unavailable, "quality": "invalid_input"}
 
 
 def search_index(index_path, query, *, k=5):

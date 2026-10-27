@@ -11,6 +11,14 @@ import traceback
 
 os.environ.setdefault("CAPX_UNIVTAC_MINIMAL_IMPORTS", "1")
 
+# Kit enumerates physical devices independently of CUDA_VISIBLE_DEVICES. The
+# parallel launcher opts into an explicit physical ordinal before CUDA imports.
+_PHYSICAL_GPU = os.environ.get('CAPX_SHADOW_PHYSICAL_GPU')
+if _PHYSICAL_GPU is not None:
+    if not _PHYSICAL_GPU.isdigit():
+        raise ValueError('CAPX_SHADOW_PHYSICAL_GPU must be a physical GPU index')
+    os.environ.pop('CUDA_VISIBLE_DEVICES', None)
+
 from capx.envs.launch_univtac import build_parser
 
 
@@ -36,6 +44,8 @@ def _register_shadow_components() -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
+    device = f'cuda:{int(_PHYSICAL_GPU)}' if _PHYSICAL_GPU is not None else args.univtac_device
+    args.univtac_device = device
     opentac_root = os.environ.get("UNIVTAC_ROOT")
     if not opentac_root:
         raise RuntimeError("UNIVTAC_ROOT must point to OpenTacBench")
@@ -45,7 +55,13 @@ def main() -> None:
     try:
         sys.argv = [original_argv[0]]
         from isaaclab.app import AppLauncher
-        app = AppLauncher(argparse.Namespace(enable_cameras=True, num_envs=1)).app
+        # Each experiment process owns one explicitly selected GPU. Kit's
+        # multi-GPU default must not enlist GPUs assigned to another arm/user.
+        app = AppLauncher(argparse.Namespace(enable_cameras=True, num_envs=1,
+            device=device, multi_gpu=False)).app
+        if _PHYSICAL_GPU is not None:
+            import torch
+            torch.cuda.set_device(int(_PHYSICAL_GPU))
     except Exception as exc:
         raise RuntimeError("IsaacLab AppLauncher must start before the Shadow task imports") from exc
     finally:
@@ -60,6 +76,7 @@ def main() -> None:
     if low_level.get("_target_") != "capx.envs.simulators.opentac_shadow.ShadowPianoLowLevelEnv":
         raise ValueError("Shadow launcher requires ShadowPianoLowLevelEnv config")
     low_level["univtac_root"] = opentac_root
+    low_level['device'] = device
     server_procs = _start_api_servers(api_servers)
     run_ok = False
     run_error: BaseException | None = None

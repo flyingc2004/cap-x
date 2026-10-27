@@ -16,6 +16,194 @@ from capx.envs.tasks.base import CodeExecEnvConfig, CodeExecutionEnvBase
 from capx.envs import trial
 from test_opentac_shadow_adapter import FakeShadowTask
 
+
+def evidence_recorder(tmp_path, name='run', encoder=None):
+    from capx.integrations.opentac_shadow_online_skills import PublicTactileEvidence
+    return PublicTactileEvidence(tmp_path/'evidence', tmp_path/name,
+        {'sensor':'same', 'force_model':'frozen', 'action_repeat':4, 'physics_hz':240,
+         'frame':'public_endpoint_geometry.v1'},
+        {'notes':['F4'], 'dynamics':['light'], 'hold_seconds':[.12]}, encoder=encoder)
+
+
+def record_sample(recorder, step, flex=.5, z=.01, quality='ok'):
+    recorder.sample(action_step=step, physics_step=step*4, attempt=0, note='F4', dynamics='light',
+        action=[0.,0.,z,flex], hand={'index_flexion_rad':flex,'wrist_x_offset_m':0.,'wrist_y_m':0.,'wrist_z_m':z,
+                                  'key_forces':[987.], 'success':True},
+        estimate={'estimated_key_force_N':.35 if quality=='ok' else None,'quality':quality,
+                  'calibration_version':'frozen','reward':123}, features=[.1,.2,.3,.4,.5],
+        rgb=np.ones((2,3,3),np.uint8), depth=np.full((2,3),.01),
+        reference=np.full((2,3),.0101), scales=[1.]*5)
+
+
+def test_evidence_keeps_continuous_frames_5d_and_optional_temporal_independent(tmp_path):
+    from capx.integrations.opentac_shadow_online_skills import encode_tactile_window
+    rec=evidence_recorder(tmp_path)
+    for step,flex,z,q in [(1,.2,.01,'ok'),(2,.5,.01,'ood'),(3,.5,.01,'ok'),(4,0,.04,'no_contact')]:
+        record_sample(rec,step,flex,z,q)
+    record_sample(rec,4,0,.04)  # queries cannot invent a second frame
+    rec.close()
+    assert [s['physics_step'] for s in rec.frames]==[4,8,12,16]
+    assert [c['phase'] for c in rec.clips]==['press','hold','release']
+    assert rec.frames[1]['estimate']['estimated_key_force_N'] is None
+    manifest=rec.manifest_path.read_text()
+    assert all(x not in manifest for x in ('key_forces','success','reward','987'))
+    window=rec.window(rec.frames)
+    assert len(window['frames'])==4 and all(m.all() for m in window['valid_masks'])
+    assert encode_tactile_window(window)['quality']=='not_configured'
+    old=[r['id'] for r in rec.index.records() if r['kind']=='representation' and r['payload']['type']=='instantaneous_5d']
+    class Encoder:
+        contract={'version':'fake.v1','preprocessing':'raw.v1','modalities':['depth_m']}
+        def encode(self, w):
+            assert w['physics_steps'][-1]<=w['current_physics_step']
+            return {'vector':[float(len(w['frames']))]*7,'quality':'ok'}
+    rep_id=rec.index.encode_clip(rec.clips[0]['clip_id'],Encoder())
+    rep=next(r for r in rec.index.records() if r['id']==rep_id)
+    assert len(rep['payload']['vector'])==7
+    assert all(any(r['id']==identifier for r in rec.index.records()) for identifier in old)
+    assert rec.index.retrieve('temporal',rep['payload']['vector'],rep['payload']['contract'])
+    changed={**rep['payload']['contract'],'encoder':{**Encoder.contract,'version':'fake.v2'}}
+    assert rec.index.retrieve('temporal',rep['payload']['vector'],changed)==[]
+    assert rec.index.retrieve('instantaneous_5d',rep['payload']['vector'],rep['payload']['contract'])==[]
+    bad={**window,'current_physics_step':8}
+    assert encode_tactile_window(bad,Encoder())['quality']=='encoder_error'
+    class Broken(Encoder):
+        def encode(self,w):
+            w['instantaneous_5d'][0][0]=999.
+            raise RuntimeError('offline')
+    assert encode_tactile_window(window,Broken())['quality']=='encoder_error'
+    assert rec.frames[0]['instantaneous_5d']==[.1,.2,.3,.4,.5]
+    assert rec.frames[-1]['instantaneous_5d']==[.1,.2,.3,.4,.5]
+
+
+def test_invocation_traces_distinguish_retrieval_call_exception_and_duplicate_calls(tmp_path):
+    rec=evidence_recorder(tmp_path)
+    source='''def press():
+    take_sample()
+    raise ValueError('public failure')
+def unused():
+    pass
+for i in range(2):
+    try:
+        press()
+    except ValueError:
+        pass
+'''
+    count=[0]
+    def sample():
+        count[0]+=1
+        record_sample(rec,count[0])
+    scope={'take_sample':sample}
+    import sys
+    previous=sys.gettrace()
+    with rec.trace_execution(source,scope) as filename:
+        exec(compile(source,filename,'exec'),scope)
+    assert sys.gettrace() is previous
+    assert len(rec.invocations)==2
+    assert rec.invocations[0]['invocation_id']!=rec.invocations[1]['invocation_id']
+    assert all(i['exceptions'][0]['type']=='ValueError' and i['end'] is not None for i in rec.invocations)
+    assert all(i['outcome']=='raised' for i in rec.invocations)
+    assert all(s['invocation_ids'] for s in rec.frames)
+    assert any(f['name']=='unused' for f in rec.functions.values())
+    assert not any(i['function_id']==f['function_id'] for i in rec.invocations for f in rec.functions.values() if f['name']=='unused')
+    assert rec.index.related(rec.clips[0]['clip_id'])
+    warm=evidence_recorder(tmp_path,'warm')
+    record_sample(warm,1)
+    assert warm.retrievals[0]['matches']
+    warm.close()
+
+
+def test_archived_encoder_rejects_changed_or_escaped_frame(tmp_path):
+    rec=evidence_recorder(tmp_path)
+    record_sample(rec,1)
+    rec.close()
+    frame=rec.directory/rec.frames[0]['frame']['path']
+    frame.write_bytes(b'not the recorded image')
+    with pytest.raises(ValueError,match='verification'):
+        rec.window(rec.frames)
+
+
+def test_adapter_records_every_action_without_private_force_queries_or_extra_steps(tmp_path):
+    class Task(FakeShadowTask):
+        @property
+        def step_count(self):return self.steps*4
+    fake=Task(stop_after=20)
+    low=ShadowPianoLowLevelEnv(univtac_root=str(tmp_path),piano_notes=['F4'],piano_dynamics=['light'],
+        task_factory=lambda _:fake,output_dir=str(tmp_path/'run'))
+    low.reset()
+    fake.tactile=SimpleNamespace(depth_m=np.full((2,3),.01),reference_depth_m=np.full((2,3),.0101))
+    calls=[]
+    def predict(depth,reference,**kw):
+        calls.append(kw['physics_step'])
+        kw['diagnostics_out']['features']=[.1,.2,.3,.4,.5]
+        return {'quality':'ok','estimated_key_force_N':.35,'calibration_version':'frozen'}
+    low._force_estimator=SimpleNamespace(uses_area_rate=True,observe_frame=lambda *a,**kw:None,
+        predict=predict,sidecar={'models':{'white':{'iqr':[1.]*5}}})
+    low.estimate_key_force=lambda *a:pytest.fail('Recorder must not enter private force audit')
+    low._tactile_evidence=evidence_recorder(tmp_path)
+    for action in ([0,0,.01,.2],[0,0,.01,.5],[0,0,.01,.5],[0,0,.04,0]):
+        low.step(action)
+    low._tactile_evidence.close()
+    assert fake.steps==4 and calls==[4,8,12,16]
+    assert len(low._tactile_evidence.frames)==4
+    assert {c['phase'] for c in low._tactile_evidence.clips}=={'press','hold','release'}
+    env=CodeExecutionEnvBase(CodeExecEnvConfig(low_level=low,apis=[],prompt='Public only.'))
+    env._exec_globals['move_shadow_index']=lambda:low.step([0,0,.04,0])
+    result=env._exec_user_code('def release_again():\n    move_shadow_index()\nrelease_again()\n')
+    assert result['ok'] and fake.steps==5
+    assert len(low._tactile_evidence.invocations)==1
+    assert low._tactile_evidence.invocations[0]['outcome']=='returned'
+
+
+def test_temporal_history_crosses_phase_not_reset_and_resolves_actual_code(tmp_path):
+    from capx.memory.trajectory.data import WINDOW
+    from capx.integrations.opentac_shadow_online_skills import load_public_tactile_window
+    class Encoder:
+        contract={'version':'temporal.test','preprocessing':'test','modalities':['depth_m'], 'window':WINDOW}
+        def encode(self,w):
+            assert w['sensor_sha256']=='same'
+            if w['timestamps_s'][-1]-w['timestamps_s'][0] < .5-1e-10:
+                return {'quality':'insufficient_valid_history','vector':None}
+            assert all(x is not None for x in w['actual_state'])
+            assert all(len(x)==4 for x in w['actions'])
+            return {'quality':'ok','vector':[1.,0.,0.], 'provenance':{'episode_id':w['episode_id'],'samples':w['sources']}}
+    rec=evidence_recorder(tmp_path,'first',Encoder())
+    scope={'take_sample':lambda i:record_sample(rec,i,flex=.2 if i<31 else .5)}
+    source='def press():\n    for i in range(1,34):\n        take_sample(i)\npress()\n'
+    with rec.trace_execution(source,scope) as filename:
+        exec(compile(source,filename,'exec'),scope)
+    rec.close()
+    reps=[r['payload'] for r in rec.index.records() if r['kind']=='representation' and r['payload']['type']=='temporal']
+    assert reps[0]['quality']=='insufficient_valid_history'
+    assert reps[-1]['quality']=='ok'  # hold clip is only two frames, history crosses press.
+    assert len({s['clip_id'] for s in reps[-1]['provenance']['samples']})>1
+    linked=rec.index.resolve_skill_evidence(rec.clips[-1]['clip_id'])
+    assert linked['functions'][0]['name']=='press' and linked['invocations']
+    assert 'take_sample' in linked['functions'][0]['source']
+    before=len(rec.index.records())
+    assert rec.index.encode_history([Encoder()])==[]
+    assert len(rec.index.records())==before
+    nxt=evidence_recorder(tmp_path,'second',Encoder())
+    for i in range(1,4): record_sample(nxt,i)
+    nxt.close()
+    reps=[r['payload'] for r in nxt.index.records() if r['kind']=='representation' and r['payload']['type']=='temporal'
+          and r['payload']['clip_id'] in {c['clip_id'] for c in nxt.clips}]
+    assert all(r['vector'] is None for r in reps)  # never borrow previous reset history.
+    sample=copy.deepcopy(rec.frames[0])
+    sample['hand'].pop('wrist_x_offset_m')
+    sample['hand']['wrist_x_m']=None
+    loaded=load_public_tactile_window(rec.directory,[sample])
+    assert loaded['actual_state']==[None] and loaded['actions'][0]==sample['action']
+    assert not any(k in loaded for k in ('reward','success','key_forces'))
+
+
+def test_missing_checkpoint_does_not_disable_5d(tmp_path):
+    rec=evidence_recorder(tmp_path,encoder={'run_dir':str(tmp_path/'missing'),'representations':['tactile']})
+    record_sample(rec,1)
+    rec.close()
+    reps=[r['payload'] for r in rec.index.records() if r['kind']=='representation']
+    assert any(r['type']=='instantaneous_5d' and r['quality']=='ok' for r in reps)
+    assert any(r['type']=='temporal' and r['quality']=='encoder_unavailable' and r['vector'] is None for r in reps)
+
 ROOT = Path(__file__).resolve().parents[1]
 
 

@@ -10,6 +10,57 @@ from capx.llm import client
 from capx.utils.launch_utils import _save_trial_artifacts
 
 
+def _sse_lines(*events):
+    for event in events:
+        yield "data: " + json.dumps(event)
+        yield ""
+
+
+def test_responses_stream_recovers_completed_items_from_empty_terminal():
+    message = {"id": "msg1", "type": "message", "status": "completed",
+               "content": [{"type": "output_text", "text": "print('ok')"}]}
+    body = client._completed_responses_stream(_sse_lines(
+        {"type": "response.output_item.done", "output_index": 0, "item": message},
+        {"type": "response.completed", "response": {"status": "completed", "output": [],
+                                                        "usage": {"total_tokens": 12}}},
+    ), 10)
+    assert client._responses_output(body) == ("print('ok')", None)
+    assert body["usage"]["total_tokens"] == 12
+
+
+@pytest.mark.parametrize("terminal", [None, {"type": "response.failed"}])
+def test_responses_stream_never_accepts_done_items_without_successful_terminal(terminal):
+    events = [{"type": "response.output_item.done", "output_index": 0,
+               "item": {"type": "message", "content": [{"type": "output_text", "text": "code"}]}}]
+    if terminal:
+        events.append(terminal)
+    with pytest.raises(RuntimeError):
+        client._completed_responses_stream(_sse_lines(*events), 10)
+
+
+def test_responses_stream_prefers_nonempty_terminal_and_rejects_delta_only():
+    terminal = {"status": "completed", "output": [{"type": "message", "content": [
+        {"type": "output_text", "text": "terminal code"}]}]}
+    body = client._completed_responses_stream(_sse_lines(
+        {"type": "response.output_text.delta", "delta": "partial code"},
+        {"type": "response.completed", "response": terminal}), 10)
+    assert client._responses_output(body)[0] == "terminal code"
+    body = client._completed_responses_stream(_sse_lines(
+        {"type": "response.output_text.delta", "delta": "partial code"},
+        {"type": "response.completed", "response": {"status": "completed", "output": []}}), 10)
+    with pytest.raises(RuntimeError, match="no visible output"):
+        client._responses_output(body)
+
+
+def test_responses_stream_rejects_missing_done_item_indices():
+    with pytest.raises(RuntimeError, match="gaps"):
+        client._completed_responses_stream(_sse_lines(
+            {"type": "response.output_item.done", "output_index": 1,
+             "item": {"type": "message", "content": []}},
+            {"type": "response.completed", "response": {"status": "completed", "output": []}},
+        ), 10)
+
+
 def test_query_requests_identity_encoding_and_logs_response_stages(monkeypatch, capsys) -> None:
     observed: dict[str, object] = {}
     body = {

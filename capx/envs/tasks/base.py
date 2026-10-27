@@ -59,6 +59,8 @@ class CodeExecEnvConfig:
     viser_debug: bool = False
     stream_user_code_output: bool = True
     """Mirror generated-code stdout/stderr to the terminal while it executes."""
+    generated_code_mode: str = "script"
+    """Use ``host_module`` when a host wrapper invokes the generated entry point."""
 
 
 class SimpleExecutor:
@@ -111,6 +113,8 @@ class CodeExecutionEnvBase(Env):
 
     def __init__(self, cfg: CodeExecEnvConfig) -> None:
         super().__init__()
+        if cfg.generated_code_mode not in {"script", "host_module"}:
+            raise ValueError("generated_code_mode must be script or host_module")
         self.cfg = cfg
         self.low_level_env: BaseEnv = self._build_low_level(
             cfg.low_level, cfg.privileged, cfg.enable_render, cfg.viser_debug
@@ -136,11 +140,19 @@ class CodeExecutionEnvBase(Env):
         # Oracle code: YAML config overrides class attribute
         if cfg.oracle_code is not None:
             self.oracle_code = cfg.oracle_code
-        self._system_prompt = (
-            "You are a helpful assistant that generates Python code to directly solve the task. "
-            "The submitted code is executed once as a script, so it must perform actions immediately; "
-            "if it defines a solve() helper, it must also call solve()."
-        )
+        if cfg.generated_code_mode == "host_module":
+            self._system_prompt = (
+                "Generate a reusable Python policy module defining the requested entry point and helpers. "
+                "The host supplies the current request and state and calls the entry point exactly once. "
+                "Do not call the entry point at module level or add a solve() wrapper. "
+                "Read observations and perform actions only inside the policy functions."
+            )
+        else:
+            self._system_prompt = (
+                "You are a helpful assistant that generates Python code to directly solve the task. "
+                "The submitted code is executed once as a script, so it must perform actions immediately; "
+                "if it defines a solve() helper, it must also call solve()."
+            )
         self._full_prompt = [
             {"role": "system", "content": self._system_prompt},
             {"role": "user", "content": [{"type": "text", "text": self._get_complete_prompt()}]},
@@ -223,13 +235,20 @@ class CodeExecutionEnvBase(Env):
             }
         previous_solve = self._exec_globals.get("solve")
         progress_before = self._low_level_progress_marker()
-        should_auto_call_solve = not _has_top_level_solve_call(code)
+        should_auto_call_solve = (
+            getattr(self.cfg, "generated_code_mode", "script") == "script"
+            and not _has_top_level_solve_call(code)
+        )
+        trace_factory = getattr(self.low_level_env, 'public_execution_trace', None)
+        execution_trace = (trace_factory(code, self._exec_globals) if callable(trace_factory)
+                           else contextlib.nullcontext('<string>'))
         try:
             with (
                 contextlib.redirect_stdout(tee_out),
                 contextlib.redirect_stderr(tee_err),
+                execution_trace as execution_filename,
             ):
-                exec(code, self._exec_globals, self._exec_globals)
+                exec(compile(code, execution_filename, 'exec'), self._exec_globals, self._exec_globals)
                 if should_auto_call_solve:
                     self._auto_call_generated_solve(previous_solve, progress_before)
         except (HardStopTrial, CodeBlockTimeout):
@@ -514,16 +533,25 @@ class CodeExecutionEnvBase(Env):
         policy_end = False
         if getattr(self.low_level_env, "policy_controls_termination", False):
             stop_value = self._exec_globals.get("capx_stop")
-            if exec_result["ok"] and exec_result.get("completed_normally") and stop_value is True:
+            if exec_result["ok"] and type(stop_value) is not bool:
+                exec_result["ok"] = False
+                exec_result["stderr"] += "capx_stop must be a bool\n"
+            elif exec_result["ok"] and exec_result.get("completed_normally"):
                 try:
-                    self.low_level_env.submit_policy_end()
-                    policy_end = True
+                    finalize_terminal = getattr(self.low_level_env, "finalize_native_termination", None)
+                    if callable(finalize_terminal) and finalize_terminal():
+                        # Terminal native episodes cannot advance toward a hover
+                        # pose. The optional host hook closes their lifecycle,
+                        # preserving the native verdict and policy diagnostics.
+                        policy_end = True
+                        self._exec_globals["capx_stop"] = True
+                        exec_result["stdout"] += "[capx-host] END after native termination; no further motion\n"
+                    elif stop_value is True:
+                        self.low_level_env.submit_policy_end()
+                        policy_end = True
                 except Exception:
                     exec_result["ok"] = False
                     exec_result["stderr"] += traceback.format_exc()
-            elif exec_result["ok"] and type(stop_value) is not bool:
-                exec_result["ok"] = False
-                exec_result["stderr"] += "capx_stop must be a bool\n"
         obs = self._get_observation()
         # Force viser 3D view update after code execution so the scene
         # reflects the final state (sim substep updates may have been skipped).

@@ -37,6 +37,11 @@ choice supported by public evidence; otherwise preserve it. Briefly document any
 as a Python comment in the returned module. This is a proposed optimization, not proof of native success.'''
 CONTRACT = '''Return ONLY Python source for a reusable module defining run_piano(request, piano_state).
 No top-level execution or entry-point call: the host supplies the request and calls the function.
+Do not add a solve() wrapper, solve(), run_piano(...), or an if __name__ guard at module level.
+The module may contain math imports, inert constants, functions and simple marker exception classes.
+A marker exception class may inherit Exception, RuntimeError or ValueError and contain only pass
+and an optional docstring; no class methods, decorators or executable class-body statements.
+Do not call observation/action helpers in module assignments, function defaults or decorators.
 request contains notes, dynamics and hold_seconds. Iterate those lists, never hardcode the episode melody,
 seed, or note-specific wrist coordinates. A0/C8 endpoint names are allowed for first visual calibration.
 Use the documented public piano APIs, math, and builtin Python only. Never open files or import task modules.
@@ -49,8 +54,11 @@ After each attempt release fully, then call finish_piano_note_attempt(i), increm
 PIANO_NOTE with public quality, hold confidence and abort reason. The adapter requires measured index
 flexion <=0.02 rad and wrist Z within 0.002 m of hover, continuously for >=0.12 simulated seconds before
 finalization. Send bounded extension/lift actions and continue checking actual pose; a sent target does
-not establish arrival. Do not read key angles or native scoring. If native_done is true no more motion
-is allowed; finalization and return remain permitted. At a first early OOD checkpoint print
+not establish arrival. Do not read key angles or native scoring. native_done means the episode stopped,
+not that release timed out or the task succeeded. Propagate it through helpers and return normally
+from run_piano immediately, without more motion or a fabricated release_timeout. The host reconciles
+already-consumed attempts and submits END with the unchanged native verdict. Do not mark unattempted
+notes completed. At a first early OOD checkpoint print
 PIANO_STOP OOD_REPROBE and return without finalizing that attempt. Return after all attempts; the host
 submits END. Do not use globals(), eval(), exec(), arbitrary attributes or filesystem access.
 When adapting parameters only use public observations and the existing numerical limits.'''
@@ -65,8 +73,9 @@ call them by the exact documented signature without reprinting/redefining their 
 status refers to the parent program, not individually verified task success. Experimental functions may
 contain the recorded defect: inspect the limitations, choose only applicable functions, and generate a
 replacement under a NEW function name when necessary. Reuse is optional; reason about this request.
-After native_done do not move, but still call finish_piano_note_attempt for any remaining lawful final
-submission before advancing completed. A completed counter alone is not evidence of finalization.'''
+After native_done do not move: propagate the terminal outcome and return normally from run_piano.
+The host closes already-consumed attempts and END; do not invent progress for unattempted notes.
+A completed counter alone is not evidence of finalization.'''
 
 PUBLIC_FUNCTIONS = {'get_keyboard_endpoints', 'locate_visual_keys', 'get_hand_state',
     'move_shadow_index', 'wait_steps', 'get_index_tactile_rgb', 'estimate_key_force',
@@ -88,6 +97,11 @@ def digest(value):
 
 def memory_policy(config):
     """Validate explicit comparison policies; retain legacy suite behavior."""
+    if config.get('shadow_piano_evidence_memory'):
+        policy = evidence_policy(config)
+        return {'arm': 'tactile_evidence_' + policy['mode'],
+                'mode': 'adaptive' if policy['update'] else 'fresh',
+                'post_episode_repair': False, 'optimize_actions_on_repair': policy['update']}
     if config.get('shadow_piano_tactile_skill_pilot'):
         return {'arm': 'C_tactile_pilot', 'mode': 'frozen',
             'post_episode_repair': False, 'optimize_actions_on_repair': False}
@@ -116,8 +130,41 @@ def validate_source(source):
     if len(functions)!=1 or [a.arg for a in functions[0].args.args]!=['request','piano_state']:
         raise ValueError('Policy must define run_piano(request, piano_state)')
     for n in tree.body:
+        if isinstance(n, ast.ClassDef):
+            inert_exception = (
+                len(n.bases) == 1 and isinstance(n.bases[0], ast.Name)
+                and n.bases[0].id in {'Exception', 'RuntimeError', 'ValueError'}
+                and not n.decorator_list and not n.keywords
+                and all(isinstance(part, ast.Pass) or (
+                    isinstance(part, ast.Expr) and isinstance(part.value, ast.Constant)
+                    and isinstance(part.value.value, str)) for part in n.body)
+            )
+            if not inert_exception:
+                raise ValueError(f'Class {n.name!r} at line {n.lineno} must be a marker exception '
+                                 'with an allowed exception base and only pass/docstring')
+            continue
+        if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call):
+            raise ValueError(f'Top-level call {ast.unparse(n.value)!r} at line {n.lineno} is not allowed; '
+                             'the host calls run_piano(request, piano_state) exactly once. '
+                             'Remove entry-point calls; move setup/action calls inside policy functions.')
         if not isinstance(n,(ast.FunctionDef,ast.Import,ast.Assign,ast.AnnAssign)) and not (isinstance(n,ast.Expr) and isinstance(n.value,ast.Constant) and isinstance(n.value.value,str)):
-            raise ValueError('Policy module must not execute actions at top level')
+            raise ValueError(f'Unsupported module-level {type(n).__name__} at line {n.lineno}; '
+                             'put control flow inside run_piano or its helpers')
+        eager_values = []
+        if isinstance(n, ast.FunctionDef):
+            if n.decorator_list:
+                raise ValueError(f'Function decorators execute during loading: {n.name} at line {n.lineno}')
+            eager_values = [*n.args.defaults, *n.args.kw_defaults, n.returns,
+                *(a.annotation for a in [*n.args.posonlyargs, *n.args.args, *n.args.kwonlyargs]),
+                n.args.vararg.annotation if n.args.vararg else None,
+                n.args.kwarg.annotation if n.args.kwarg else None]
+        elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+            eager_values = [n.value]
+            if isinstance(n, ast.AnnAssign):eager_values.append(n.annotation)
+        if any(isinstance(part, (ast.Call, ast.NamedExpr)) for value in eager_values
+               if value is not None for part in ast.walk(value)):
+            raise ValueError(f'Module-loading expression at line {n.lineno} must not call functions; '
+                             'move observation/action setup inside run_piano')
     for n in ast.walk(tree):
         if isinstance(n,ast.Import) and any(x.name!='math' for x in n.names):
             raise ValueError('Only math imports are allowed')
@@ -155,11 +202,15 @@ def compatibility(config):
     low=config.get('_piano_low_level') or config['env']['cfg']['low_level']
     def sha(path):return digest(Path(path).read_bytes())
     signature = {'schema':SCHEMA,'api':'ShadowPianoVisualForceApi.v1','entry':'run_piano(request,piano_state)',
+        'execution_contract':'host_policy_module.v2',
+        'terminal_finalization':'native_done_host.v1',
         'action_repeat':int(low['action_repeat']),'physics_hz':240,
         'sensor':sha(low['digit_piano_config']),'force_model':sha(low['digit_force_sidecar']),
         'frame':'public_endpoint_geometry.v1','release_guard':'measured_pose_0p12s.v1'}
     if action_memory_enabled(config):
         signature['action_memory'] = 'parameterized_functions.v1'
+    if config.get('shadow_piano_evidence_memory'):
+        signature['evidence_policy'] = evidence_policy(config)
     return signature
 
 
@@ -466,6 +517,53 @@ def _session_path(config):return Path(config['output_dir'])/'piano_code_memory_s
 
 
 def _query(args,messages,*,deadline_seconds=None,phase='code_memory_repair'):
+    """Optionally stop an entire parallel batch on its first request failure."""
+    abort_file = os.environ.get('CAPX_LLM_ABORT_FILE')
+    if not abort_file:
+        return _query_impl(args, messages, deadline_seconds=deadline_seconds, phase=phase)
+    import time
+    import uuid
+    abort = Path(abort_file)
+    if abort.exists():
+        raise RuntimeError('Parallel batch stopped after an earlier API failure')
+    abort.parent.mkdir(parents=True, exist_ok=True)
+    request_id = uuid.uuid4().hex
+    output = os.environ.get('CAPX_OUTPUT_DIR')
+    base = {'request_id': request_id, 'pid': os.getpid(), 'phase': phase,
+            'run': output, 'model': getattr(args, 'model', None)}
+
+    def record_event(event, **fields):
+        if output:
+            with (Path(output) / 'piano_api_requests.jsonl').open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps({**base, 'event': event, 'time_ns': time.time_ns(), **fields}) + '\n')
+
+    record_event('started')
+    try:
+        response = _query_impl(args, messages, deadline_seconds=deadline_seconds, phase=phase)
+    except Exception as exc:
+        message = str(exc)
+        key = getattr(args, 'api_key', None)
+        if key:
+            message = message.replace(key, '[REDACTED]')
+        failure = {**base, 'time_ns': time.time_ns(), 'error_type': type(exc).__name__,
+                   'error': message[:2000]}
+        # Exclusive creation retains the first failure if several requests fail.
+        try:
+            with abort.open('x', encoding='utf-8') as stream:
+                json.dump(failure, stream, ensure_ascii=False)
+                stream.write('\n')
+        except FileExistsError:
+            pass
+        record_event('failed', error_type=type(exc).__name__)
+        print(f'[piano-code-memory] API_FAILURE_ABORT file={abort}', flush=True)
+        raise
+    record_event('completed')
+    if abort.exists():
+        raise RuntimeError('Parallel batch stopped after another request failed')
+    return response
+
+
+def _query_impl(args,messages,*,deadline_seconds=None,phase='code_memory_repair'):
     from capx.llm.client import query_model
     # This mutates only a task-specific argument copy; API keys never enter artifacts.
     args=copy.copy(args);args.max_tokens=8192
@@ -475,7 +573,37 @@ def _query(args,messages,*,deadline_seconds=None,phase='code_memory_repair'):
     args.request_timeout_seconds=float(deadline_seconds)
     print(f'[piano-code-memory] phase={phase} request_deadline_seconds={deadline_seconds:g} '
           f'http_timeout_seconds={deadline_seconds:g}',flush=True)
-    with request_deadline(deadline_seconds,phase=phase):return query_model(args,messages)
+    # Parallel simulators may share a capacity-limited provider. Serialize only
+    # model requests, not episodes; queue time is not provider inference latency.
+    lock_path = os.environ.get('CAPX_LLM_SERIAL_LOCK')
+    if not lock_path:
+        with request_deadline(deadline_seconds,phase=phase):return query_model(args,messages)
+    import fcntl
+    import time
+    path = Path(lock_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    limit = float(os.environ.get('CAPX_LLM_QUEUE_TIMEOUT_SECONDS', '1200'))
+    with path.open('a') as lock:
+        print(f'[piano-code-memory] phase={phase} waiting_for_api_slot', flush=True)
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() - started >= limit:
+                    raise TimeoutError('API queue deadline exceeded before request')
+                time.sleep(.2)
+        waited = time.monotonic() - started
+        output = os.environ.get('CAPX_OUTPUT_DIR')
+        if output:
+            with (Path(output) / 'piano_api_queue.jsonl').open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps({'phase': phase, 'queue_seconds': waited}) + '\n')
+        print(f'[piano-code-memory] phase={phase} api_slot_acquired queue_seconds={waited:.3f}', flush=True)
+        try:
+            with request_deadline(deadline_seconds,phase=phase):return query_model(args,messages)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def initial_code(args,config,obs):
@@ -485,11 +613,13 @@ def initial_code(args,config,obs):
     request=config['_piano_public_request']
     if policy['mode']=='fresh':
         record,reason=None,'fresh_generation_required'
+    elif config.get('shadow_piano_evidence_memory'):
+        record,reason=linked_initial_record(config,signature)
     else:
         record,reason=read_active(root,signature)
     if action_memory and record and record.get('status') != 'public_execution_checked':
         record,reason=None,'candidate_requires_new_plan'
-    if record and not config.get('_piano_key_map_ready',True):
+    if record and not config.get('_piano_key_map_ready',True) and not config.get('shadow_piano_evidence_memory'):
         record=None;reason='keyboard_calibration_required'
     if config.get('shadow_piano_code_memory_read_only') and record is None:
         raise ValueError('Read-only code-memory diagnostic requires a compatible policy and keyboard calibration: '+reason)
@@ -497,6 +627,11 @@ def initial_code(args,config,obs):
         'cache_reason':reason,'input_version':record['version'] if record else None,
         'parameters':record.get('parameters',{}) if record else {},'repair_calls':0,
         'memory_policy':policy, 'action_memory': action_memory}
+    if config.get('shadow_piano_evidence_memory'):
+        session['evidence_input_bundle'] = config.get('_linked_input_bundle')
+        session['evidence_policy'] = evidence_policy(config)
+        if record:
+            session['evidence_rules'] = record['rules']
     print(f"[piano-code-memory] arm={policy['arm']} mode={policy['mode']} "
           f"post_episode_repair={policy['post_episode_repair']}",flush=True)
     instructions=[]
@@ -509,7 +644,14 @@ def initial_code(args,config,obs):
         source=record['source'];reasoning='';session['executed_version']=record['version']
         print('[piano-code-memory] cache hit version='+record['version'],flush=True)
     else:
-        messages=copy.deepcopy(obs['full_prompt']);messages.append({'role':'user','content':CONTRACT})
+        source_contract = CONTRACT
+        if config.get('shadow_piano_evidence_memory'):
+            source_contract = source_contract.replace(
+                'At a first early OOD checkpoint print\nPIANO_STOP OOD_REPROBE and return without finalizing that attempt.',
+                'On OOD safely release and finalize that attempt; there is no in-episode regeneration.')
+        messages=copy.deepcopy(obs['full_prompt']);messages.append({'role':'user','content':source_contract})
+        if config.get('shadow_piano_evidence_memory'):
+            messages.append({'role':'user','content':LINKED_CONTROL_CONTRACT})
         prefix, cards = ('', [])
         if action_memory:
             if policy['mode'] != 'fresh':
@@ -554,6 +696,10 @@ def initial_code(args,config,obs):
 
 
 def repair(args,config,extra=None):
+    if config.get('shadow_piano_evidence_memory'):
+        # One joint update at the episode boundary, never a second whole-module
+        # repair that competes with its rules/functions/parameters snapshot.
+        return None
     if config.get('shadow_piano_tactile_skill_pilot'):
         print('[piano-code-memory] tactile pilot freezes source; no repair request', flush=True)
         return None
@@ -686,7 +832,8 @@ def public_summary(run):
                 phase=('release' if releasing else ('press' if pressed else 'arrival'))
                 counts[phase]+=1
                 last_flex=flex
-            notes.append({'index':e['index'],'stage_steps':counts,'release_verified':e.get('release_verified',False)})
+            notes.append({'index':e['index'],'stage_steps':counts,'release_verified':e.get('release_verified',False),
+                'finalization_source':e.get('finalization_source','policy')})
             previous=e['action_step']
         elif e['kind']=='code_execution':
             last_messages=e['public_messages']
@@ -714,6 +861,8 @@ def public_summary(run):
 
 def finish_episode(config):
     """Called before private summary consumption, after execution has stopped."""
+    if config.get('shadow_piano_evidence_memory'):
+        return finish_linked_episode(config)
     from capx.llm.client import ModelQueryArgs,collect_llm_usage,summarize_llm_usage
     run=Path(config['output_dir']);path=_session_path(config)
     if not path.exists():return {'error':'no_code_memory_session'}
@@ -930,3 +1079,474 @@ class PublicTactileSkillMemory:
             self.emit('tactile_skill_recorded',**entry)
             return {'stored':True,'skill_id':entry['skill_id']}
         return {'stored':False,'reason':'class_already_recorded'}
+
+
+# The evidence mode is opt-in and does not migrate or overwrite legacy memories.
+LINKED_CONTROL_CONTRACT = '''TACTILE EVIDENCE MODE: use module-level reusable action functions.
+The host archives every public contact sample, actual function call and release check.
+An episode-boundary updater may revise press rhythm, hold feedback and release/recovery logic.
+Fixed descent/press action counts from historical strategies are not task requirements.
+Preserve requested hold_seconds, measured-pose release >=0.12s, hover 0.04m, force targets,
+force quality handling and all API action bounds. No private verdict is available.
+Historical tactile signatures and rules are advisory; validate them with fresh public observations.
+Do not modify request, redefine public APIs, or change the frozen estimator. Helpers must be
+parameterized by current note geometry, dynamics and duration, not a specific melody.'''
+
+
+def _linked_root(config):
+    return Path(config['shadow_piano_evidence_memory']).expanduser().resolve()
+
+
+def evidence_policy(config):
+    mode = config.get('shadow_piano_evidence_mode', 'joint')
+    if mode not in ('none', 'text', 'tactile', 'joint'):
+        raise ValueError('Evidence mode must be none, text, tactile or joint')
+    return {'mode': mode, 'update': mode != 'none', 'text_memory': mode in ('text', 'joint'),
+            'tactile_history': mode in ('tactile', 'joint')}
+
+
+def _linked_bundle(root, identifier):
+    if not isinstance(identifier, str) or not re.fullmatch('[0-9a-f]{64}', identifier):
+        raise ValueError('Invalid evidence bundle ID')
+    directory = root / 'bundles' / identifier
+    bundle = json.loads((directory / 'bundle.json').read_text(encoding='utf-8'))
+    source = (directory / 'policy.py').read_text(encoding='utf-8')
+    from capx.integrations.opentac_shadow_online_skills import validate_library, _evidence_hash
+    rules = validate_library((directory / 'rules.yaml').read_bytes())
+    if digest(source) != bundle['source_version'] or rules != bundle['rules']:
+        raise ValueError('Evidence bundle failed content verification')
+    if _evidence_hash(bundle) != identifier:
+        raise ValueError('Evidence bundle manifest changed')
+    return {**bundle, 'source': source, 'bundle_id': identifier}
+
+
+def _store_linked_bundle(root, source, signature, rules, parameters, parent, evidence, changes):
+    import yaml
+    from capx.integrations.opentac_shadow_online_skills import validate_library, _evidence_hash, TactileEvidenceIndex
+    source = validate_source(source)
+    parameters = validate_parameters(parameters)
+    raw = yaml.safe_dump(rules, allow_unicode=True).encode('utf-8')
+    validate_library(raw)
+    bundle = {'schema': 'tactile_evidence_bundle.v1', 'source_version': digest(source),
+        'compatibility': signature, 'rules': rules, 'parameters': parameters,
+        'parent_bundle': parent, 'evidence': evidence, 'changed_functions': changes}
+    identifier = _evidence_hash(bundle)
+    directory = root / 'bundles' / identifier
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'policy.py').write_text(source, encoding='utf-8')
+    (directory / 'rules.yaml').write_bytes(raw)
+    atomic_json(directory / 'bundle.json', bundle)
+    index = TactileEvidenceIndex(root)
+    for rule in rules['skills']:
+        index.append('rule', {'bundle_id': identifier, **rule}, [identifier, *evidence])
+    for group, values in parameters.items():
+        index.append('parameter_binding', {'bundle_id': identifier, 'group': group,
+            'values': values, 'source_version': digest(source), 'status': 'public_report_not_force_truth'},
+            [identifier, *evidence])
+    index.append('bundle', {'bundle_id': identifier, **bundle}, [identifier, *evidence, *([parent] if parent else [])])
+    return identifier
+
+
+def linked_initial_record(config, signature):
+    root = _linked_root(config)
+    config['_linked_input_bundle'] = None
+    for name in ('pending_bundle.json', 'active_bundle.json'):
+        path = root / name
+        if not path.exists():
+            continue
+        pointer = json.loads(path.read_text(encoding='utf-8'))
+        if name == 'pending_bundle.json' and pointer.get('attempted_run'):
+            continue
+        bundle = _linked_bundle(root, pointer['bundle_id'])
+        if bundle['compatibility'] != signature:
+            continue
+        config['_linked_input_bundle'] = bundle['bundle_id']
+        if name == 'pending_bundle.json':
+            atomic_json(path, {**pointer, 'attempted_run': Path(config['output_dir']).name})
+        return {**bundle, 'version': bundle['source_version'], 'status': 'pending_public_execution'}, name
+    return None, 'no_compatible_evidence_bundle'
+
+
+def _linked_manifest(config):
+    root = _linked_root(config)
+    pointer = json.loads((Path(config['output_dir']) / 'piano_tactile_evidence.json').read_text(encoding='utf-8'))
+    path = Path(pointer['manifest']).resolve()
+    if not path.is_relative_to(root / 'episodes') or path.name != 'manifest.json':
+        raise ValueError('Evidence manifest must be in the public episode directory')
+    manifest = json.loads(path.read_text(encoding='utf-8'))
+    if manifest['schema'] != 'public_tactile_evidence.v1' or manifest['episode_id'] != pointer['episode_id']:
+        raise ValueError('Invalid public evidence manifest')
+    return manifest, path
+
+
+def _linked_update_input(source, manifest, rules, parameters, index=None):
+    """Whitelist and bound the prompt; no private files, scores, or duplicated module."""
+    functions = extract_action_functions(source)
+    names = {f['name']: f for f in functions if sum(g['name'] == f['name'] for g in functions) == 1}
+    executed = {f['function_id']: f['name'] for f in manifest['functions']}
+    calls = [i for i in manifest['invocations'] if executed.get(i['function_id']) in names]
+    contact_calls = {i for c in manifest['clips'] for i in c['invocation_ids']}
+    # Prefer functions with exceptions, then contact/release helpers actually run.
+    ranked = sorted(names, key=lambda name: (
+        -sum(bool(i['exceptions']) for i in calls if executed[i['function_id']] == name),
+        -int(any(s in name.lower() for s in ('press', 'hold', 'release'))), name))
+    selected = []
+    for name in ranked:
+        f = names[name]
+        if any(executed[i['function_id']] == name and i['invocation_id'] in contact_calls for i in calls) and not any(
+                f['line'] <= g['line'] <= f['end_line'] or g['line'] <= f['line'] <= g['end_line'] for g in selected):
+            selected.append(f)
+        if len(selected) == 2:
+            break
+    if not selected:
+        raise ValueError('No executed reusable helper has public evidence; retain the experience')
+    ids = {i['invocation_id'] for i in calls if executed[i['function_id']] in {f['name'] for f in selected}}
+    eligible = [c for c in manifest['clips'] if ids.intersection(c['invocation_ids'])]
+    if not eligible:
+        raise ValueError('No tactile clip is associated with the executed helpers')
+    by_clip = {c['clip_id']: [] for c in eligible}
+    for s in manifest['samples']:
+        if s['clip_id'] in by_clip:
+            by_clip[s['clip_id']].append(s)
+    # Include phase diversity and quality failures; never select using native grades.
+    chosen = []
+    for phase in ('press', 'hold', 'release'):
+        options = [c for c in eligible if c['phase'] == phase]
+        if options:
+            chosen.append(max(options, key=lambda c: sum(s['estimate']['quality'] != 'ok' for s in by_clip[c['clip_id']])))
+    if not chosen:
+        chosen = eligible[:3]
+    clips = []
+    for clip in chosen:
+        samples = by_clip[clip['clip_id']]
+        # Bound prompt sampling only; the on-disk trace remains complete.
+        positions = sorted(set(np.linspace(0, len(samples)-1, min(12, len(samples)), dtype=int).tolist()))
+        clips.append({k: clip[k] for k in ('clip_id', 'phase', 'attempt', 'note', 'dynamics',
+            'start_physics_step', 'end_physics_step', 'phase_basis')} | {'samples': [
+                {k: samples[i][k] for k in ('sample_id', 'action_step', 'physics_step', 'timestamp_s',
+                    'instantaneous_5d', 'estimate', 'action', 'hand')} for i in positions]})
+    result = {'schema': 'public_tactile_update_input.v1', 'episode_id': manifest['episode_id'],
+        'request': {k: manifest['request'][k] for k in ('notes', 'dynamics', 'hold_seconds')},
+        'rules': rules, 'parameters': parameters,
+        'functions': [{k: f[k] for k in ('name', 'qualified_name', 'signature', 'code', 'dependencies', 'captured_context')} for f in selected],
+        'dependency_signatures': [{k: f[k] for k in ('name', 'signature')} for f in functions if f not in selected],
+        'clips': clips,
+        'public_events': [{k: e[k] for k in ('kind', 'action_step', 'physics_step', 'index',
+            'release_verified', 'continuous_release_seconds', 'has_exception',
+            'finalization_source', 'finalized_indices') if k in e}
+            for e in manifest['events'] if e['kind'] in ('attempt_finalized', 'release_rejected',
+                'code_execution', 'native_terminal_end')][-12:],
+        'invocations': [{k: i[k] for k in ('invocation_id', 'function_id', 'start', 'end', 'exceptions')}
+            for i in calls if i['invocation_id'] in ids][-8:]}
+    result['historical_clips'] = []
+    result['historical_functions'] = {}
+    if index is not None:
+        # Retrieve actual trajectories, not just an opaque embedding or a label.
+        # Resolve actual invoked functions. Vectors select evidence, never become
+        # language advice. Store each historical source once, bounded below.
+        records = index.records()
+        seen = set()
+        for retrieval in reversed(manifest.get('retrievals', [])):
+            for match in retrieval['matches']:
+                if match['clip_id'] in seen or len(seen) >= 2:
+                    continue
+                candidates = [r['payload'] for r in records if r['kind'] == 'clip' and r['payload']['clip_id'] == match['clip_id']]
+                if not candidates:
+                    continue
+                historical = candidates[-1]
+                path = Path(historical['manifest']).resolve()
+                if not path.is_relative_to(index.root / 'episodes') or path.name != 'manifest.json':
+                    continue
+                prior = json.loads(path.read_text(encoding='utf-8'))
+                rows = [s for s in prior['samples'] if s['clip_id'] == match['clip_id']]
+                if not rows:
+                    continue
+                linked = index.resolve_skill_evidence(match['clip_id'], records=records)
+                if not linked or not linked['functions']:
+                    continue
+                seen.add(match['clip_id'])
+                function_refs = []
+                for f in sorted(linked['functions'], key=lambda f: (f['name'] == 'run_piano', len(f['source']))):
+                    if f['source_hash'] not in result['historical_functions']:
+                        if len(result['historical_functions']) >= 2:
+                            continue
+                        current = next((g['name'] for g in selected if g['code'].strip() == f['source'].strip()), None)
+                        result['historical_functions'][f['source_hash']] = {
+                            k: f[k] for k in ('function_id', 'name', 'source_hash', 'ast_hash')}
+                        if current:
+                            result['historical_functions'][f['source_hash']]['same_as_current_function'] = current
+                        else:
+                            result['historical_functions'][f['source_hash']]['source'] = f['source']
+                    function_refs.append(f['source_hash'])
+                positions = sorted(set(np.linspace(0, len(rows)-1, min(6, len(rows)), dtype=int).tolist()))
+                result['historical_clips'].append({
+                    k: historical[k] for k in ('clip_id', 'phase', 'attempt', 'note', 'dynamics',
+                        'start_physics_step', 'end_physics_step', 'phase_basis')} | {
+                    'retrieval_type': retrieval['type'], 'distance': match['distance'],
+                    'encoder': retrieval.get('encoder'), 'function_refs': function_refs,
+                    'invocations': [i for i in linked['invocations'] if i['function_id'] in
+                        {f['function_id'] for f in result['historical_functions'].values()}][-4:],
+                    'samples': [{k: rows[i][k] for k in ('sample_id', 'action_step', 'physics_step',
+                        'timestamp_s', 'instantaneous_5d', 'estimate', 'action', 'hand')} for i in positions],
+                    'association_ids': [r['id'] for r in records if match['clip_id'] in r['links']
+                                        and r['kind'] in ('application', 'update', 'rule', 'parameter_binding')][-8:]})
+    while len(json.dumps(result, ensure_ascii=False).encode('utf-8')) > 24 * 1024:
+        longest = max(result['clips'] + result['historical_clips'], key=lambda c: len(c['samples']))
+        if len(longest['samples']) <= 2:
+            raise ValueError('Evidence cannot fit the 24 KiB update budget without losing its source')
+        longest['samples'].pop(1)
+    # Defense in depth; actual confidentiality is the field/file whitelist above.
+    if any(m in json.dumps(result).lower() for m in _PRIVATE_MARKERS):
+        raise ValueError('Private audit marker in public update input')
+    return result
+
+
+def _protected_expressions(source):
+    """Freeze named force/hold/hover bindings, including dictionaries and comparisons.
+
+    This is a conservative patch validator, not a proof about arbitrary Python.
+    The adapter remains the authority for motion/release guards.
+    """
+    protected = re.compile(r'(target_force|tolerance|hold_gate|hold_seconds|force_target|force_bounds|hover|calibration|estimator)')
+    tree = ast.parse(source)
+    result = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(protected.search(ast.unparse(t)) for t in targets):
+                result.append(ast.dump(node))
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if isinstance(key, ast.Constant) and isinstance(key.value, str) and protected.search(key.value):
+                    result.append(ast.dump(key) + ':' + ast.dump(value))
+    return sorted(result)
+
+
+def validate_linked_proposal(proposal, source, evidence):
+    import yaml
+    from capx.integrations.opentac_shadow_online_skills import validate_library
+    if not isinstance(proposal, dict) or set(proposal) != {'functions', 'rules', 'rule_evidence'}:
+        raise ValueError('Update requires functions/rules/rule_evidence')
+    if not evidence.get('memory_policy', {}).get('text_memory', True) and (proposal['rules'] or proposal['rule_evidence']):
+        raise ValueError('This arm cannot retain a text experience library')
+    patches = proposal['functions']
+    if not isinstance(patches, list) or len(patches) > 2:
+        raise ValueError('At most two local functions may change')
+    offered = {f['qualified_name']: f for f in evidence['functions']}
+    available = {c['clip_id']: {s['physics_step'] for s in c['samples']}
+                 for c in evidence['clips'] + evidence.get('historical_clips', [])}
+    def check_refs(row):
+        if row.get('basis') not in ('observed', 'hypothesis'):
+            raise ValueError('Changes need an evidence basis')
+        if not all(isinstance(row.get(k), str) and 1 <= len(row[k]) <= 600 for k in ('reason', 'expected_effect')):
+            raise ValueError('Changes need reason and expected public effect')
+        if not isinstance(row.get('evidence'), list) or not row['evidence']:
+            raise ValueError('Changes must cite tactile clips and sampled physical steps')
+        for ref in row['evidence']:
+            if set(ref) != {'clip_id', 'physics_steps'} or ref['clip_id'] not in available:
+                raise ValueError('Unknown tactile evidence')
+            if not ref['physics_steps'] or any(type(s) is not int or s not in available[ref['clip_id']] for s in ref['physics_steps']):
+                raise ValueError('Unavailable physical evidence step')
+    tree = ast.parse(source)
+    nodes = {}
+    def visit(node, parents=()):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef):
+                qualified = '.'.join((*parents, child.name))
+                nodes[qualified] = child
+                visit(child, (*parents, child.name))
+            else:
+                visit(child, parents)
+    visit(tree)
+    edits, changes, seen = [], [], set()
+    for patch in patches:
+        if set(patch) != {'qualified_name', 'source', 'evidence', 'basis', 'reason', 'expected_effect'}:
+            raise ValueError('Unsupported function patch fields')
+        name = patch['qualified_name']
+        if name not in offered or name in seen:
+            raise ValueError('Patch must target a distinct offered function')
+        seen.add(name)
+        check_refs(patch)
+        replacement = ast.parse(patch['source'])
+        if len(replacement.body) != 1 or not isinstance(replacement.body[0], ast.FunctionDef):
+            raise ValueError('Patch must be exactly one function definition')
+        old, new = nodes[name], replacement.body[0]
+        if (new.name != old.name or ast.dump(new.args) != ast.dump(old.args) or new.decorator_list
+                or ast.dump(new.returns or ast.Constant(None)) != ast.dump(old.returns or ast.Constant(None))):
+            raise ValueError('Function signature and binding must stay compatible')
+        if _protected_expressions(offered[name]['code']) != _protected_expressions(patch['source']):
+            raise ValueError('Force/hold/hover constraints are not patchable')
+        # Reject API shadowing and request writes even inside nested helpers.
+        for part in ast.walk(new):
+            if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Store) and part.id in PUBLIC_FUNCTIONS:
+                raise ValueError('Public API bindings are immutable')
+            if isinstance(part, ast.Subscript) and isinstance(part.ctx, ast.Store) and ast.unparse(part.value).startswith('request'):
+                raise ValueError('The public request is immutable')
+        indent = ' ' * old.col_offset
+        replacement_text = textwrap.indent(patch['source'].strip(), indent) + '\n'
+        edits.append((old.lineno - 1, old.end_lineno, replacement_text))
+        def structure(node):
+            value = copy.deepcopy(node)
+            for item in ast.walk(value):
+                if isinstance(item, ast.Constant):
+                    item.value = type(item.value).__name__
+            return ast.dump(value)
+        changes.append({'qualified_name': name, 'old_hash': digest(ast.dump(old)),
+            'new_hash': digest(ast.dump(new)), 'ast_structure_changed': structure(old) != structure(new),
+            'evidence': patch['evidence'], 'basis': patch['basis'], 'reason': patch['reason'],
+            'expected_effect': patch['expected_effect']})
+    edits.sort(reverse=True)
+    for upper, lower in zip(edits, edits[1:]):
+        if lower[1] > upper[0]:
+            raise ValueError('Overlapping nested function patches')
+    lines = source.splitlines(keepends=True)
+    for start, end, body in edits:
+        lines[start:end] = [body]
+    assembled = validate_source(''.join(lines))
+    old_functions = {f['qualified_name']: f for f in extract_action_functions(source)}
+    for function in extract_action_functions(assembled):
+        old_function = old_functions.get(function['qualified_name'])
+        allowed = set(old_function['captured_context']) if old_function else set()
+        if set(function['captured_context']) - allowed:
+            raise ValueError('Patch introduced undefined or nonpublic dependencies')
+    rules = {'schema': 'shadow_piano_public_skills.v1', 'skills': proposal['rules']}
+    validate_library(yaml.safe_dump(rules, allow_unicode=True).encode('utf-8'))
+    if not isinstance(proposal['rule_evidence'], list):
+        raise ValueError('Rule evidence must be a list')
+    rule_refs = {}
+    for ref in proposal['rule_evidence']:
+        if set(ref) != {'rule_id', 'evidence', 'basis', 'reason', 'expected_effect'}:
+            raise ValueError('Invalid rule evidence')
+        check_refs(ref)
+        rule_refs[ref['rule_id']] = ref
+    old_rules = {r['id']: r for r in evidence['rules']['skills']}
+    new_rules = {r['id']: r for r in rules['skills']}
+    for identifier in old_rules.keys() | new_rules.keys():
+        if old_rules.get(identifier) != new_rules.get(identifier) and identifier not in rule_refs:
+            raise ValueError('Every rule change or removal needs evidence')
+    return assembled, rules, changes
+
+
+def finish_linked_episode(config, query_args=None):
+    """One public-only joint update; pending code never overwrites checked code."""
+    from capx.integrations.opentac_shadow_online_skills import TactileEvidenceIndex, _evidence_hash
+    from capx.llm.client import ModelQueryArgs, collect_llm_usage, summarize_llm_usage
+    run = Path(config['output_dir'])
+    result_path = run / 'piano_evidence_update_result.json'
+    if result_path.exists():
+        return json.loads(result_path.read_text(encoding='utf-8'))
+    output = run / 'tactile_evidence_update'
+    output.mkdir(parents=True, exist_ok=True)
+    # Claim once before the request; a crash is archived, never silently replayed.
+    claim = output / 'started.json'
+    if claim.exists():
+        return {'status': 'interrupted_previous_update', 'accepted': False}
+    atomic_json(claim, {'schema': 'tactile_evidence_update.v1'})
+    result = {'accepted': False, 'status': 'started', 'official_result_used': False}
+    policy = evidence_policy(config)
+    result['memory_policy'] = policy
+    usage = []
+    if not policy['update']:
+        result.update(status='disabled_no_memory', update_usage=summarize_llm_usage([]))
+        atomic_json(result_path, result)
+        atomic_json(output / 'validation.json', result)
+        return result
+    try:
+        root = _linked_root(config)
+        index = TactileEvidenceIndex(root)
+        session = json.loads(_session_path(config).read_text(encoding='utf-8'))
+        source = validate_source(session['source'])
+        manifest, manifest_path = _linked_manifest(config)
+        summary = public_summary(run)
+        parent = config.get('_linked_input_bundle')
+        # Config may be reconstructed by a caller after the trial.
+        if parent is None:
+            parent = session.get('evidence_input_bundle')
+        bundle = _linked_bundle(root, parent) if parent else None
+        rules = bundle['rules'] if bundle and policy['text_memory'] else {'schema': 'shadow_piano_public_skills.v1', 'skills': []}
+        parameters = validate_parameters(summary['parameters'])
+        executed_hashes = {f['ast_hash'] for f in manifest['functions'] if any(
+            i['function_id'] == f['function_id'] and i['end'] is not None for i in manifest['invocations'])}
+        changed_called = not bundle or all(c['new_hash'] in executed_hashes for c in bundle['changed_functions'])
+        checked = (summary['public_checks_complete'] and not summary['failures'] and
+                   not summary['control_failures'] and changed_called and bool(manifest['samples']) and
+                   not any(i['exceptions'] for i in manifest['invocations']))
+        evidence_ids = [c['clip_id'] for c in manifest['clips']]
+        executed_bundle = parent or _store_linked_bundle(root, source, session['compatibility'], rules,
+            parameters, None, evidence_ids, [])
+        result.update(input_bundle=parent, executed_bundle=executed_bundle,
+            executed_version=digest(source), public_execution_checked=bool(checked),
+            manifest_sha256=digest(manifest_path.read_bytes()))
+        index.append('application', {'bundle_id': executed_bundle, 'episode_id': manifest['episode_id'],
+            'source_version': digest(source), 'public_execution_checked': bool(checked),
+            'changed_functions_called': bool(changed_called), 'manifest_sha256': result['manifest_sha256']},
+            [executed_bundle, *evidence_ids, *(i['invocation_id'] for i in manifest['invocations'])])
+        if checked:
+            atomic_json(root / 'active_bundle.json', {'bundle_id': executed_bundle,
+                'status': 'public_execution_checked', 'evidence_episode': manifest['episode_id']})
+        evidence = _linked_update_input(source, manifest, rules, parameters,
+            index=index if policy['tactile_history'] else None)
+        evidence['memory_policy'] = policy
+        if len(json.dumps(evidence, ensure_ascii=False).encode('utf-8')) > 24 * 1024:
+            raise ValueError('Evidence including ablation metadata exceeds 24 KiB')
+        atomic_json(output / 'public_input.json', evidence)
+        instruction = (LINKED_CONTROL_CONTRACT + '\nReturn ONLY JSON with functions, rules, rule_evidence. '
+            'functions is a list of at most two replacements: {qualified_name,source,evidence,basis,reason,expected_effect}. '
+            'source is one complete function with unchanged name/signature. Evidence is [{clip_id,physics_steps:[...]}]. '
+            'basis is observed or hypothesis. Each rule_evidence item has rule_id,evidence,basis,reason,expected_effect. '
+            'rules is the COMPLETE next text library, each item id/trigger/practice, max16, YAML<=8KiB; '
+            'trigger<=240 characters, practice<=600. All changes/removals require references. '
+            'Preserve fixed force/hold/hover bindings; do not change targets, estimator, native scoring or API limits. '
+            'Use tactile changes across press/hold/release to propose reusable LOGIC changes, not merely constants. '
+            'If evidence is insufficient return unchanged rules and functions=[]. Improvements are hypotheses '
+            'until fresh public execution checks. Do not claim official success. Only listed functions may change.')
+        if not policy['text_memory']:
+            instruction += ' This arm has no persistent text library: return rules=[] and rule_evidence=[]. Keep rationales only in function proposal evidence.'
+        if not policy['tactile_history']:
+            instruction += ' This arm has no historical tactile retrieval. Current-episode tactile feedback is available equally to all updating arms.'
+        messages = [{'role': 'system', 'content': instruction},
+                    {'role': 'user', 'content': json.dumps(evidence, ensure_ascii=False)}]
+        atomic_json(output / 'prompt.json', {'messages': messages})
+        if query_args is None:
+            base = os.environ['CAPX_API_BASE_URL'].rstrip('/')
+            query_args = ModelQueryArgs(model=os.environ.get('MODEL', os.environ.get('CAPX_MODEL', 'gpt-6.1-sol')),
+                server_url=base if base.endswith('/responses') else base + '/responses',
+                api_key=os.environ['CAPX_API_KEY'], max_tokens=8192, reasoning_effort='low')
+        # Process is serial; restore environment after the isolated API request.
+        proxy_keys = ['HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY','http_proxy','https_proxy','all_proxy','no_proxy']
+        saved = {k: os.environ.get(k) for k in proxy_keys + ['CAPX_DISABLE_PROXY', 'CAPX_LLM_TRUST_ENV']}
+        try:
+            for key in proxy_keys:
+                os.environ.pop(key, None)
+            os.environ['CAPX_DISABLE_PROXY'] = '1'
+            os.environ['CAPX_LLM_TRUST_ENV'] = '0'
+            with collect_llm_usage(usage, 'tactile_evidence_update'):
+                response = _query(query_args, messages, deadline_seconds=300, phase='tactile_evidence_update')
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        (output / 'response.txt').write_text(response['content'], encoding='utf-8')
+        proposal = json.loads(re.sub(r'^```(?:json)?\s*|\s*```$', '', response['content'].strip()))
+        atomic_json(output / 'proposal.json', proposal)
+        updated, next_rules, changes = validate_linked_proposal(proposal, source, evidence)
+        if updated == source and next_rules == rules:
+            result.update(status='no_change', accepted=True, output_bundle=executed_bundle)
+        else:
+            candidate = _store_linked_bundle(root, updated, session['compatibility'], next_rules, parameters,
+                executed_bundle, evidence_ids, changes)
+            proposal_id = index.append('update', {'parent_bundle': executed_bundle, 'candidate_bundle': candidate,
+                'changes': changes, 'rule_evidence': proposal['rule_evidence'], 'status': 'syntax_checked_pending_execution',
+                'proposal_sha256': _evidence_hash(proposal)}, [executed_bundle, candidate, *evidence_ids])
+            atomic_json(root / 'pending_bundle.json', {'bundle_id': candidate, 'attempted_run': None,
+                'status': 'syntax_checked_pending_execution'})
+            result.update(status='candidate', accepted=True, candidate_bundle=candidate, update_id=proposal_id,
+                logic_change_proposed=any(c['ast_structure_changed'] for c in changes))
+    except Exception as exc:
+        result.update(status='rejected_or_unavailable', error=f'{type(exc).__name__}: {exc}')
+    result['update_usage'] = summarize_llm_usage(usage)
+    atomic_json(result_path, result)
+    atomic_json(output / 'validation.json', result)
+    return result

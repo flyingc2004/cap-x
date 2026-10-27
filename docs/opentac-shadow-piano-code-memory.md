@@ -144,3 +144,203 @@ C结束后原先只检查异常或未完成尝试链。即使`PIANO_NOTE`明确�
 2026-10-27追加3301–3304，共八条串行配对，运行代码和阈值未变。结果依次为3/6、4/6、5/6、4/6，两条件各seed动作数均相同（1164、1281、1275、1238）。前两seed各有一次白键轻音技能命中并实际应用，后两seed无匹配且目标指令逐帧一致。全部失败为重音，当前单条白键轻音记忆未覆盖。两个匹配窗口私有力MAE约小幅下降5.18%/4.48%，没有成功音数或动作数收益。样本少、每seed单对，不能宣称整体优势；未测LLM经验驱动的代码重规划。
 
 结果和16份含音轨视频：[四seed留出复测](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/C_tactile_skill_transfer_3301_3304_20261027T043600Z/results.md)。
+
+
+## 触觉证据闭环与并行时序接口（2026-10-27）
+
+新配置为 `env_configs/opentac/play_piano_shadow_digit_evidence_memory.yaml`，仍由 t-cap 的
+`./run_responses` 启动，未增加运行脚本。默认独立数据目录为
+`/mnt/data/ljz/opentacbench/shadow_piano_evidence_v1`，可用 `CAPX_SHADOW_EVIDENCE_ROOT` 指定新的实验目录。
+这次交付只进行 CPU 模拟与回归验证，没有调用真实模型、启动 GPU 实验或训练编码器；不代表策略已改善。
+旧 A/B/C、文字库、代码库和触觉参数试验格式保留，默认配置不会开启此功能。
+
+### 执行入口约定（2026-10-27 修复）
+
+代码记忆返回的是可复用模块：LLM 定义 `run_piano(request, piano_state)` 和辅助函数，宿主
+`wrapped()` 注入当前公开音序与本轮状态，并调用入口一次。源码本身不应再调用 `solve()`、
+`run_piano(...)`，也不应添加 `if __name__ == ...` 启动逻辑。原生任务仍活动时，宿主包装器仅在
+完成尝试计数达到请求长度后请求 END；不以函数正常返回替代逐音完成与释放检查。
+
+所有启用 `shadow_piano_code_memory` 的配置由加载器设为 `generated_code_mode: host_module`。
+此模式发送模块生成系统提示，并关闭通用执行器的 `solve()` 自动补调用；普通脚本模式的提示与
+自动补调用逻辑保持原行为。此前通用系统提示要求主动调用 `solve()`，与模块提示相冲突；已移除
+代码记忆模式中的这项冲突。执行协议版本为 `host_policy_module.v2`，旧版本缓存需重新验证。
+
+允许只含 `pass`／文档字符串、继承 `Exception`、`RuntimeError` 或 `ValueError` 的自定义异常类。
+类体执行语句、类方法与装饰器仍不允许；模块赋值、函数默认参数与注解中也不能调用观测或动作函数。
+真实的顶层入口调用仍会拒绝，错误指出具体调用及行号，不静默删改模型源码。普通异常类不会再被
+笼统误报为“顶层执行动作”。以上是调用契约检查，不能保证生成控制策略本身正确。
+
+### 原生终止后的主机收尾（2026-10-27 修复）
+
+原生任务可在末音琴键完成释放时立即终止，此时手腕未必回到悬停位置。`native_done` 是终止
+信号，不能解释成释放超时或成功。API 文档、模块契约和 evidence YAML 要求将它传回
+`run_piano` 并正常返回，停止所有动作和等待；活动任务仍要求完整的实测释放检查。
+
+策略正常返回且原生已终止时，执行器调用 Shadow 适配器的主机收尾钩子。钩子只补记原生
+已经消费、但公开记录尚未结束的尝试，然后提交一次 END；不重新执行评分、物理动作或原生
+`finish_attempt`。未尝试的音不会补齐，原生失败仍返回失败，代码异常不会被此兜底掩盖。
+终止状态是否需要收尾只取决于生命周期信号，不根据私有成功标志选择策略或修改执行。
+
+补记标记为 `finalization_source=host_native_termination`、`release_verified=false`，并记录
+`native_terminal_end`；不篡改生成代码的 completed 计数或原始停止日志，不把主机收尾冒充
+策略自行完成释放检查，也不据此晋升代码缓存。运行兼容签名新增
+`terminal_finalization=native_done_host.v1`，避免与旧的收尾协议混用。
+
+对 2026-10-27 21:07 完成的 joint seed3300，以原生成源码、已记录的公开观测与公开端点映射
+做离线回放：1186 次目标动作、468 次测力读取均匹配原记录，末次物理步仍为5621；主机补记
+最后一次尝试、END仅一次，CaP-X `Task Completed=True`，原生结果未变。该回放没有新物理步、
+API 请求或 GPU 实验，不改写原运行的失败结果。
+
+### 双通路与记录契约
+
+现有每次采样的 5D（均值、三个面积比例、面积变化率）以及冻结的力估计器保持不变。
+`instantaneous_5d` 与 `temporal` 是两个独立的表示类型，分别保存版本、质量与物理时间，
+共同引用同一 `clip_id`。未接入编码器时，时序质量是 `not_configured`，即时表示和控制继续工作。
+
+启用新模式后，适配器在每次原生动作结束自动记录一次公开观测，不依赖 LLM 是否调用测力 API，
+不增加物理动作、不插值为 240 Hz。每帧保存 RGB、模拟 depth、参考 depth 和有效像素掩码的压缩
+NPZ、SHA256，以及 5D、估计力/质量、动作、公开手部状态、动作步与真实物理步。
+缺失通道不造数据；不可用力保留 null。样本去重按物理 step，reset 使用独立 episode ID。
+阶段依据命令变化分为 approach/press/hold/release，这是控制阶段推断，不是原生评分阶段。
+
+宿主跟踪实际 Python 函数调用、返回和异常，记录函数 AST 哈希、源码、调用 ID 与首尾时间；
+同一函数调用多次产生不同调用 ID。仅定义或检索函数不会被记为实际应用。
+完整公开轨迹留在磁盘；更新提示只取有界片段。真值和原生评分仍在已有独立私有审计中。
+
+### 关联与更新
+
+`associations.jsonl` 是只追加的内容寻址索引，关联片段、两类表示、函数版本、参数绑定、文字规则、
+调用和应用结果。`TactileEvidenceIndex.related(id)` 可以逐层追溯这些关联。
+旧触觉参数 API 的记录/检索/应用事件也接入索引；新配置不强制载入旧试验的 Z 修正权重。
+当前检索以相同传感器、力模型、动作频率、坐标系、黑白键、轻重和阶段为条件，对 5D 用标定 IQR
+计算距离；时序表示另按编码器与预处理版本隔离。近邻是待验证的经验，不自动改变动作。
+
+每轮结束通过现有 Responses 客户端执行一次联合整理，代替该模式下的旧整段代码修复和独立文字整理。
+输入包含当前规则、参数、最多两个实际调用过的函数、当前触觉片段，以及匹配到的历史片段。
+源码不重复上传，全部证据 JSON 不超过 24 KiB，完整轨迹不直接发送模型。
+输出最多两个完整函数替换和完整的下一版文字规则，每项改变或删除都必须引用片段 ID 与具体采样物理步，
+并解释观察依据、修改理由与预期公开效果。允许修改策略的下压节奏、反馈与释放逻辑；策略固定等待数
+不当作原生要求。原生持音时间、释放保护、力目标、估计器和 API 动作边界保持固定。
+
+提案检查语法、入口/函数签名、引用、依赖、公共接口和受保护的力/持音/悬停参数绑定。
+这是保守的代码检查，不是对任意 Python 控制策略的数学安全证明；动作和释放仍由适配器保护。
+文字仍限 16 条、8 KiB。参数或注释修改可以留档，但 `ast_structure_changed` 为 false，不算逻辑更新。
+一次请求最多 8192 输出 token、300 秒；清除大小写代理并禁止客户端读取代理环境，结束后恢复进程环境。
+没有自动第二次整理调用，网络失败、非法提案和无修改分别记录，前一有效版本保留。
+
+`bundles/<hash>/` 将源码、文字规则、参数和父版本绑定成一份不可变候选。
+`pending_bundle.json` 指向待验证版本，下次 episode 优先尝试一次；`active_bundle.json` 保留最后通过
+公开执行检查的版本。定义存在或仅通过编译不会晋升。检查要求新函数实际调用、公开尝试链及释放完成，
+且无记录的代码/控制失败；异常或未调用保留旧有效版本。公开检查通过不是官方成功。
+整轮中断后已保存的证据保留，启动过的整理调用不会被最终处理器重复发送。
+
+### 时序编码器扩展接口
+
+宿主可向 low-level 的 `tactile_temporal_encoder` 传入对象（或通过现有 `_target_` 配置实例化）。
+对象提供：
+
+```python
+contract = {"version": "my_encoder.v1", "preprocessing": "depth_window.v1",
+            "modalities": ["depth_m"]}
+
+def encode(window):
+    # window: frames, valid_masks, instantaneous_5d, physics_steps,
+    #         timestamps_s, current_physics_step, actions, actual_state,
+    #         episode_id, sensor_sha256, sources
+    # frames 中可能包含 rgb/depth_m/reference_depth_m；缺失通道保持缺失。
+    return {"vector": encoded_vector, "quality": "ok"}
+```
+
+未声明固定 window 时，沿用可变长度的已发生阶段窗口；声明 window 时，取同 episode 的
+历史窗口，可以跨动作阶段但不能跨 reset，不能引用未来时间。编码器声明预处理/窗口策略版本；
+维数不固定为 5，质量异常或编码失败只使时序表示不可用，不覆盖即时表示。
+`TactileEvidenceIndex.encode_clip(clip_id, encoder)` 支持对已有公开帧重新编码，验证帧 SHA256，
+追加新的表示节点，不改片段 ID、旧 5D、函数或历史关联。不需要重新采集才可换编码器。
+在线编码与离线重编码应使用同一 contract；不同版本和维数的向量不直接计算匹配距离。
+时序向量用于经验检索；给更新 LLM 的依据仍是可解释的力/接触变化及公开动作。
+
+### 产物和检查入口
+
+- 每次运行：`piano_tactile_evidence.json` 指向本轮公开 manifest；`piano_code_memory_session.json` 记录实际执行源码。
+- 数据盘：`episodes/<id>/samples.jsonl`、`manifest.json`、连续 NPZ 帧；`associations.jsonl` 保存跨轮关联。
+- 更新：运行目录下 `tactile_evidence_update/` 保存输入、提示、原始响应、提案和校验；
+  `piano_evidence_update_result.json` 保存候选/公开检查状态及独立更新 token 与请求耗时。
+- 模拟测试覆盖完整更新后再执行、未调用不晋升、失败回退、版本隔离、帧校验、异常追踪、
+  缺失编码器、按动作采样而不额外推进物理，以及私有字段隔离。
+
+后续实际运行时设置 `CONFIG_PATH=env_configs/opentac/play_piano_shadow_digit_evidence_memory.yaml`、
+`CAPX_SHADOW_EVIDENCE_ROOT`、`CAPX_SHADOW_TASK_SEED` 和显式 `GPU`，沿用原有 `./run_responses`。
+本次没有自动启动该命令。
+
+
+### 四组并行试验协议（2026-10-27）
+
+用户授权四组各 seed3300–3304，在不同 GPU 上并行；各组内部按 seed 串行。
+同一配置通过 `CAPX_SHADOW_EVIDENCE_MODE=none|text|tactile|joint` 选择：none 每 seed 从零生成，
+不读取代码缓存、不做结束更新；text 保存文字和代码但不检索历史触觉；tactile 保存代码和轨迹但
+禁止持久文字规则；joint 两者都保存。三个更新组均能看到相同类型的当前回合公开触觉反馈。
+因此更新组之间比较的是历史记忆类型；与 none 的差异也包含代码复用，不能全归因于触觉。
+
+各组首份代码独立生成，不共享其他组的策略。所有组每 seed 使用新的键位缓存文件，清场与定位
+动作单独统计；代码复用组可能直接执行已有定位逻辑，图片请求次数仍按真实调用记录。
+固定 gpt-6.1-sol、low、8192输出token、四物理步、冻结5D、每次更新300秒，关闭整轮重试。
+无记忆组仍保存审计证据，但后续 seed 不读取这些数据。时序编码器不参与本轮。
+使用四个后台 shell 循环调用现有 `./run_responses`，没有新增运行脚本。
+任务未全对的退出码1继续下一个 seed；缺少试验完成标记的基础设施错误暂停该组，保留现场，
+不以补跑替换失败。每 seed 前校验运行源码摘要，发现共享工作区变化则暂停，避免混用实现。
+
+## 16 帧短期轨迹接入（2026-10-28，CPU 验证）
+
+`capx.memory.trajectory.model.EvidenceTrajectoryEncoder` 包装现有
+`FrozenTrajectoryEncoder.encode_window()`，实现证据库的 `contract` / `encode(window)` 接口。
+现有 evidence YAML 的 low-level 新增如下配置；仍使用 `./run_responses`，没有新增运行脚本。
+本次未启动、重启 GPU 实验，也未调用 LLM。
+
+```yaml
+tactile_temporal_encoder:
+  run_dir: ${oc.env:CAPX_SHADOW_TRAJECTORY_RUN,/mnt/data/ljz/opentacbench/tactile_trajectory_encoder_v1/run_20261027T091422Z}
+  representations: [window4, tactile, tactile_action]
+```
+
+三种空间并存并独立检索，不合并或替换原 5D 力表示：
+
+| 名称 | 表示 | 输入 |
+|---|---|---|
+| window4 | 64D，L2 归一化 | 16 帧原始 4D 特征按训练集 feature_mean/std 标准化后按时间展开 |
+| tactile | 32D，L2 归一化 | 冻结 tactile/seed_0/best.pt；深度、参考深度、有效掩码 |
+| tactile_action | 32D，L2 归一化 | 冻结 tactile_action/seed_0/best.pt；以上输入加每帧 4D 动作及实际状态 |
+
+每个片段结束时，使用真实物理时间查找最近 0.5 秒的 16 个 30 Hz 目标时刻，只选择对应时刻
+及之前的最新真实帧，允许年龄上限为模型固定的 1/30 秒。60 Hz 记录通常隔一帧取样；
+不直接取末 16 帧、不插值、不补零、不借用上一 episode。样本不足或无效则无向量。
+记录 16 个目标时刻、实际采样时刻/物理步、sample/clip ID、帧路径及校验值。
+相邻阶段的历史允许进入同一窗口，引用仍指向原始片段。
+
+动作顺序为 `[wrist_x_offset_m, wrist_y_m, lift_z_m, index_flexion_rad]`，
+实际状态顺序为 `[wrist_x_offset_m, wrist_y_m, wrist_z_m, index_flexion_rad]`。
+记录器已修正原先误用 `wrist_x_m` 的问题。旧记录中实际 X 为 null 时，不能以动作目标
+或零代替实测状态；动作版返回 `missing_public_motion`。两种纯触觉表示仍正常运行。
+窗口使用 episode 实际 sensor SHA，不能借用模型声明的 SHA 冒充实际传感器。
+
+检索 contract 包括表示名称、checkpoint/归一化 SHA、预处理、采样窗口、传感器、坐标系、
+动作频率及原有阶段/黑白键/轻重条件。同为 32D 的两个编码器也不互相匹配。
+可选编码器加载失败被记录为不可用，保留即时 5D；模型和归一化未修改、未重新训练。
+
+`TactileEvidenceIndex.encode_history(encoders)` 对本库已有 CaP-X 公开片段幂等建库；
+新 episode 仅检索启动前的历史节点。专家评估 index 不导入技能库，其空 skill_id 不作技能。
+`resolve_skill_evidence(clip_id)` 沿片段的真实调用 ID 找到函数版本、源码哈希和历史源码。
+更新器输入包含有界的历史片段与最多两份历史局部函数；相同源码只存一份引用，向量不发送 LLM。
+本轮也修正更新器先按函数名选中纯判断函数的问题：候选必须有实际调用和触觉片段关联。
+
+真实数据验证使用两个已完成的 CaP-X 公开 episode，构建独立数据盘索引；原始档案未修改。
+NPZ 使用硬链接复用原始字节并校验 SHA，未复制私有审计。48 个片段生成 144 条质量记录：
+window4 48 条可用、tactile 48 条可用、tactile_action 48 条缺失实际 X 因而不可用。
+两种可用空间各得到 56 条跨轮 top-3 匹配，均追溯到实际调用的函数与历史源码。
+这是检索链路验证，不是技能相关性、控制收益或成功率评估。
+
+真实记录的更新输入选择了 `press` 和 `release`，包含两段历史触觉和历史函数，
+紧凑 JSON 为 24,134 bytes，小于 24 KiB；没有发起更新 API。
+验证报告及独立索引：
+`/mnt/data/ljz/opentacbench/capx_trajectory_retrieval_v1/validation_20261027T171630Z/validation.json`。
+公开更新输入示例位于同目录 `offline_public_updater_input.json`。

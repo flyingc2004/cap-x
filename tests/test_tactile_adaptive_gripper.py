@@ -795,6 +795,7 @@ def test_lift_can_prompt_and_controller_do_not_use_univtac_adaptive_helper() -> 
 def test_code_execution_treats_zero_system_exit_as_normal_completion() -> None:
     env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
     env.cfg = SimpleNamespace(stream_user_code_output=False)
+    env.low_level_env = SimpleNamespace()
     env._exec_globals = {}
     env._apis = {}
     env._get_observation = lambda: {}

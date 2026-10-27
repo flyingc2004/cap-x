@@ -2367,11 +2367,16 @@ def _run_single_trial(
     # External suite finalization is idempotent and cannot spend a second budget.
     if config.get('shadow_piano_code_memory'):
         from capx.integrations.opentac_shadow_code_memory import action_memory_enabled, finish_episode
-        if action_memory_enabled(config):
+        if action_memory_enabled(config) or config.get('shadow_piano_evidence_memory'):
             try:
                 memory_result = finish_episode(config)
-                print('[piano-code-memory] episode archived; output_version=' +
-                    str(memory_result.get('output_version')), flush=True)
+                if config.get('shadow_piano_evidence_memory'):
+                    print('[piano-evidence] status=' + str(memory_result.get('status')) +
+                          ' candidate=' + str(memory_result.get('candidate_bundle')) +
+                          ' public_execution_checked=' + str(memory_result.get('public_execution_checked')), flush=True)
+                else:
+                    print('[piano-code-memory] episode archived; output_version=' +
+                        str(memory_result.get('output_version')), flush=True)
             except Exception as exc:
                 print('[piano-code-memory] episode finalization failed: ' + str(exc), flush=True)
 
