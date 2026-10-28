@@ -59,6 +59,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         evidence_memory_root: str | None = None,
         tactile_temporal_encoder: Any | None = None,
         retrieve_tactile_history: bool = True,
+        evidence_failure_triggered: bool = True,
     ) -> None:
         super().__init__()
         self.univtac_root = Path(univtac_root).expanduser().resolve()
@@ -77,6 +78,7 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self.evidence_memory_root = evidence_memory_root
         self._tactile_temporal_encoder = tactile_temporal_encoder
         self._retrieve_tactile_history = bool(retrieve_tactile_history)
+        self._evidence_failure_triggered = bool(evidence_failure_triggered)
         self._tactile_evidence = None
         self._release_ready_since = None
         self._keyboard_calibration = None
@@ -141,6 +143,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self._policy_end_verdict = False
         self._sim_step_count = 0
         self._public_attempts_finalized = 0
+        self._public_policy_managed = False
+        self._recovery_pending_reads = set()
         self._last_native_notes_attempted = 0
         self._last_private_piano_record = 0
         self._last_private_score_event = 0
@@ -339,6 +343,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
         self._policy_end_verdict = False
         self._sim_step_count = 0
         self._public_attempts_finalized = 0
+        self._public_policy_managed = False
+        self._recovery_pending_reads = set()
         self._release_ready_since = None
         self._last_native_notes_attempted = 0
         self._last_private_piano_record = 0
@@ -390,7 +396,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
                  'force_model': hashlib.sha256(self.digit_force_sidecar.read_bytes()).hexdigest(),
                  'action_repeat': self.action_repeat, 'physics_hz': 240,
                  'frame': 'public_endpoint_geometry.v1'}, self._public_sequence,
-                encoder=self._tactile_temporal_encoder, retrieve_history=self._retrieve_tactile_history)
+                encoder=self._tactile_temporal_encoder, retrieve_history=self._retrieve_tactile_history,
+                failure_triggered=self._evidence_failure_triggered)
             self._record_tactile_evidence_sample()
         return self.get_observation(), {}
 
@@ -436,6 +443,76 @@ class ShadowPianoLowLevelEnv(BaseEnv):
                   if re.match(r"^[A-Za-z]+(?:Error|Exception):", line)]
         safe = [line for line in lines + errors if not any(m in line.lower() for m in _PRIVATE_MARKERS)]
         self._write_public_event("code_execution", public_messages=safe[-24:], has_exception=bool(errors))
+
+    def observe_public_policy_stdout(self, text):
+        evidence = getattr(self, '_tactile_evidence', None)
+        if evidence is not None and evidence.failure_triggered:
+            evidence.write(text)
+
+    def public_recovery_context(self):
+        """Host progress and measured public state; no native verdict or force truth."""
+        from capx.integrations.opentac_shadow_code_memory import public_failure_context
+        evidence = self._tactile_evidence
+        failure=public_failure_context({'executions':evidence.executions,'events':evidence.events,
+            'invocations':evidence.invocations,'functions':list(evidence.functions.values())})
+        events = [e for e in evidence.events if e['kind'] == 'attempt_finalized']
+        indices = [e['index'] for e in events]
+        if indices != list(range(self._public_attempts_finalized)):
+            raise ValueError('Public attempt ledger and adapter progress disagree')
+        hand = self.get_observation()['hand_state']
+        sample = evidence.frames[-1] if evidence.frames else None
+        return {'finalized_indices': indices, 'current_attempt': len(indices),
+            'error_kind':failure['kind'] if failure else None,
+            'error_attempt':failure['attempt'] if failure else None,
+            'native_stopped': bool(self._native_done),
+            'hand': {k: hand.get(k) for k in ('wrist_x_offset_m', 'wrist_y_m', 'wrist_z_m', 'index_flexion_rad')},
+            'last_tactile': {k: sample[k] for k in ('physics_step', 'instantaneous_5d', 'estimate')} if sample else None,
+            'physics_step': int(self._task.step_count),
+            'release_ready_since_physics_step': self._release_ready_since}
+
+    def prepare_public_policy_execution(self, code, previous):
+        import re
+        evidence = getattr(self, '_tactile_evidence', None)
+        if evidence is None or not evidence.failure_triggered or not re.search(r'^# capx-piano-policy:[0-9a-f]{64}$', code, re.M):
+            return None
+        from capx.integrations.opentac_shadow_code_memory import validate_parameters
+        context = self.public_recovery_context()
+        previous = previous if isinstance(previous, dict) else {}
+        try:
+            match = re.search(r'^# capx-piano-parameters:(.+)$', code, re.M)
+            defaults = json.loads(match.group(1)) if match else {}
+            parameters = validate_parameters(previous.get('policy_parameters', defaults))
+        except (ValueError, TypeError):
+            parameters = {}
+        resume = bool(evidence.executions or re.search(r'^# capx-piano-repair:', code, re.M))
+        self._recovery_pending_reads = {'hand','tactile'} if resume and not context['native_stopped'] else set()
+        self._public_policy_managed = True
+        initialized = bool(previous.get('initialization_complete')) or any(
+            e['end'] and e['end']['action_step'] > e['start']['action_step'] for e in evidence.executions)
+        return {'completed': context['current_attempt'], 'attempts': list(context['finalized_indices']),
+            'keys': dict(self._cached_key_targets) if self._visual_key_map_ready else None,
+            'policy_parameters': parameters, 'initialization_complete': initialized,
+            'recovery': {**context, 'resuming': resume,
+                'instruction': 'Re-enter run_piano; inspect fresh pose/contact/release before acting. '
+                    'Do not replay finalized attempts or initialization. Recheck hold timing using physical steps.'}}
+
+    def note_public_recovery_read(self, modality, note=None):
+        pending = getattr(self, '_recovery_pending_reads', set())
+        if modality == 'tactile' and pending:
+            from capx.integrations.opentac_shadow_vision import parse_note
+            if self._public_attempts_finalized >= len(self.piano_notes) or parse_note(note)[0] != parse_note(self.piano_notes[self._public_attempts_finalized])[0]:
+                return
+        if modality in pending:
+            self._tactile_evidence.event('recovery_read', modality=modality)
+            pending.discard(modality)
+
+    def finalize_public_policy_return(self):
+        if not getattr(self, '_public_policy_managed', False) or self._policy_end_submitted:
+            return False
+        if self._public_attempts_finalized != len(self.piano_notes):
+            return False
+        self.submit_policy_end()
+        return True
 
     def _clear_keyboard_for_visual(self) -> None:
         """Move the open index away from the keyboard before the sole initial image."""
@@ -493,6 +570,8 @@ class ShadowPianoLowLevelEnv(BaseEnv):
     def step(self, action):
         if self._policy_end_submitted or self._native_done:
             raise RuntimeError("Native piano episode has ended; no further action is allowed")
+        if getattr(self, '_recovery_pending_reads', None):
+            raise ValueError('Recovery requires fresh get_hand_state() and estimate_key_force(current_note) before any motion')
         value = self._validate_action(action)
         self._require_xy_arrival_before_press(value)
         self._observation, reward, terminated, truncated, self._native_info = self._task.step(value)
@@ -564,12 +643,14 @@ class ShadowPianoLowLevelEnv(BaseEnv):
                 raise ValueError('Public release has not completed: actual index must be <=0.02 rad '
                     'and wrist Z within 0.002 m of 0.04 m continuously for >=0.12 s; keep advancing bounded release actions')
         release_verified = bool(getattr(self, 'require_public_release', False) and not self._native_done)
+        terminal_before_finalize = bool(self._native_done)
         self._native_info = self._task.finish_piano_note_attempt(index)
         self._public_attempts_finalized += 1
         if getattr(self, '_tactile_skill_memory', None) is not None:
             self._tactile_skill_memory.next_attempt()
         self._write_public_event("attempt_finalized", index=index,
-            release_verified=release_verified, finalization_source="policy")
+            release_verified=release_verified, finalization_source="policy",
+            terminal_before_finalize=terminal_before_finalize)
         self._release_ready_since = None
         self._observation = self._task._observation()
         self._native_done = bool(self._task._done)

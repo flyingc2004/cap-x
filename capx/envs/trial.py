@@ -679,11 +679,13 @@ def _should_query_multiturn_after_block(
     # A visual checkpoint is an explicit, bounded request from the generated
     # program.  It is intentionally allowed even in failure-only mode, while
     # ordinary successful intermediate blocks continue without another query.
-    if _visual_checkpoint_marker(info_step, config) is not None:
+    error_only = bool(config.get('shadow_piano_evidence_memory')) and config.get(
+        'shadow_piano_evidence_trigger', 'repair_only') == 'repair_only'
+    if not error_only and _visual_checkpoint_marker(info_step, config) is not None:
         return True
     if _shadow_piano_probe_stopped(info_step, config):
         return True
-    if not config.get("multi_turn_on_failure_only", False):
+    if not error_only and not config.get("multi_turn_on_failure_only", False):
         return True
 
     stdout = str(info_step.get("stdout", "") or "")
@@ -720,6 +722,9 @@ def _should_query_multiturn_after_block(
     )
     if any(token in combined for token in failure_tokens):
         return True
+
+    if error_only:
+        return False  # no retrieval/LLM turn merely for images or an unfinished block
 
     if config.get("multiturn_requires_checkpoint_or_failure", False):
         # Some visual-control protocols reserve model calls for explicit
@@ -1520,7 +1525,7 @@ def _handle_multi_turn_step(
         from capx.integrations.opentac_shadow_code_memory import repair
         # Detailed feedback comes from the recorded public whitelist, never
         # arbitrary native traceback/observation payloads.
-        new_code = repair(args, config, {'trigger': 'public_code_failure_or_checkpoint'})
+        new_code = repair(args, config, {'trigger': 'public_code_failure_or_checkpoint'}, env=env)
         return ('regenerate', new_code, '', None, None) if new_code else ('finish', None, '', None, None)
     use_wrist = config.get("use_wrist_camera", False)
     checkpoint_marker = _visual_checkpoint_marker(info_step, config)

@@ -300,12 +300,14 @@ class PublicTactileEvidence:
     Phase names describe commanded motion, not native scoring stages.
     """
 
-    def __init__(self, root, run_dir, contract, request, *, encoder=None, retrieve_history=True):
+    def __init__(self, root, run_dir, contract, request, *, encoder=None, retrieve_history=True,
+                 failure_triggered=True):
         self.index = TactileEvidenceIndex(root)
+        self.failure_triggered = bool(failure_triggered)
         self.encoders = trajectory_encoders(encoder)
         # Existing public CaP-X executions gain keys in the same versioned spaces.
         # No native labels or expert-index skill IDs are consumed here.
-        self.backfill = self.index.encode_history(self.encoders) if retrieve_history and self.encoders else []
+        self.backfill = self.index.encode_history(self.encoders) if retrieve_history and self.encoders and not self.failure_triggered else []
         self.history = self.index.records() if retrieve_history else []
         self.episode_id = Path(run_dir).name + '_' + uuid.uuid4().hex
         self.directory = self.index.root / 'episodes' / self.episode_id
@@ -315,6 +317,10 @@ class PublicTactileEvidence:
         self.contract, self.request, self.encoder = contract, request, encoder
         self.frames, self.clips, self.invocations, self.functions = [], [], [], {}
         self.events, self.retrievals, self.active_calls = [], [], []
+        self.sequence = 0
+        self.execution_id = None
+        self.executions = []
+        self._text_buffer = ''
         self.current_clip = None
         self.last_step = None
         self.last_action = None
@@ -328,6 +334,20 @@ class PublicTactileEvidence:
             'schema': 'public_tactile_evidence.v1', 'root': str(self.index.root),
             'episode_id': self.episode_id, 'manifest': str(self.manifest_path)})
         self.flush()
+
+    def stamp(self):
+        self.sequence += 1
+        return {'event_seq': self.sequence, 'execution_id': self.execution_id, **self.clock}
+
+    def write(self, text):
+        """Observe public stop markers at their call site, before the stack unwinds."""
+        self._text_buffer += text
+        while '\n' in self._text_buffer:
+            line, self._text_buffer = self._text_buffer.split('\n', 1)
+            if line.startswith(('PIANO_STOP ', 'CAPX_FAILURE ')) and not any(m in line.lower() for m in _PRIVATE_MARKERS):
+                self.event('public_stop', message=line[:1200])
+        self._text_buffer = self._text_buffer[-1200:]
+        return len(text)
 
     def _phase(self, attempt, action):
         if attempt != self.attempt:
@@ -348,6 +368,7 @@ class PublicTactileEvidence:
 
     def sample(self, *, action_step, physics_step, attempt, note, dynamics, action,
                hand, estimate, features, rgb, depth, reference, scales):
+        self.instantaneous_scales = list(scales)
         if self.last_step == physics_step:
             return  # Repeated queries do not create new physical observations.
         if self.last_step is not None and physics_step < self.last_step:
@@ -382,7 +403,7 @@ class PublicTactileEvidence:
         if force is not None and not np.isfinite(force):
             force = None
         row = {'sample_id': 'sample:' + _evidence_hash([self.episode_id, physics_step]),
-            **self.clock, 'timestamp_s': physics_step / self.contract['physics_hz'],
+            **self.stamp(), 'timestamp_s': physics_step / self.contract['physics_hz'],
             'clip_id': self.current_clip['clip_id'], 'attempt': attempt, 'phase': phase,
             'action': list(action), 'hand': public_hand, 'instantaneous_5d': vector,
             'estimate': {'estimated_key_force_N': force, 'quality': estimate.get('quality', 'unavailable'),
@@ -395,7 +416,7 @@ class PublicTactileEvidence:
             stream.write(json.dumps(row, allow_nan=False) + '\n')
         # Query once per segment using fresh instantaneous evidence. A retrieved
         # clip remains advisory, not an automatically approved parameter change.
-        if vector is not None and estimate.get('quality') == 'ok' and not self.current_clip.get('queried'):
+        if not self.failure_triggered and vector is not None and estimate.get('quality') == 'ok' and not self.current_clip.get('queried'):
             self.current_clip['queried'] = True
             rep_contract = self._representation_contract(note, dynamics, phase)
             matches = self.index.retrieve('instantaneous_5d', vector, rep_contract,
@@ -435,7 +456,7 @@ class PublicTactileEvidence:
             self.index.put_representation(clip['clip_id'], 'temporal', None,
                 {**contract, 'encoder': None, 'window': 'commanded_phase_segment.v1'},
                 'not_configured', samples[-1]['physics_step'])
-        for encoder in self.encoders:
+        for encoder in ([] if self.failure_triggered else self.encoders):
             try:
                 window = _clip_window(self.directory, self.frames, clip, self.contract, encoder, self.episode_id)
                 result = encode_tactile_window(window, encoder)
@@ -456,7 +477,7 @@ class PublicTactileEvidence:
         # Never serialize arbitrary generated values or native simulator info.
         if kind in ('attempt_finalized', 'release_rejected'):
             fields = {k: fields[k] for k in ('index', 'release_verified', 'continuous_release_seconds',
-                'finalization_source') if k in fields}
+                'finalization_source', 'terminal_before_finalize') if k in fields}
         elif kind == 'native_terminal_end':
             fields = {'finalized_indices': list(fields.get('finalized_indices', []))}
         elif kind in ('tactile_skill_query', 'tactile_skill_applied', 'tactile_skill_recorded'):
@@ -464,10 +485,18 @@ class PublicTactileEvidence:
                 'status', 'z_correction_m', 'queried_step', 'applied_step', 'entry_features',
                 'color', 'dynamics', 'hold_start_step', 'hold_end_step') if k in fields}
         elif kind == 'code_execution':
-            fields = {'has_exception': bool(fields.get('has_exception'))}
+            fields = {'has_exception': bool(fields.get('has_exception')),
+                'public_messages': [s[:8192] if s.startswith('PIANO_POLICY_STATE ') else s[:1200] for s in fields.get('public_messages', [])[-24:]
+                    if not any(m in s.lower() for m in _PRIVATE_MARKERS)]}
+        elif kind == 'recovery_read':
+            if fields.get('modality') not in ('hand','tactile'):
+                return
+            fields = {'modality': fields['modality']}
+        elif kind == 'public_stop':
+            fields = {'message': fields['message'][:1200], 'invocation_ids': list(self.active_calls)}
         else:
             return
-        event = {'kind': kind, **self.clock, **fields}
+        event = {'kind': kind, **self.stamp(), **fields}
         self.events.append(event)
         links = [*self.active_calls, *([fields['skill_id']] if fields.get('skill_id') else [])]
         if kind == 'tactile_skill_recorded':
@@ -483,6 +512,16 @@ class PublicTactileEvidence:
     @contextmanager
     def trace_execution(self, code, namespace):
         filename = '<capx-public-' + _evidence_hash(code.encode()) + '>'
+        self._finish_clip()
+        self.execution_id = 'execution:' + _evidence_hash([self.episode_id, len(self.executions)])
+        policy = re.search(r'^# capx-piano-policy:([0-9a-f]{64})$', code, re.M)
+        repair = re.search(r'^# capx-piano-repair:([0-9a-f]{64})$', code, re.M)
+        execution = {'execution_id': self.execution_id, 'source_version': policy.group(1) if policy else None,
+            'repair_id': repair.group(1) if repair else None, 'start': self.stamp(), 'end': None}
+        self.executions.append(execution)
+        if repair:
+            self.events.append({'kind': 'repair_execution_begin', 'repair_id': repair.group(1),
+                                'source_version': execution['source_version'], **self.stamp()})
         tree = ast.parse(code)
         by_line = {}
         for node in ast.walk(tree):
@@ -505,19 +544,21 @@ class PublicTactileEvidence:
             key = (frame.f_code.co_firstlineno, frame.f_code.co_name)
             if event == 'call' and key in by_line:
                 identifier = 'invocation:' + _evidence_hash([self.episode_id, len(self.invocations)])
-                row = {'invocation_id': identifier, 'function_id': by_line[key], 'start': dict(self.clock),
+                row = {'invocation_id': identifier, 'function_id': by_line[key], 'start': self.stamp(),
+                       'execution_id': self.execution_id, 'depth': len(self.active_calls),
+                       'parent_invocation_id': self.active_calls[-1] if self.active_calls else None,
                        'end': None, 'exceptions': [], 'outcome': 'running'}
                 frames[id(frame)] = row
                 self.invocations.append(row)
                 self.active_calls.append(identifier)
             row = frames.get(id(frame))
             if row is not None and event == 'exception':
-                row['exceptions'].append({'type': arg[0].__name__, **self.clock})
+                row['exceptions'].append({'type': arg[0].__name__, 'generated_line': frame.f_lineno, **self.stamp()})
             if row is not None and event == 'return':
                 if frame.f_code not in instructions:
                     instructions[frame.f_code] = {i.offset: i.opname for i in dis.get_instructions(frame.f_code)}
                 opcode = instructions[frame.f_code].get(frame.f_lasti, '')
-                row.update(end=dict(self.clock), outcome='returned' if opcode.startswith('RETURN') else 'raised')
+                row.update(end=self.stamp(), outcome='returned' if opcode.startswith('RETURN') else 'raised')
                 # Exception events are retained even when handled by the helper.
                 self.index.append('invocation', row, [row['invocation_id'], row['function_id']])
                 self.active_calls.remove(row['invocation_id'])
@@ -528,12 +569,14 @@ class PublicTactileEvidence:
             yield filename
         finally:
             sys.settrace(previous)
+            execution['end'] = self.stamp()
             self._finish_clip()
             self.flush()
 
     def flush(self):
         atomic_json(self.manifest_path, {'schema': 'public_tactile_evidence.v1',
             'episode_id': self.episode_id, 'contract': self.contract, 'request': self.request,
+            'failure_triggered': self.failure_triggered, 'executions': self.executions,
             'trajectory_encoders': [{'contract': e.contract,
                 'load_error_type': getattr(e, 'error_type', None)} for e in self.encoders],
             'clips': self.clips, 'samples': self.frames, 'invocations': self.invocations,

@@ -24,10 +24,13 @@ class Tee(io.TextIOBase):
     (enables breakpointing for debugging!)
     """
 
-    def __init__(self, *streams):
+    def __init__(self, *streams, observer=None):
         self.streams = streams
+        self.observer = observer
 
     def write(self, s):
+        if self.observer is not None:
+            self.observer(s)
         for st in self.streams:
             st.write(s)
             st.flush()
@@ -189,6 +192,13 @@ class CodeExecutionEnvBase(Env):
         return f"{self._task_prompt}\nAPIs:\n" + "\n".join(docs)
 
     def _exec_user_code(self, code: str) -> dict[str, Any]:
+        prepare = getattr(self.low_level_env, 'prepare_public_policy_execution', None)
+        if callable(prepare):
+            state = prepare(code, self._exec_globals.get('piano_state'))
+            if state is not None:
+                # A new module must not silently retain removed old helpers.
+                self._init_exec_globals()
+                self._exec_globals['piano_state'] = state
         obs = self._get_observation()
         if getattr(getattr(self, "low_level_env", None), "policy_controls_termination", False):
             # A previous block's END request must never carry into a continuation.
@@ -213,6 +223,9 @@ class CodeExecutionEnvBase(Env):
             # repair prompt without flooding an interactive terminal.
             tee_out = Tee(stdout_buffer)
             tee_err = Tee(stderr_buffer)
+        observe = getattr(self.low_level_env, 'observe_public_policy_stdout', None)
+        if callable(observe):
+            tee_out.observer = observe
         ok = True
         completed_normally = True
         undefined_names = self._find_static_undefined_globals(code)
@@ -546,6 +559,10 @@ class CodeExecutionEnvBase(Env):
                         policy_end = True
                         self._exec_globals["capx_stop"] = True
                         exec_result["stdout"] += "[capx-host] END after native termination; no further motion\n"
+                    elif callable(getattr(self.low_level_env, 'finalize_public_policy_return', None)) and self.low_level_env.finalize_public_policy_return():
+                        policy_end = True
+                        self._exec_globals['capx_stop'] = True
+                        exec_result['stdout'] += '[capx-host] END after public attempt chain\n'
                     elif stop_value is True:
                         self.low_level_env.submit_policy_end()
                         policy_end = True

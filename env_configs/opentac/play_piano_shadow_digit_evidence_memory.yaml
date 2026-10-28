@@ -124,11 +124,9 @@ env:
       continue bounded probing for this same note, reset the hold clock, and never
       fabricate force.
 
-      OOD/stale/invalid or overforce requires safe release; finalize that attempt
-      and continue.
-
-      No in-episode code regeneration is enabled; the host reviews evidence once after
-      the episode.
+      Persistent OOD/stale/invalid or overforce requires safe release. If the public
+      recovery cannot resolve it, print PIANO_STOP OOD_REPROBE and return without
+      finalizing the unfinished attempt. The host may request one in-episode repair.
 
       Fresh quality=''ok'', age_steps=0 and finite force are prerequisites for feedback.
       Keep Z fixed
@@ -202,17 +200,19 @@ env:
       The host records continuous public 5D plus RGB/depth/masks and actual helper
       invocations.
 
-      A future temporal encoder is a PARALLEL memory representation, never a replacement
-      for 5D
-
-      or the frozen force estimator. One episode-boundary updater can modify up to
-      two helpers
-
-      using these public trajectories. Historical rules and parameter suggestions
-      are advisory;
-
-      verify them with fresh tactile feedback. Preserve hard limits and the requested
-      melody.
+      Temporal encoders are PARALLEL memory representations, never replacements for
+      5D or the frozen force estimator. Normal execution only records evidence.
+      On an explicit public failure print PIANO_STOP with the reason and return
+      without falsely finalizing the unfinished attempt. The host retrieves history
+      only before one bounded repair request. There is no episode-end LLM updater.
+      When run_piano is called again, use piano_state[''recovery''] and
+      its host-confirmed finalized_indices/current_attempt. Do not replay finalized
+      attempts, initialization, clearing or calibration. Inspect fresh hand pose and
+      tactile contact/quality before release, re-approach or continuing. Recheck hold
+      timing; API waiting does not advance physical time. Never rely on completed
+      alone. Historical fixes are hypotheses; keep hard limits and requested melody.
+      On recovery call get_hand_state() and estimate_key_force for the current note
+      before ANY action. The host rejects motion until both public reads occur.
 
       '
     multi_turn_prompt: 'Use the unchanged public request and preserve finalized attempts.
@@ -226,11 +226,11 @@ output_dir: ${oc.env:CAPX_OUTPUT_DIR,/mnt/data/ljz/opentacbench/capx-runs/shadow
 trial_timeout_seconds: 7200
 code_block_wall_timeout_seconds: 3300
 max_trial_retries: 0
-max_regenerations: 0
+max_regenerations: 1
 stop_multiturn_when_regeneration_exhausted: true
 multi_turn_on_failure_only: true
 multiturn_requires_checkpoint_or_failure: true
-shadow_piano_recover_on_stop: false
+shadow_piano_recover_on_stop: true
 shadow_piano_wrist_on_failure: false
 split_code_blocks_on_breakpoint: true
 visual_checkpoint_markers:
@@ -255,4 +255,9 @@ shadow_piano_public_skill_library: null
 evolve_skill_library: false
 shadow_piano_evidence_memory: ${oc.env:CAPX_SHADOW_EVIDENCE_ROOT,/mnt/data/ljz/opentacbench/shadow_piano_evidence_v1}
 shadow_piano_evidence_mode: ${oc.env:CAPX_SHADOW_EVIDENCE_MODE,joint}
+shadow_piano_evidence_trigger: repair_only
+shadow_piano_repair_scope: release_regions_v1
+# Optional frozen V0 for a controlled repair comparison, not an approved cache entry.
+shadow_piano_initial_source: ${oc.env:CAPX_SHADOW_INITIAL_SOURCE,null}
+shadow_piano_initial_source_sha256: ${oc.env:CAPX_SHADOW_INITIAL_SOURCE_SHA256,null}
 shadow_piano_action_memory: false

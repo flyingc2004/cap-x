@@ -17,12 +17,13 @@ from capx.envs import trial
 from test_opentac_shadow_adapter import FakeShadowTask
 
 
-def evidence_recorder(tmp_path, name='run', encoder=None):
+def evidence_recorder(tmp_path, name='run', encoder=None, failure_triggered=False):
     from capx.integrations.opentac_shadow_online_skills import PublicTactileEvidence
     return PublicTactileEvidence(tmp_path/'evidence', tmp_path/name,
         {'sensor':'same', 'force_model':'frozen', 'action_repeat':4, 'physics_hz':240,
          'frame':'public_endpoint_geometry.v1'},
-        {'notes':['F4'], 'dynamics':['light'], 'hold_seconds':[.12]}, encoder=encoder)
+        {'notes':['F4'], 'dynamics':['light'], 'hold_seconds':[.12]}, encoder=encoder,
+        failure_triggered=failure_triggered)
 
 
 def record_sample(recorder, step, flex=.5, z=.01, quality='ok'):
@@ -203,6 +204,27 @@ def test_missing_checkpoint_does_not_disable_5d(tmp_path):
     reps=[r['payload'] for r in rec.index.records() if r['kind']=='representation']
     assert any(r['type']=='instantaneous_5d' and r['quality']=='ok' for r in reps)
     assert any(r['type']=='temporal' and r['quality']=='encoder_unavailable' and r['vector'] is None for r in reps)
+
+
+def test_temporal_encoding_and_retrieval_are_lazy_until_error(tmp_path):
+    from capx.memory.trajectory.data import WINDOW
+    from capx.integrations.opentac_shadow_code_memory import _repair_query
+    calls=[]
+    class Encoder:
+        contract={'version':'test','preprocessing':'raw','modalities':['depth_m'],'window':WINDOW}
+        def encode(self,w):
+            calls.append(w)
+            assert all(s['physics_step']<=w['current_physics_step'] for s in w['sources'])
+            return {'vector':[1.,0.], 'quality':'ok' if w['timestamps_s'][-1]-w['timestamps_s'][0]>=.5 else 'insufficient_valid_history'}
+    rec=evidence_recorder(tmp_path,encoder=Encoder(),failure_triggered=True)
+    for i in range(1,35):record_sample(rec,i,flex=.2 if i<31 else .5)
+    rec.close()
+    assert not calls and not rec.retrievals
+    failure={'kind':'code_exception','physics_step':136,'error_event_seq':10000}
+    result=_repair_query(rec,failure)
+    assert len(calls)==1 and len({s['clip_id'] for s in calls[0]['sources']})>1
+    assert result['miss_reason']=='no_compatible_verified_repair' and not result['matches']
+    assert len(rec.retrievals)==1
 
 ROOT = Path(__file__).resolve().parents[1]
 

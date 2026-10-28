@@ -123,6 +123,7 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         low['evidence_memory_root'] = evidence_root
         low['public_episode_recording'] = True
         low['retrieve_tactile_history'] = evidence_options['tactile_history']
+        low['evidence_failure_triggered'] = configs_dict.get('shadow_piano_evidence_trigger', 'repair_only') == 'repair_only'
     if shadow_memory_policy is not None:
         from capx.integrations.opentac_shadow_code_memory import memory_policy
         shadow_memory_policy = memory_policy(configs_dict)
@@ -223,6 +224,10 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "shadow_piano_code_memory": configs_dict.get("shadow_piano_code_memory"),
         "shadow_piano_evidence_memory": evidence_root,
         "shadow_piano_evidence_mode": evidence_mode,
+        "shadow_piano_evidence_trigger": configs_dict.get('shadow_piano_evidence_trigger', 'repair_only'),
+        "shadow_piano_repair_scope": configs_dict.get('shadow_piano_repair_scope', 'legacy'),
+        "shadow_piano_initial_source": configs_dict.get('shadow_piano_initial_source'),
+        "shadow_piano_initial_source_sha256": configs_dict.get('shadow_piano_initial_source_sha256'),
         "shadow_piano_tactile_skill_pilot": configs_dict.get("shadow_piano_tactile_skill_pilot", False),
         "shadow_piano_action_memory": configs_dict.get("shadow_piano_action_memory", False),
         "shadow_piano_memory_policy": shadow_memory_policy,

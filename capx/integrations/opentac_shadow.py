@@ -28,7 +28,10 @@ class ShadowPianoControlApi(ApiBase):
 
     def get_hand_state(self) -> dict:
         """Read public wrist, index-finger and Franka joint state."""
-        return self._env.get_observation()["hand_state"]
+        state = self._env.get_observation()["hand_state"]
+        marker = getattr(self._env, 'note_public_recovery_read', None)
+        if callable(marker): marker('hand')
+        return state
 
     def get_key_angles(self, notes: list[str | int] | None = None) -> dict[str, float]:
         """Read physical key angles in radians; omitted notes return all 88 keys.
@@ -151,7 +154,10 @@ class ShadowPianoVisualForceApi(ApiBase):
         commanded target. wrist_and_index_velocity[0] is wrist Y speed in m/s.
         Compare measured X/Y with locate_visual_keys() targets before pressing.
         """
-        return self._env.get_observation()["hand_state"]
+        state = self._env.get_observation()["hand_state"]
+        marker = getattr(self._env, 'note_public_recovery_read', None)
+        if callable(marker): marker('hand')
+        return state
 
     def move_shadow_index(self, wrist_x_offset_m: float, wrist_y_m: float,
                           lift_z_m: float, index_flexion_rad: float,
@@ -211,7 +217,10 @@ class ShadowPianoVisualForceApi(ApiBase):
         1/60 s); 9 samples span 8 intervals, not 9. A skipped action invalidates
         a consecutive hold streak; never fill missing readings by interpolation.
         """
-        return self._env.estimate_key_force(note)
+        estimate = self._env.estimate_key_force(note)
+        marker = getattr(self._env, 'note_public_recovery_read', None)
+        if callable(marker): marker('tactile', note)
+        return estimate
 
     def finish_piano_note_attempt(self, index: int) -> dict:
         """After safely releasing note index (zero based), consume that attempt.

@@ -16,6 +16,245 @@ SOURCE='''def run_piano(request, piano_state):
 '''
 
 
+REGION_SOURCE='''def run_piano(request, piano_state):
+    notes = request['notes']
+    def command(x, y, z, flex):
+        return move_shadow_index(x, y, z, flex)
+    def measured_arrival(x, y, hover):
+        return True, False
+    def release(x, y, start_z, hover, start_flex, already_done):
+        for k in range(8):
+            command(x, y, hover, 0.)
+        return True, False
+    def finalize(i, note, quality, confidence, reason, done):
+        finish_piano_note_attempt(i)
+        piano_state['completed'] = i + 1
+        return done
+    for i in range(piano_state['completed'], len(notes)):
+        note = notes[i]
+        x = 0.
+        y = 0.
+        hover = .04
+        z = .01
+        flex = .5
+        arrived, done = measured_arrival(x, y, hover)
+        command(x, y, z, flex)
+        released, done = release(x, y, z, hover, flex, done)
+        done = finalize(i, note, 'ok', True, None, done)
+'''
+
+REGION_RELEASE='''def release(x, y, start_z, hover, start_flex, already_done):
+    if already_done:
+        return False, True
+    elapsed = 0.
+    ready_since = None
+    for k in range(180):
+        result = command(x, y, hover, 0.)
+        if result.get('native_done'):
+            return False, True
+        elapsed += result.get('steps_executed', 0) * 4. / 240.
+        hand = get_hand_state()
+        ready = hand['index_flexion_rad'] <= .02 and abs(hand['wrist_z_m'] - hover) <= .002
+        if not ready:
+            ready_since = None
+        elif ready_since is None:
+            ready_since = elapsed
+        elif elapsed - ready_since >= .12:
+            return True, False
+    print('PIANO_STOP release_timeout')
+    return False, False
+'''
+
+REGION_RECOVERY='''hand = get_hand_state()
+contact = estimate_key_force(note)
+released, done = release(x, y, hand['wrist_z_m'], hover, hand['index_flexion_rad'], False)
+if done:
+    return
+if not released:
+    print('PIANO_STOP release_timeout')
+    return
+done = finalize(i, note, 'unavailable', None, 'release_recovered_prior_hold_unknown', done)
+if done:
+    return
+continue
+'''
+
+
+def region_proposal(evidence):
+    regions=evidence['editable_regions']
+    return {'mode':'regions','base_source_sha256':regions['base_source_sha256'],
+        'edits':[{'id':r['id'],'original_sha256':r['original_sha256'],
+                  'source':REGION_RELEASE if r['id']=='release_body' else REGION_RECOVERY} for r in regions['regions']],
+        'reason':'Eight observations have only seven physical intervals.',
+        'expected_effect':'Complete release before finalization without replaying the press.',
+        'evidence':{'error_event_seq':evidence['failure']['error_event_seq'],
+                    'clip_ids':list({s['clip_id'] for s in evidence['samples']})}}
+
+
+def test_region_repair_round_trip_and_fresh_seed(tmp_path,monkeypatch):
+    cfg,rec,env=live_repair_fixture(tmp_path)
+    cfg['shadow_piano_repair_scope']='release_regions_v1'
+    monkeypatch.setattr(mem,'compatibility',lambda _: {'test':'regions'})
+    seen=[]
+    def query(args,messages,**kw):
+        seen.append(kw['phase'])
+        if kw['phase']=='code_memory_initial':return {'content':REGION_SOURCE}
+        e=json.loads(messages[1]['content'])
+        assert e['mode']=='regions' and e['current_source']==mem.validate_source(REGION_SOURCE)
+        return {'content':json.dumps(region_proposal(e))}
+    monkeypatch.setattr(mem,'_query',query)
+    code,_,_=mem.initial_code(SimpleNamespace(),cfg,{'full_prompt':[]})
+    _,_,_,_,info=env.step(code)
+    assert info['sandbox_rc']!=0 and env.low_level_env._task.steps==9
+    code=mem.repair(SimpleNamespace(),cfg,env=env)
+    assert code
+    _,_,_,_,info=env.step(code)
+    assert info['sandbox_rc']==0,info
+    assert env.low_level_env._task.steps==28
+    result=mem.finish_episode(cfg)
+    assert result['accepted'] and result['verification']['changed_functions_called'],result
+    case=[r['payload'] for r in rec.index.records() if r['kind']=='repair_case'][-1]
+    assert len(case['region_edits'])==2
+    cfg2,rec2,env2=live_repair_fixture(tmp_path,'next')
+    cfg2['shadow_piano_repair_scope']='release_regions_v1'
+    code2,_,_=mem.initial_code(SimpleNamespace(),cfg2,{'full_prompt':[]})
+    _,_,_,_,info=env2.step(code2)
+    assert info['sandbox_rc']==0 and env2.low_level_env._task.steps==20
+    assert not any(e['kind']=='recovery_read' for e in rec2.events)
+    assert seen==['code_memory_initial','tactile_error_repair']
+    assert mem.finish_episode(cfg2)['accepted']
+
+
+@pytest.mark.parametrize('tamper',['shared_write','skip','full_module','wrong_hash','true_confidence','new_motion','signature'])
+def test_region_rejects_out_of_scope_changes(tamper):
+    source=mem.validate_source(REGION_SOURCE)
+    e={'mode':'regions','editable_regions':mem._release_region_contract(source),
+       'failure':{'error_event_seq':12},'samples':[]}
+    p=region_proposal(e)
+    if tamper=='shared_write':p['edits'][1]['source']="piano_state['completed'] = 99\n"+REGION_RECOVERY
+    elif tamper=='skip':p['edits'][1]['source']='continue\n'+REGION_RECOVERY
+    elif tamper=='full_module':p['source']=source
+    elif tamper=='wrong_hash':p['edits'][0]['original_sha256']='0'*64
+    elif tamper=='true_confidence':p['edits'][1]['source']=REGION_RECOVERY.replace("'unavailable', None", "'unavailable', True")
+    elif tamper=='new_motion':p['edits'][1]['source']='move_shadow_index(0,0,0,0)\n'+REGION_RECOVERY
+    else:p['edits'][0]['source']=REGION_RELEASE.replace('already_done):','already_done, extra=1):')
+    with pytest.raises(ValueError):mem._validate_repair_proposal(p,e,source)
+
+
+def test_region_history_offers_the_executed_local_correction(tmp_path,monkeypatch):
+    test_region_repair_round_trip_and_fresh_seed(tmp_path,monkeypatch)
+    cfg,rec,env=live_repair_fixture(tmp_path,'history_probe')
+    p=tmp_path/'V0.py';p.write_text(REGION_SOURCE)
+    cfg.update(shadow_piano_repair_scope='release_regions_v1',shadow_piano_initial_source=str(p),
+               shadow_piano_initial_source_sha256=mem.digest(p.read_bytes()))
+    seen=[]
+    def query(args,messages,**kwargs):
+        assert kwargs['phase']=='tactile_error_repair'
+        e=json.loads(messages[1]['content']);seen.append(e)
+        assert e['historical_repairs'] and e['historical_repairs'][0]['corrected_regions']
+        assert e['historical_repairs'][0]['verification']['original_check_passed']
+        assert len(json.dumps(e,ensure_ascii=False).encode())<=24*1024
+        return {'content':json.dumps(region_proposal(e))}
+    monkeypatch.setattr(mem,'_query',query)
+    code,_,_=mem.initial_code(SimpleNamespace(),cfg,{'full_prompt':[]})
+    env.step(code)
+    repaired=mem.repair(SimpleNamespace(),cfg,env=env)
+    assert repaired and len(seen)==1
+    assert env.step(repaired)[-1]['sandbox_rc']==0
+    assert mem.finish_episode(cfg)['accepted']
+
+
+def test_region_preserves_frozen_code_and_supports_later_patch():
+    source=mem.validate_source(REGION_SOURCE)
+    e={'mode':'regions','editable_regions':mem._release_region_contract(source),
+       'failure':{'error_event_seq':12},'samples':[]}
+    assembled,changes=mem._validate_repair_proposal(region_proposal(e),e,source)
+    old_release,(at,_),_=mem._release_region_layout(source)
+    new_release,(start,end),_=mem._release_region_layout(assembled)
+    old=source.splitlines(True);new=assembled.splitlines(True)
+    assert old[:old_release.lineno-1]==new[:new_release.lineno-1]
+    assert old[old_release.end_lineno:at]==new[new_release.end_lineno:start]
+    assert old[at:]==new[end:]
+    assert {c['qualified_name'] for c in changes}=={'run_piano','run_piano.release'}
+    e['editable_regions']=mem._release_region_contract(assembled)
+    with pytest.raises(ValueError,match='did not change'):mem._validate_repair_proposal(region_proposal(e),e,assembled)
+    p=region_proposal(e);p['edits'][0]['source']=REGION_RELEASE.replace('range(180)','range(179)')
+    again,_=mem._validate_repair_proposal(p,e,assembled)
+    assert again.count(mem._RECOVERY_BEGIN)==1 and 'range(179)' in again
+
+
+def test_local_repair_is_retrievable_despite_later_control_failure(tmp_path,monkeypatch):
+    cfg,rec,env=live_repair_fixture(tmp_path)
+    cfg['shadow_piano_repair_scope']='release_regions_v1'
+    monkeypatch.setattr(mem,'compatibility',lambda _: {'test':'local-regions'})
+    late_failure="    print('PIANO_NOTE', {'index':1,'quality':'ok','public_hold_confidence':False,'abort_reason':'hold_uncertain'})\n"
+    source=REGION_SOURCE+late_failure
+    def query(args,messages,**kw):
+        if kw['phase']=='code_memory_initial':return {'content':source}
+        return {'content':json.dumps(region_proposal(json.loads(messages[1]['content'])))}
+    monkeypatch.setattr(mem,'_query',query)
+    code,_,_=mem.initial_code(SimpleNamespace(),cfg,{'full_prompt':[]})
+    assert env.step(code)[-1]['sandbox_rc']!=0
+    repaired=mem.repair(SimpleNamespace(),cfg,env=env)
+    assert env.step(repaired)[-1]['sandbox_rc']==0
+    result=mem.finish_episode(cfg)
+    assert not result['accepted'] and result['verification']['new_error_event_seqs']
+    assert result['verification']['local_verification']['passed']
+    assert not (tmp_path/'evidence'/'active_bundle.json').exists()
+    case=[r['payload'] for r in rec.index.records() if r['kind']=='repair_case'][-1]
+    assert case['status']=='local_repair_checked' and not case['verification']['passed']
+    cfg2,rec2,env2=live_repair_fixture(tmp_path,'local-history')
+    p=tmp_path/'original.py';p.write_text(source)
+    cfg2.update(shadow_piano_repair_scope='release_regions_v1',shadow_piano_initial_source=str(p),
+                shadow_piano_initial_source_sha256=mem.digest(p.read_bytes()))
+    seen=[]
+    def repair_query(args,messages,**kw):
+        e=json.loads(messages[1]['content']);seen.append(e)
+        h=e['historical_repairs'][0]
+        assert h['qualification']=='local_repair_checked'
+        assert h['local_verification']['passed'] and not h['verification']['passed']
+        return {'content':json.dumps(region_proposal(e))}
+    monkeypatch.setattr(mem,'_query',repair_query)
+    code,_,_=mem.initial_code(SimpleNamespace(),cfg2,{'full_prompt':[]})
+    env2.step(code)
+    assert mem.repair(SimpleNamespace(),cfg2,env=env2) and len(seen)==1
+
+
+@pytest.mark.parametrize('tamper',['missing_checkpoint','wrong_function','new_release_error'])
+def test_local_repair_requires_executed_change_and_original_checkpoint(tmp_path,monkeypatch,tamper):
+    test_region_repair_round_trip_and_fresh_seed(tmp_path,monkeypatch)
+    cfg={'output_dir':str(tmp_path/'first')}
+    session=json.loads(mem._session_path(cfg).read_text())
+    manifest=json.loads(next((tmp_path/'evidence'/'episodes').glob('first*/manifest.json')).read_text())
+    repair=session['repair'];source=session['source']
+    if tamper=='missing_checkpoint':
+        manifest['events']=[e for e in manifest['events'] if not (e['kind']=='attempt_finalized' and e['index']==0)]
+    elif tamper=='wrong_function':repair['changes'][0]['new_hash']='0'*64
+    else:
+        checkpoint=next(e for e in manifest['events'] if e['kind']=='attempt_finalized' and e['index']==0)
+        manifest['events'].append({**checkpoint,'kind':'release_rejected','event_seq':checkpoint['event_seq']-1})
+    assert not mem._check_execution_suffix(manifest,source,repair)['local_verification']['passed']
+
+
+@pytest.mark.parametrize('stopped',[False,True])
+def test_policy_terminal_finalization_is_legal_but_not_release_verification(tmp_path,stopped):
+    cfg,rec,env=live_repair_fixture(tmp_path,count=1)
+    source=mem.validate_source(REGION_SOURCE)
+    env.step(mem.wrapped(source,rec.request,{},host_progress=True))
+    manifest=json.loads(rec.manifest_path.read_text())
+    execution=manifest['executions'][-1]
+    manifest['events']=[e for e in manifest['events'] if e['kind'] not in ('release_rejected','code_execution')]
+    manifest['events'] += [
+        {'kind':'attempt_finalized','index':0,'release_verified':False,'finalization_source':'policy',
+         'terminal_before_finalize':stopped,'event_seq':10000,'physics_step':40},
+        {'kind':'code_execution','has_exception':False,'public_messages':[],
+         'event_seq':10001,'physics_step':40}]
+    manifest['invocations']=[]
+    check=mem._check_execution_suffix(manifest,source)
+    assert check['public_chain_complete'] is stopped and check['passed'] is stopped
+    assert not check['local_verification']['passed']
+
+
 EVIDENCE_SOURCE='''def press(value):
     move_shadow_index(value)
 
@@ -32,6 +271,295 @@ def run_piano(request, piano_state):
         piano_state['completed'] = i + 1
 '''
 
+REPAIR_SOURCE='''def press(index):
+    move_shadow_index(0., 0., .01, .5)
+
+def release(index):
+    if index == 0:
+        for k in range(9):
+            move_shadow_index(0., 0., .04, 0.)
+    finish_piano_note_attempt(index)
+
+def run_piano(request, piano_state):
+    if piano_state.get('recovery', {}).get('resuming'):
+        get_hand_state()
+        estimate_key_force(request['notes'][piano_state['completed']])
+    if not piano_state.get('initialization_complete'):
+        print('INIT_ONCE')
+        piano_state['initialization_complete'] = True
+    for i in range(piano_state['completed'], len(request['notes'])):
+        press(i)
+        release(i)
+        piano_state['completed'] = i + 1
+'''
+
+
+def live_repair_fixture(tmp_path, name='first', count=2):
+    from test_opentac_shadow_adapter import FakeShadowTask
+    from test_shadow_piano_online_skills import evidence_recorder
+    from capx.envs.tasks.base import CodeExecutionEnvBase, CodeExecEnvConfig
+    class Task(FakeShadowTask):
+        def __init__(self):
+            self.target=np.array([0.,0.,.04,0.]);self._done=False
+            super().__init__(stop_after=10000)
+            self.tactile=SimpleNamespace(depth_m=np.full((2,3),.01),reference_depth_m=np.full((2,3),.0101))
+        @property
+        def step_count(self):return self.steps*4
+        def _action_state(self):return self.target
+        def _observation(self):
+            obs=super()._observation();obs['state'][:3]=self.target[1:]
+            return obs
+        def step(self,action):
+            self.target=np.asarray(action);return super().step(action)
+        def finish_piano_note_attempt(self,index):return {}  # no scoring used by memory
+    task=Task()
+    low=ShadowPianoLowLevelEnv(univtac_root=str(tmp_path),piano_notes=['F4']*count,piano_dynamics=['light']*count,
+        task_factory=lambda _:task,output_dir=str(tmp_path/name),action_repeat=4)
+    low.reset();low.visual_key_mode=True;low.piano_continue_on_note_failure=True;low.require_public_release=True
+    low._visual_key_map_ready=True;low._cached_key_targets={'F4':{'wrist_x_offset_m':0.}}
+    for attr in ('_write_native_event','_write_private_piano_timeline','_write_private_force_audit','_save_attempt_snapshots','_save_tactile_snapshot'):
+        setattr(low,attr,lambda *a,**kw:None)
+    def predict(*args,**kw):
+        kw['diagnostics_out']['features']=[.1,.2,.3,.4,.5]
+        return {'estimated_key_force_N':.35,'quality':'ok','calibration_version':'frozen'}
+    low._force_estimator=SimpleNamespace(uses_area_rate=True,observe_frame=lambda *a,**kw:None,predict=predict,
+        sidecar={'models':{'white':{'iqr':[1.]*5}}})
+    rec=evidence_recorder(tmp_path,name,failure_triggered=True)
+    rec.request={'notes':['F4']*count,'dynamics':['light']*count,'hold_seconds':[.12]*count}
+    rec.flush();low._tactile_evidence=rec
+    def move(x,y,z,flex):
+        low.step(np.array([x,y,z,flex]));return {'native_done':False,'steps_executed':1}
+    def hand():
+        state=low.get_observation()['hand_state'];low.note_public_recovery_read('hand');return state
+    def force(note):
+        low.note_public_recovery_read('tactile',note)
+        return {'quality':'ok','estimated_key_force_N':.35}
+    api=SimpleNamespace(functions=lambda:{'move_shadow_index':move,'finish_piano_note_attempt':low.finish_piano_note_attempt,
+        'get_hand_state':hand,'estimate_key_force':force})
+    env=CodeExecutionEnvBase(CodeExecEnvConfig(low_level=low,apis=[],prompt='Public',generated_code_mode='host_module'))
+    env._apis={'test':api}
+    cfg={'shadow_piano_evidence_memory':str(tmp_path/'evidence'),'shadow_piano_code_memory':str(tmp_path/'code'),
+        'output_dir':str(tmp_path/name),'shadow_piano_evidence_trigger':'repair_only',
+        '_piano_public_request':rec.request,'_piano_key_map_ready':True}
+    return cfg,rec,env
+
+
+def repair_proposal(messages, *, fail_again=False):
+    e=json.loads(messages[1]['content'])
+    source=('def release(index):\n    finish_piano_note_attempt(index)\n' if fail_again else
+        'def release(index):\n    get_hand_state()\n    for k in range(9):\n        move_shadow_index(0., 0., .04, 0.)\n    finish_piano_note_attempt(index)\n')
+    return {'content':json.dumps({'mode':'functions','functions':[{'qualified_name':'release','source':source}],
+        'source':None,'reason':'Release failed while the measured index was curled.',
+        'expected_effect':'Inspect pose and extend at hover before retrying the public release guard.',
+        'evidence':{'error_event_seq':e['failure']['error_event_seq'],
+                    'clip_ids':list({s['clip_id'] for s in e['samples']})}})}
+
+
+def test_pinned_historical_policy_is_not_a_memory_hit(tmp_path,monkeypatch):
+    cfg,rec,env=live_repair_fixture(tmp_path)
+    monkeypatch.setattr(mem,'compatibility',lambda _: {'test':'fixed'})
+    source_path=tmp_path/'historical.py';source_path.write_text(REPAIR_SOURCE,encoding='utf-8')
+    cfg.update(shadow_piano_initial_source=str(source_path),
+        shadow_piano_initial_source_sha256=mem.digest(source_path.read_bytes()))
+    def forbidden(*args,**kwargs):raise AssertionError('Pinned V0 must not read active code or call API')
+    monkeypatch.setattr(mem,'_query',forbidden)
+    monkeypatch.setattr(mem,'linked_initial_record',forbidden)
+    code,_,error=mem.initial_code(None,cfg,{'full_prompt':[]})
+    session=json.loads(mem._session_path(cfg).read_text())
+    assert error is None and 'run_piano(' in code
+    assert session['source']==mem.validate_source(REPAIR_SOURCE)
+    assert not session['cache_hit'] and session['evidence_input_bundle'] is None
+    assert session['parameters']=={} and session['initial_source']['initial_generation_calls']==0
+    assert not (tmp_path/'evidence'/'active_bundle.json').exists()
+    cfg['shadow_piano_initial_source_sha256']='0'*64
+    with pytest.raises(ValueError,match='SHA256'):mem.initial_code(None,cfg,{'full_prompt':[]})
+
+
+def test_error_only_repair_miss_resume_and_suffix_promotion(tmp_path,monkeypatch):
+    cfg,rec,env=live_repair_fixture(tmp_path)
+    monkeypatch.setattr(mem,'compatibility',lambda _: {'test':'fixed'})
+    requests=[]
+    def query(args,messages,**kw):
+        requests.append(kw['phase'])
+        if kw['phase']=='code_memory_initial':return {'content':REPAIR_SOURCE}
+        assert kw['deadline_seconds']==300 and args.max_tokens==8192
+        assert 'HTTPS_PROXY' not in mem.os.environ
+        e=json.loads(messages[1]['content'])
+        assert e['recovery']['current_attempt']==1
+        assert e['retrieval_status']=='no_compatible_verified_repair'
+        assert not e['historical_repairs'] and e['current_source'] is None
+        assert not any(k in json.dumps(e) for k in ('key_forces','native_notes_completed','reward'))
+        return repair_proposal(messages)
+    monkeypatch.setattr(mem,'_query',query)
+    code,_,_=mem.initial_code(SimpleNamespace(),cfg,{'full_prompt':[]})
+    _,_,_,_,info=env.step(code)
+    assert info['sandbox_rc']!=0
+    assert [e['index'] for e in rec.events if e['kind']=='attempt_finalized']==[0]
+    assert not rec.retrievals
+    old_physics=rec.clock['physics_step']
+    regenerated=mem.repair(SimpleNamespace(),cfg,env=env)
+    assert regenerated and rec.clock['physics_step']==old_physics
+    env._exec_globals['piano_state']['completed']=99  # generated counters are not authority
+    env._exec_globals['obsolete_helper']=lambda:None
+    _,_,_,_,info=env.step(regenerated)
+    assert info['sandbox_rc']==0,info
+    assert 'INIT_ONCE' not in info['stdout'] and 'obsolete_helper' not in env._exec_globals
+    assert env.low_level_env._policy_end_submitted
+    assert [e['index'] for e in rec.events if e['kind']=='attempt_finalized']==[0,1]
+    assert any(e['kind']=='release_rejected' for e in rec.events)
+    result=mem.finish_episode(cfg)
+    assert result['status']=='promoted',result
+    check=result['verification']
+    assert check['changed_functions_called'] and check['original_check_passed'] and not check['new_error_event_seqs']
+    assert check['boundary_physics_step']==old_physics
+    assert any(e['kind']=='release_rejected' and e['event_seq']<check['boundary_event_seq'] for e in rec.events)
+    assert requests==['code_memory_initial','tactile_error_repair']
+    assert mem.repair(SimpleNamespace(),cfg,env=env) is None
+    assert len([r for r in rec.index.records() if r['kind']=='repair_case'])==1
+    cfg2,rec2,env2=live_repair_fixture(tmp_path,'next')
+    code,_,_=mem.initial_code(SimpleNamespace(),cfg2,{'full_prompt':[]})
+    assert len(requests)==2  # compatible active code executes without initial generation
+    env2.step(code)
+    result2=mem.finish_episode(cfg2)
+    assert result2['status']=='promoted' and not rec2.retrievals
+    assert len(requests)==2
+
+
+def test_failed_repair_never_replaces_active_and_history_hit(tmp_path,monkeypatch):
+    # Seed a verified correction with the complete public execution test first.
+    test_error_only_repair_miss_resume_and_suffix_promotion(tmp_path,monkeypatch)
+    active=(tmp_path/'evidence/active_bundle.json').read_bytes()
+    cfg,rec,env=live_repair_fixture(tmp_path,'failed')
+    source=mem.validate_source(REPAIR_SOURCE)
+    mem.atomic_json(mem._session_path(cfg),{'source':source,'executed_version':mem.digest(source),
+        'compatibility':{'test':'fixed'},'request':rec.request,'parameters':{},'repair_calls':0,'control_instructions':''})
+    env.step(mem.wrapped(source,rec.request,{},host_progress=True))
+    seen=[]
+    def query(args,messages,**kw):
+        e=json.loads(messages[1]['content']);seen.append(e)
+        assert e['historical_repairs'] and e['historical_repairs'][0]['corrected_functions']
+        return repair_proposal(messages,fail_again=True)
+    monkeypatch.setattr(mem,'_query',query)
+    code=mem.repair(SimpleNamespace(),cfg,env=env)
+    assert code and len(seen)==1
+    env.step(code)
+    result=mem.finish_episode(cfg)
+    assert result['status']=='candidate_not_promoted'
+    assert result['verification']['new_error_event_seqs']
+    assert (tmp_path/'evidence/active_bundle.json').read_bytes()==active
+    assert [r for r in rec.index.records() if r['kind']=='repair_case'][-1]['payload']['status']=='failed_or_unverified'
+
+
+@pytest.mark.parametrize('outcome',['fixed','api_failure','invalid_proposal'])
+def test_no_window_static_error_still_gets_one_repair_and_is_archived(tmp_path,monkeypatch,outcome):
+    cfg,rec,env=live_repair_fixture(tmp_path,count=1)
+    monkeypatch.setattr(mem,'compatibility',lambda _: {'test':'fixed'})
+    calls=[]
+    def query(args,messages,**kw):
+        calls.append(kw['phase'])
+        if kw['phase']=='code_memory_initial':return {'content':'def run_piano(:\n'}
+        e=json.loads(messages[1]['content'])
+        assert e['mode']=='module' and not e['samples'] and e['retrieval_status']=='no_public_window'
+        if outcome=='api_failure':raise TimeoutError('test provider')
+        if outcome=='invalid_proposal':return {'content':'not JSON'}
+        return {'content':json.dumps({'mode':'module','source':REPAIR_SOURCE,'functions':[],
+            'reason':'Repair the invalid Python signature.','expected_effect':'Enter and execute the policy.',
+            'evidence':{'error_event_seq':e['failure']['error_event_seq'],'clip_ids':[]}})}
+    monkeypatch.setattr(mem,'_query',query)
+    code,_,_=mem.initial_code(SimpleNamespace(),cfg,{'full_prompt':[]})
+    env.step(code)
+    assert not rec.frames
+    code=mem.repair(SimpleNamespace(),cfg,env=env)
+    if outcome=='fixed':
+        assert code
+        env.step(code)
+    else:assert code is None
+    assert mem.repair(SimpleNamespace(),cfg,env=env) is None
+    result=mem.finish_episode(cfg)
+    assert result['accepted']==(outcome=='fixed'),result
+    cases=[r for r in rec.index.records() if r['kind']=='repair_case']
+    assert len(cases)==1 and cases[0]['payload']['query_clip_id'] is None
+    assert (tmp_path/'evidence/active_bundle.json').exists()==(outcome=='fixed')
+    assert calls==['code_memory_initial','tactile_error_repair']
+
+
+def test_stop_marker_keeps_actual_call_context_without_inventing_exception(tmp_path,monkeypatch):
+    cfg,rec,env=live_repair_fixture(tmp_path,count=1)
+    source='''def probe():
+    move_shadow_index(0.,0.,.01,.5)
+    print('PIANO_STOP OOD_REPROBE')
+def run_piano(request,piano_state):
+    probe()
+'''
+    env.step(mem.wrapped(source,rec.request,{},host_progress=True))
+    failure=mem.public_failure_context(json.loads(rec.manifest_path.read_text()))
+    assert failure['function_name']=='probe' and failure['kind']=='public_stop'
+    assert failure['exception'] is None
+    assert not rec.retrievals
+
+
+def test_reentry_cannot_move_before_actual_public_pose_and_contact_reads(tmp_path,monkeypatch):
+    cfg,rec,env=live_repair_fixture(tmp_path,count=1)
+    source='def run_piano(request,piano_state):\n    print("PIANO_STOP OOD_REPROBE")\n'
+    env.step(mem.wrapped(source,rec.request,{},host_progress=True))
+    before=env.low_level_env._task.step_count
+    unchecked='def run_piano(request,piano_state):\n    move_shadow_index(0.,0.,.01,.5)\n'
+    _,_,_,_,info=env.step(mem.wrapped(unchecked,rec.request,{},host_progress=True,repair_id='a'*64))
+    assert info['sandbox_rc']!=0 and 'Recovery requires fresh' in info['stderr']
+    assert env.low_level_env._task.step_count==before
+    # An already stopped native environment must not call/retrieve for recovery.
+    env.low_level_env._native_done=True
+    mem.atomic_json(mem._session_path(cfg),{'source':source,'executed_version':mem.digest(source),
+        'compatibility':{},'request':rec.request,'parameters':{},'repair_calls':0})
+    monkeypatch.setattr(mem,'_query',lambda *a,**kw:pytest.fail('No repair after native termination'))
+    assert mem.repair(SimpleNamespace(),cfg,env=env) is None
+    assert not rec.retrievals
+
+
+def test_clean_checkpoint_or_unfinished_code_is_not_a_repair_trigger():
+    config={'shadow_piano_evidence_memory':'unused','shadow_piano_evidence_trigger':'repair_only',
+            'visual_checkpoint_markers':['finger_alignment'],'shadow_piano_recover_on_stop':True}
+    for stdout in ('','CAPX_VISUAL_CHECKPOINT finger_alignment'):
+        assert not trial._should_query_multiturn_after_block({'stdout':stdout,'stderr':'','sandbox_rc':0,'task_completed':False},
+            code_block_idx=1,total_code_blocks=1,config=config)
+    assert trial._should_query_multiturn_after_block({'stdout':'PIANO_STOP OOD_REPROBE','stderr':'','sandbox_rc':0},
+        code_block_idx=1,total_code_blocks=1,config=config)
+
+
+def test_host_metadata_preserves_valid_parameters_and_cannot_be_forged(tmp_path):
+    cfg,rec,env=live_repair_fixture(tmp_path,count=1)
+    parameters={'white_light':{'z_trim_m':-.0001}}
+    source='def run_piano(request,piano_state):\n    return\n'
+    env.step(mem.wrapped(source,rec.request,parameters,host_progress=True))
+    assert env._exec_globals['piano_state']['policy_parameters']==parameters
+    with pytest.raises(ValueError,match='metadata'):
+        mem.validate_source('# capx-piano-repair:'+'a'*64+'\n'+source)
+
+
+def test_pending_or_unchecked_bundle_never_becomes_default(tmp_path):
+    cfg={'shadow_piano_evidence_memory':str(tmp_path),'shadow_piano_evidence_trigger':'repair_only'}
+    bundle=mem._store_linked_bundle(tmp_path,mem.validate_source(REPAIR_SOURCE),{},
+        {'schema':'shadow_piano_public_skills.v1','skills':[]},{},None,[],[])
+    mem.atomic_json(tmp_path/'pending_bundle.json',{'bundle_id':bundle,'status':'syntax_checked_pending_execution'})
+    assert mem.linked_initial_record(cfg,{})[0] is None
+    mem.atomic_json(tmp_path/'active_bundle.json',{'bundle_id':bundle})
+    assert mem.linked_initial_record(cfg,{})[0] is None
+    mem.atomic_json(tmp_path/'active_bundle.json',{'bundle_id':bundle,'status':'public_execution_checked'})
+    assert mem.linked_initial_record(cfg,{})[0]['bundle_id']==bundle
+
+
+@pytest.mark.parametrize('confidence',[False,True])
+def test_repaired_stop_requires_renewed_public_check_and_accepts_existing_dict_logs(tmp_path,confidence):
+    cfg,rec,env=live_repair_fixture(tmp_path,count=1)
+    source=mem.validate_source(REPAIR_SOURCE +
+        "    print('PIANO_NOTE', {'index':0,'quality':'ok','public_hold_confidence':"+repr(confidence)+",'abort_reason':None})\n")
+    env.step(mem.wrapped(source,rec.request,{},host_progress=True,repair_id='b'*64))
+    repair={'repair_id':'b'*64,'changes':[], 'failure':{'kind':'public_stop','attempt':0,
+            'function_name':'run_piano','messages':['PIANO_STOP OOD_REPROBE']}}
+    result=mem._check_execution_suffix(json.loads(rec.manifest_path.read_text()),source,repair)
+    assert result['original_check_passed']==confidence
+    assert result['passed']==confidence
+
 
 def run_public_evidence_fixture(tmp_path, name, source=EVIDENCE_SOURCE, config=None):
     from test_shadow_piano_online_skills import evidence_recorder, record_sample
@@ -39,6 +567,7 @@ def run_public_evidence_fixture(tmp_path, name, source=EVIDENCE_SOURCE, config=N
     cfg=config or {'shadow_piano_evidence_memory':str(tmp_path/'evidence'),
         'shadow_piano_code_memory':str(tmp_path/'old_code'),'output_dir':str(tmp_path/name)}
     cfg['output_dir']=str(tmp_path/name)
+    cfg.setdefault('shadow_piano_evidence_trigger','episode_end')  # archived updater compatibility tests
     run=Path(cfg['output_dir'])
     request={'notes':['F4'],'dynamics':['light'],'hold_seconds':[.12]}
     (run/'shadow_public_episode.json').write_text(json.dumps({'sequence':request,'clear_action_steps':0}))
@@ -182,7 +711,9 @@ def test_linked_config_and_plain_runner_wiring(tmp_path,monkeypatch):
     assert mem.memory_policy(cfg)['arm']=='tactile_evidence_joint'
     assert mem.repair(SimpleNamespace(),cfg) is None
     assert not mem.action_memory_enabled(cfg)
-    assert cfg['max_regenerations']==0
+    assert cfg['max_regenerations']==1
+    assert cfg['shadow_piano_evidence_trigger']=='repair_only'
+    assert cfg['shadow_piano_repair_scope']=='release_regions_v1'
 
 
 @pytest.mark.parametrize('mode,text,history,updates',[

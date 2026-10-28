@@ -390,3 +390,58 @@ C#4重、A4重原生判incomplete_note，其他四音成功；生成代码五条
 更新器返回rejected_or_unavailable：No tactile clip is associated with the executed helpers。按名称排序选了_release_pose（369次调用）和hold（540次调用），两者都无含触觉样本的关联片段；实际press和release各调用6次，分别有关联片段18和12个。选函数时先占满两个名额再检查触觉关联，导致发送前失败；不是API超时或模型拒绝修改。记忆仍保存1226帧和24片段，未产生候选。该筛选缺陷及此前释放证据遗漏尚待修复。
 
 [完整结果](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/result_audit.json) · [run.log](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/joint/runs/seed_3300/joint_preflight_fix_seed3300_20261027T154339Z_smoke_rep1_20261027T154350Z/run.log) · [更新错误](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/joint/runs/seed_3300/joint_preflight_fix_seed3300_20261027T154339Z_smoke_rep1_20261027T154350Z/piano_evidence_update_result.json) · [私有原生审计](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/joint/private_audits/joint_preflight_fix_seed3300_20261027T154339Z_smoke_rep1_20261027T154350Z_3b820e5b108c47ca827f9b41f0d4e6ef/shadow_piano_native_audit_summary.json) · [HEAD视频](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/joint/runs/seed_3300/joint_preflight_fix_seed3300_20261027T154339Z_smoke_rep1_20261027T154350Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/videos/video_combined.mp4) · [第三方视频](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/single_joint_preflight_fix_3300_20261027T154339Z/joint/runs/seed_3300/joint_preflight_fix_seed3300_20261027T154339Z_smoke_rep1_20261027T154350Z/trial_01_sandboxrc_0_reward_0.000_taskcompleted_0/videos/video_combined_third.mp4)。实验已结束，无剩余本次进程，未追加seed或批量实验。
+
+## 2026-10-28：真实释放错误的最小修复对照，前置条件未满足
+
+同一真实历史 V0，GPU0串行，gpt-6.1-sol/low，temperature=0.2，无代理。每条初始生成0次、修复API1次，均只执行1个代码块。
+
+| 条件 | seed | 动作数／清场 | 公开已提交 | 原生成功音数／目标 | END | 修复API墙钟秒 | 服务商总token | exit |
+|---|---:|---:|---:|---:|---|---:|---:|---:|
+| ①空库建立经历 | 3300 | 185／0 | 0 | 1／6 | 否 | 89.899 | 14469 | 1 |
+| ②无历史对照 | 3301 | 177／0 | 0 | 0／6 | 否 | 20.615 | 14474 | 1 |
+
+两次均实际开始首音，在原生尚未终止时触发已有release_rejected：物理步740／708，连续到位时间0.1166667秒，小于0.12秒。API正常返回，无额外请求。模型提出释放计时修复，但整模块重写改变了受保护表达式的结构，均被`Repair changed protected force/hold/hover constraints`拒绝，未执行提案。不能把该提示直接理解为实际力目标被改错。
+
+两次时序window4/tactile/tactile_action均quality=ok，空历史命中均为0。①没有合格修正，因此③（S1有历史）和④（S2继承）未启动；没有拿②的结果替代①、放松校验或追加seed。只能证明真实错误触发记录、物理时间编码及一次API请求可用，尚未证明历史经验帮助修复。中断时的原生分数不是完整六音成功率；真值未进入更新器。
+
+[完整四步状态、音序、日志、代码差异、HEAD／第三方含音轨视频及私有审计](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/minimal_error_repair_20261028T002124Z/results.md)。
+
+## 2026-10-28：明确两个可修改区域后的释放修复试验
+
+仍从同一历史 V0 开始，只允许修改嵌套的 `run_piano.release` 和当前未完成尝试的恢复分支；其余源码逐字保留。GPU0串行，gpt-6.1-sol/low，无代理、单次修复预算。首次生成0次，未新增独立运行脚本或修改OpenTacBench。
+
+| 条件 | seed | 音序／力度 | 原生成功音数 | 公开提交 | 动作数／清场 | 代码块／重新生成 | END／exit | 修复API墙钟秒 | 输入／输出token |
+|---|---:|---|---:|---:|---:|---:|---|---:|---:|
+| ①空库建立经历，区域补丁 | 3300 | F4轻、A4轻、C#4重、A4轻、A4重、E4轻 | 6/6 | 6 | 1164／0 | 2／1 | 是／0 | 31.210 | 11971／849 |
+
+动作185、物理步740重现原释放检查拒绝：连续到位仅0.1166667秒。一次模型补丁被接受并实际执行；在物理步828、动作207通过同一公开释放检查，22个恢复动作中没有重新接近或按压首音。释放计时现在累计实际动作间隔，重入时根据公开错误与已提交记录恢复。两处修改均有新函数哈希的实际调用记录。后续索引1–4也通过公开释放检查；末音在原生终止后合法提交并END。
+
+整段策略未晋升：未修改的按压策略在C#4重、A4重自报 `hold_uncertain`，且末音由策略合法提交、宿主未补记的分支尚未被晋升检查计入完整链。原释放错误的重检已通过，不能将整段策略的候选状态误报为局部补丁未执行；同样不能用私有6/6代替公开晋升依据。原始失败与修复后证据均保留，未放宽检查。
+
+①结束后的公共库已冻结；可检索的已验证修复数为0，未创建活动版本。②无历史对照、③有历史对照及④继承尚未运行。预选S1为3306（首音F4轻，与S0的触觉检索兼容条件一致），S2为3301，选择仅依据运行前公开目标音序。未依据实际成绩挑选或追加实验。本轮证明了区域补丁能执行并解决真实释放错误，尚未证明历史触觉经验的额外收益或跨seed继承。
+
+相关CPU测试134项通过。两份视频均含音轨；API墙钟包含传输和排队，不等同纯模型推理时间。任务执行耗时453.09秒。
+
+[完整报告、补丁差异、检索与更新输入、日志、HEAD／第三方视频及私有原生审计](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/minimal_region_repair_20261028T015608Z/results.md)。
+
+## 2026-10-28：局部修复经历检索与新seed继承，三次串行对照
+
+分开局部释放修复资格与整段策略晋升，140项相关CPU测试通过。此前3300只依靠公开证据重新核验为局部释放修复有效，原失败记录保留，以追加索引记录冻结；不以原生6/6提高资格。GPU0串行，gpt-6.1-sol/low、temperature=0.2、无代理；所有运行调用现有 ./run_responses，无新增运行脚本或整组重试。
+
+| 条件 | seed | 原生成功音／6 | 原生已尝试／公开提交 | 动作／清场 | 代码块／重新生成 | 初始／修复API | token输入／输出 | API墙钟秒 | END／exit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 同一V0，无历史 | 3306 | 1/6（中断） | 1／0 | 185／0 | 1／0 | 0／1 | 12240／879 | 15.354 | 否／1 |
+| 同一V0，有3300历史 | 3306 | 6/6 | 6／6 | 1127／0 | 2／1 | 0／1 | 12776／868 | 15.612 | 是／0 |
+| 直接执行第二组修正版 | 3301 | 5/6 | 6／6 | 1157／0 | 1／0 | 0／0 | 0／0 | 0 | 是／1 |
+
+3306音序均为F4轻、C4重、E4轻、G#4轻、F#4轻、D#4重；3301为D4重、F4轻、C#4重、F#4重、G#4轻、F4重。每音持音0.12秒。两次3306错误前186帧公开动作、手部状态、5D特征和估计力逐项一致，均在动作185／物理步740触发原释放检查。API墙钟包括网络和排队，非纯推理时间；前两组固定预检不计入策略调用或token，继承组关闭预检。
+
+无历史组API正常返回，补丁提出正确的间隔计时思路，但attempt_recovery的SHA256漏抄一位，被Stale region hash拒绝执行。离线仅补正该字段后静态校验通过；未执行、未重跑，也没有覆盖原提案或更改本行结果。因此不能把185步视为高效率，也不能将两组结果差异直接归因为历史帮助模型理解错误。
+
+有历史组仅从冻结的3300索引检索到一条局部释放经验；32D tactile_action距离为0，未读取无历史组的任何结果。模型输出release函数与历史修正版AST相同，恢复分支有局部表达变化；两处实际调用后在物理步828通过同一释放检查，未重弹首音。整段策略仍有C4重音hold_uncertain与末音D#4重音ood公开记录，未自动晋升。末音合法终止提交已正确计入完整链，不等同于释放验证。
+
+继承组显式加载上组保存的源码，SHA256为4ad5aa0f58de18c8f889d3942c8a6bf9af8aa0e717f84cc3bb859bcf114471f5，初始生成和修复均为零；执行状态从0初始化，原释放错误未复发。该执行是候选的受控继承验证，不伪称已晋升代码库的自动命中。首音D4重音原生incomplete_note：接触记录仅出现D4，真实力在0.43–0.57N内最长连续7物理步（0.02917秒），不足0.12秒；公开代码却自报hold_confident。其他五音原生成功，END完成。私有真值只用于此审计，未进入检索或更新器。
+
+结论限于“历史触觉片段—修正代码—实际执行—新seed继承”链路可追溯、局部释放修正持续有效。单次配对受到基线格式失败影响，且S0/S1首音与窗口相同，未证明触觉检索优于语言检索或总体成功率显著提高。三次均已结束，未追加实验。试验耗时分别99.50、416.76、405.41秒。
+
+[三行完整报告、音序、补丁差异、原始日志、HEAD／第三方含音轨视频与私有审计](/mnt/data/ljz/opentacbench/shadow_piano_memory_comparison/minimal_region_repair_20261028T015608Z/continuation_20261028T024645Z/results.md)。
